@@ -65,7 +65,9 @@ from vllm.v1.spec_decode.utils import (
     eagle_prepare_next_token_padded_kernel,
     eagle_step_update_slot_mapping_and_metadata,
     extend_all_queries_by_N,
+    fill_backup_next_token_ids,
     next_power_of_2,
+    prepare_next_token_ids_padded,
 )
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
@@ -1863,44 +1865,19 @@ class SpecDecodeBaseProposer:
         for each request, considering the "discarded" requests whose next token
         is not sampled and comes from `request.get_token_id()` instead. This is denoted
         the "backup" token id. It also counts rejected tokens via `sampled_token_ids`.
+
+        Non-last pipeline ranks derive the same values from the received
+        sampled matrix with the same helpers (GPUModelRunner).
         """
-        # Precompute backup token IDs for discarded requests.
-        num_reqs = gpu_input_batch.num_reqs
-        for i in range(num_reqs):
-            self.backup_next_token_ids.np[i] = requests[
-                gpu_input_batch.req_ids[i]
-            ].get_token_id(gpu_input_batch.num_tokens_no_spec[i] - 1)
-        self.backup_next_token_ids.copy_to_gpu(num_reqs)
-        backup_tokens_gpu = self.backup_next_token_ids.gpu
-
-        batch_size, num_tokens = sampled_token_ids.shape
-        device = sampled_token_ids.device
-
-        assert discard_request_mask.dtype == torch.bool
-        assert backup_tokens_gpu.dtype == torch.int32
-
-        next_token_ids = torch.empty(batch_size, dtype=torch.int32, device=device)
-        valid_sampled_tokens_count = next_token_ids.new_empty(batch_size)
-
-        # Kernel grid: one program per request (row)
-        grid = (batch_size,)
-
-        # Find the next power of 2 for block sizes
-        BLOCK_SIZE_TOKENS = next_power_of_2(num_tokens)
-        eagle_prepare_next_token_padded_kernel[grid](
+        backup_tokens_gpu = fill_backup_next_token_ids(
+            self.backup_next_token_ids, requests, gpu_input_batch
+        )
+        return prepare_next_token_ids_padded(
             sampled_token_ids,
             discard_request_mask,
             backup_tokens_gpu,
-            next_token_ids,
-            valid_sampled_tokens_count,
             gpu_input_batch.vocab_size,
-            num_tokens,
-            batch_size,
-            sampled_token_ids.stride(0),
-            BLOCK_SIZE_TOKENS=BLOCK_SIZE_TOKENS,
         )
-
-        return next_token_ids, valid_sampled_tokens_count
 
     def prepare_inputs_padded(
         self,
