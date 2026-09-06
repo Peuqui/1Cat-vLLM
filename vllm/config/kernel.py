@@ -130,6 +130,13 @@ MoEBackend = Literal[
     "flashinfer_cutedsl",
     "flashinfer_b12x",
     "marlin",
+    # fork: per-expert dispatch over the skinny NVFP4 GEMMs (SM70/SM75).
+    # The oracle (fused_moe/oracle/nvfp4.py) has mapped this name since the
+    # per-expert path was added, but the literal was never extended -- so the
+    # backend existed and was unreachable from the command line. Auto-select
+    # cannot pick it either: MARLIN precedes SM70_SKINNY in AVAILABLE_BACKENDS
+    # and is supported here, so the search always stops one entry short.
+    "sm70_skinny",
     "humming",
     "triton_unfused",
     "aiter",
@@ -181,7 +188,8 @@ class KernelConfig:
     - "flashinfer_cutedsl": Use FlashInfer with CuteDSL kernels (FP4 only)
     - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
       (RTX Pro 6000 / DGX Spark)
-    - "marlin": Use Marlin kernels (weight-only quantization)
+    - "marlin": Use Marlin kernels
+    - "sm70_skinny": Use the fork's per-expert skinny NVFP4 kernels (SM70/SM75) (weight-only quantization)
     - "humming": Use Humming Mixed Precision kernels
     - "triton_unfused": Use Triton unfused MoE kernels
     - "aiter": Use AMD AITer kernels (ROCm only)

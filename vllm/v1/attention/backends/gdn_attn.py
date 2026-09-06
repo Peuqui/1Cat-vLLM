@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.2.2
+# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
+# Changes: adds a chain-MTP fast metadata build
+# (VLLM_SM70_GDN_CHAIN_SPEC_FAST_BUILD, -1.4 ms/step, byte-identical
+# output) and env-gated slot-debug instrumentation.
 """Backend for GatedDeltaNet attention."""
 
 import json
@@ -559,6 +565,25 @@ def gather_gdn_state_block_ids(
     current_block_idx = torch.clamp((seq_lens - 1) // block_size, min=0)
     offsets = torch.arange(width, device=block_table.device, dtype=torch.long)
     gather_indices = current_block_idx.to(torch.long).unsqueeze(1) + offsets
+    if os.getenv("VLLM_SM70_GDN_SLOT_DEBUG") == "1":
+        _max_idx = int(gather_indices.max().item())
+        if _max_idx > block_table.shape[1] - 1:
+            logger.warning(
+                "GDN_SLOT_DEBUG gather clamp: max_idx=%d table_width=%d "
+                "width=%d",
+                _max_idx, block_table.shape[1], width,
+            )
+        else:
+            _g = torch.gather(
+                block_table, 1,
+                torch.clamp(gather_indices, max=block_table.shape[1] - 1))
+            _uniq = int(_g[0].unique().numel()) if _g.numel() else 0
+            if _uniq < min(width, _g.shape[1]):
+                logger.warning(
+                    "GDN_SLOT_DEBUG slot aliasing: width=%d unique=%d "
+                    "ids=%s",
+                    width, _uniq, _g[0][:width].tolist(),
+                )
     gather_indices = torch.clamp(gather_indices, max=block_table.shape[1] - 1)
     return torch.gather(block_table, 1, gather_indices)
 
@@ -1527,8 +1552,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
             non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
             num_zero_len = (non_spec_query_lens_cpu == 0).sum().item()
+            # Chain-MTP reuses the ddtree all-spec fast build (identical
+            # construction for linear chains; skips the nonzero/mask storm
+            # in build_gdn_spec_decode_state_contract). Env-gated for A/B.
+            chain_fast = (
+                os.getenv("VLLM_SM70_GDN_CHAIN_SPEC_FAST_BUILD", "0") == "1"
+                and bool(torch.all(spec_sequence_masks_cpu).item())
+            )
             pure_ddtree_spec_fast_path_candidate = (
-                ddtree_parent_ids is not None
+                (ddtree_parent_ids is not None or chain_fast)
                 and num_spec_decodes > 0
                 and non_spec_query_lens_cpu.size(0) == num_zero_len
             )

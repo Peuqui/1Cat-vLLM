@@ -473,7 +473,9 @@ class DeepseekCompressor(nn.Module):
             (7, 0)
         ):
             # NVIDIA GPUs.
-            if self.head_dim == 512:
+            # fork: the CuteDSL kernel needs Hopper+. Pre-Hopper takes the
+            # Triton kernel that AMD already uses for this exact layout.
+            if self.head_dim == 512 and current_platform.has_device_capability(90):
                 from .nvidia.ops.sparse_attn_compress_cutedsl import (
                     compress_norm_rope_store_cutedsl,
                 )

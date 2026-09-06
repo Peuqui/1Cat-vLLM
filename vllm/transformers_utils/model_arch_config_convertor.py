@@ -548,6 +548,15 @@ class Gemma4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
 
 
 # hf_config.model_type -> convertor class
+class Qwen4ExpMTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    def get_num_hidden_layers(self) -> int:
+        return getattr(
+            self.hf_text_config,
+            "mtp_num_hidden_layers",
+            getattr(self.hf_text_config, "num_nextn_predict_layers", 0),
+        )
+
+
 MODEL_ARCH_CONFIG_CONVERTORS = {
     "cohere_asr": CohereAsrModelArchConfigConvertor,
     "dbrx": DbrxModelArchConfigConvertor,
@@ -573,6 +582,7 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
     "pangu_ultra_moe_mtp": PanguUltraMoeMTPModelArchConfigConvertor,
     "qwen3_5_mtp": Qwen3_5MTPModelArchConfigConvertor,
     "qwen3_next_mtp": Qwen3NextMTPModelArchConfigConvertor,
+    "qwen4_exp_mtp": Qwen4ExpMTPModelArchConfigConvertor,
     "RefinedWeb": FalconModelArchConfigConvertor,
     "RefinedWebModel": FalconModelArchConfigConvertor,
     "step3p5_mtp": Step3p5MTPModelArchConfigConvertor,

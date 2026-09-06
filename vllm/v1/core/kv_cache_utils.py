@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.3.0
+# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
+# Changes: the no-KV-memory error now reports the negative available_memory figure.
 """KV-Cache Utilities."""
 
 import copy
@@ -623,15 +627,22 @@ def resolve_kv_cache_block_sizes(
     ):
         return scheduler_block_size, scheduler_block_size
 
+    # Only prefix-cacheable groups take part in block hashing; a group that
+    # opts out (CircularBufferSpec) must not drag the GCD down or fail the
+    # divisibility check with its ring capacity.
+    hashing_sizes = [
+        block_size
+        for group, block_size in zip(groups, group_block_sizes)
+        if group.kv_cache_spec.prefix_cacheable
+    ] or group_block_sizes
     requested = cache_config.hash_block_size
-    hash_block_size = (
-        requested if requested is not None else math.gcd(*group_block_sizes)
-    )
-    if any(bs % hash_block_size != 0 for bs in group_block_sizes):
+    hash_block_size = requested if requested is not None else math.gcd(*hashing_sizes)
+    if any(bs % hash_block_size != 0 for bs in hashing_sizes):
         raise ValueError(
-            f"Invalid hash_block_size={hash_block_size}; all KV cache group "
-            f"block sizes must be divisible by hash_block_size. "
-            f"Got group block sizes={group_block_sizes}."
+            f"Invalid hash_block_size={hash_block_size}; prefix-cacheable "
+            "KV cache group block sizes must be divisible by hash_block_size. "
+            f"Got group block sizes={group_block_sizes}, "
+            f"prefix-cacheable={hashing_sizes}."
         )
     return scheduler_block_size, hash_block_size
 
@@ -698,7 +709,8 @@ def _check_enough_kv_cache_memory(
 ):
     if available_memory <= 0:
         raise ValueError(
-            "No available memory for the cache blocks. "
+            f"No available memory for the cache blocks "
+            f"(available_memory={available_memory / 1024**3:.2f} GiB). "
             "Try increasing `gpu_memory_utilization` when initializing the engine "
             "(this flag also controls CPU memory reservation on the CPU "
             "backend, despite its name). "
@@ -1591,7 +1603,14 @@ def get_kv_cache_config_from_groups(
         )
 
     # Determine how model runners should initialize the KV cache tensors.
-    if len(kv_cache_groups) == 1 and isinstance(
+    csa_config = _get_kv_cache_config_csa_linear(
+        vllm_config, kv_cache_groups, available_memory
+    )
+    if csa_config is not None:
+        # CSA+linear: two page sizes per block with aliased owners, so neither
+        # the uniform-page nor the DeepseekV4 bucketing applies.
+        num_blocks, kv_cache_tensors = csa_config
+    elif len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         # Special case: all layers have the same type of KV cache but with
@@ -2274,7 +2293,8 @@ def _annotate_eagle_groups_deepseek_v4(
 
 
 def get_kv_cache_groups(
-    vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
+    vllm_config: VllmConfig,
+    kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
     """
     Split the layers in the model into groups with the same KV cache spec.
@@ -2417,6 +2437,20 @@ def _max_memory_usage_bytes_from_groups(
     """
     if not kv_cache_groups:
         return 0
+
+    csa_layout = _get_csa_linear_tensor_layout(kv_cache_groups)
+    if csa_layout is not None:
+        # CSA+linear: every cache owner aliases into one of the two page slots
+        # a QSA layer occupies in a block, so the hybrid cache costs exactly
+        # one bytes_per_block per block of context -- the mamba states and the
+        # compressor ring ride along in slots that are paid for already. Must
+        # agree with _get_kv_cache_config_csa_linear.
+        num_blocks = max(
+            group.kv_cache_spec.max_memory_usage_pages(vllm_config)
+            for group in kv_cache_groups
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        )
+        return csa_layout.bytes_per_block * num_blocks
 
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs

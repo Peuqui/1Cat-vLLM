@@ -7617,3 +7617,21 @@ def fused_gdn_gating(
         num_warps=1,
     )
     return g, beta_output
+
+
+class QwenGatedDeltaNetAttentionUpstreamCall(QwenGatedDeltaNetAttention):
+    """Adapter for the upstream decoder-layer call convention.
+
+    Mirror image of ``QwenGatedDeltaNetAttentionForkCall`` in the sm75 module.
+    The fork's decoder layer (qwen3_next.py) preallocates the output buffer and
+    calls ``linear_attn(hidden_states=..., output=buffer)``; upstream-derived
+    decoder layers such as Qwen4Exp expect the result as the return value.
+    """
+
+    def forward(  # type: ignore[override]
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        output = torch.empty_like(hidden_states)
+        super().forward(hidden_states=hidden_states, output=output)
+        return output

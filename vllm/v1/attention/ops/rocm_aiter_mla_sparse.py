@@ -15,6 +15,8 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+# fork: pre-SM89 Triton has no fp8e4nv. Reuse vLLM's own capability gate.
+from vllm.v1.attention.ops.triton_turboquant_decode import _use_fp8_e4b15
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950
@@ -1027,6 +1029,20 @@ def build_ragged_indices_from_dense(
     return flat, indptr
 
 
+_SHARED_MEM_OPTIN: dict[int, int] = {}
+
+
+def _max_shared_mem(device: torch.device) -> int:
+    """Per-block shared memory the device can actually grant (opt-in limit)."""
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    if idx not in _SHARED_MEM_OPTIN:
+        props = torch.cuda.get_device_properties(idx)
+        _SHARED_MEM_OPTIN[idx] = getattr(
+            props, "shared_memory_per_block_optin", props.shared_memory_per_block
+        )
+    return _SHARED_MEM_OPTIN[idx]
+
+
 def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
     if x.dtype == torch.int32 and x.ndim == 1 and x.is_contiguous():
         return x
@@ -1100,6 +1116,9 @@ def _sparse_attn_prefill_ragged_kernel(
             other=0.0,
         )
         kv = tl.where(valid[:, None] & dim_mask[None, :], kv, 0.0)
+        # fork: tl.dot needs both operands in one dtype, and Volta has no bf16
+        # tensor cores at all -- so the cache side follows the query's dtype.
+        kv = kv.to(q.dtype)
 
         scores = tl.dot(q, tl.trans(kv)) * scale
         scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
@@ -1171,6 +1190,7 @@ def _sparse_attn_decode_ragged_kernel(
     NOPE_BLOCK: tl.constexpr,
     ROPE_DIM: tl.constexpr,
     IS_FNUZ: tl.constexpr,
+    FP8_E4B15: tl.constexpr,  # fork: pre-SM89 fp8 substitute
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -1206,8 +1226,8 @@ def _sparse_attn_decode_ragged_kernel(
     main_end = tl.load(main_indptr_ptr + query_idx + 1)
     main_len = main_end - main_start
 
-    zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
-    zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=tl.bfloat16)
+    zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=q_nope.dtype)
+    zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=q_rope.dtype)
 
     for k_start in tl.range(0, main_len, BLOCK_K):
         k_pos = k_start + k_offsets
@@ -1227,17 +1247,27 @@ def _sparse_attn_decode_ragged_kernel(
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        if IS_FNUZ:
-            x_fp8 = x_uint8.to(tl.float8e4b15, bitcast=True)
+        # fork: e4b15 shares e4m3fn's 1-4-3 layout and differs only in
+        # exponent bias (15 vs 7), so the decode is exact after a factor
+        # 2**8. Kept separate from the FNUZ branch, which reinterprets a
+        # differently-written cache and must not gain the factor.
+        if FP8_E4B15:
+            x_val = (
+                x_uint8.to(tl.float8e4b15, bitcast=True).to(tl.float32) * 256.0
+            )
+        elif IS_FNUZ:
+            x_val = x_uint8.to(tl.float8e4b15, bitcast=True).to(tl.float32)
         else:
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            x_val = x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
         encoded_scales = tl.load(
             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
             mask=valid[:, None] & nope_mask[None, :],
             other=127,
         )
         scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-        k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+        # fork: scale in fp32, land in the query's dtype (the cache holds
+        # bf16, which Volta's tensor cores cannot feed to tl.dot).
+        k_nope = (x_val * scales).to(q_nope.dtype)
         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1247,6 +1277,7 @@ def _sparse_attn_decode_ragged_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        k_rope = k_rope.to(q_rope.dtype)
         k_rope = tl.where(valid[:, None], k_rope, zero_rope)
         k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
 
@@ -1295,17 +1326,27 @@ def _sparse_attn_decode_ragged_kernel(
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            if IS_FNUZ:
-                x_fp8 = x_uint8.to(tl.float8e4b15, bitcast=True)
+            # fork: e4b15 shares e4m3fn's 1-4-3 layout and differs only in
+            # exponent bias (15 vs 7), so the decode is exact after a factor
+            # 2**8. Kept separate from the FNUZ branch, which reinterprets a
+            # differently-written cache and must not gain the factor.
+            if FP8_E4B15:
+                x_val = (
+                    x_uint8.to(tl.float8e4b15, bitcast=True).to(tl.float32) * 256.0
+                )
+            elif IS_FNUZ:
+                x_val = x_uint8.to(tl.float8e4b15, bitcast=True).to(tl.float32)
             else:
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                x_val = x_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
             encoded_scales = tl.load(
                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
                 mask=valid[:, None] & nope_mask[None, :],
                 other=127,
             )
             scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
-            k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
+            # fork: scale in fp32, land in the query's dtype (the cache holds
+            # bf16, which Volta's tensor cores cannot feed to tl.dot).
+            k_nope = (x_val * scales).to(q_nope.dtype)
             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
 
@@ -1315,6 +1356,7 @@ def _sparse_attn_decode_ragged_kernel(
                 mask=valid[:, None],
                 other=0.0,
             )
+            k_rope = k_rope.to(q_rope.dtype)
             k_rope = tl.where(valid[:, None], k_rope, zero_rope)
             k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
 
@@ -1543,7 +1585,11 @@ def _rocm_sparse_attn_decode_ragged_triton(
         extra_indices = torch.empty(0, device=q.device, dtype=torch.int32)
         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
 
-    block_h = 16
+    # fork: at block_h=16 this kernel needs 70,656 B of shared memory, which
+    # Turing cannot grant (RTX 8000 opt-in limit 65,536 B; Volta has 98,304).
+    # Halving the head block halves the accumulator tiles and fits; the grid
+    # grows correspondingly, so only occupancy changes, not the result.
+    block_h = 16 if _max_shared_mem(q.device) >= 72 * 1024 else 8
     block_k = 16 if head_dim >= 256 else 32
     out = torch.empty_like(q, dtype=torch.bfloat16)
     _sparse_attn_decode_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
@@ -1574,6 +1620,11 @@ def _rocm_sparse_attn_decode_ragged_triton(
         NOPE_BLOCK=triton.next_power_of_2(nope_head_dim),
         ROPE_DIM=rope_head_dim,
         IS_FNUZ=current_platform.is_fp8_fnuz(),
+        FP8_E4B15=_use_fp8_e4b15(
+            torch.cuda.current_device()
+            if main_cache.device.index is None
+            else main_cache.device.index
+        ),
         BLOCK_H=block_h,
         BLOCK_K=block_k,
         num_warps=8,

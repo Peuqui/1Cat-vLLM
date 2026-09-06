@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.3.0
+# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
+# Changes: VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH now also caps the PP batch queue.
 import multiprocessing
 import os
 import pickle
@@ -478,6 +482,15 @@ class MultiprocExecutor(Executor):
         pp_size = self.parallel_config.pipeline_parallel_size
         if pp_size <= 1 and self.scheduler_config.async_scheduling:
             return max(2, envs.VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH)
+        # Fork fix (v100-skinny): let the existing depth override CAP the
+        # PP batch queue too. With five stages the default of pp_size
+        # in-flight batches interleaves the spec-decode broadcasts of round
+        # n with the execute RPCs of rounds n+1..n+4 and the pipeline
+        # deadlocks on the first request (PP0-2 in broadcast, PP3-4 in
+        # irecv). Depth 2 matches the validated PP=2 behaviour; for
+        # single-request serving the lost pipelining is irrelevant.
+        if envs.VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH > 0:
+            return min(pp_size, max(2, envs.VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH))
         return pp_size
 
     def _get_output_rank(self) -> int:

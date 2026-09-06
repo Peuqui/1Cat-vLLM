@@ -251,12 +251,33 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
 
         if layer_type == "linear_attention":
-            self.linear_attn = QwenGatedDeltaNetAttention(
-                config,
-                vllm_config=vllm_config,
-                prefix=f"{prefix}.linear_attn",
-                gqa_interleaved_layout=False,
-            )
+            if (
+                torch.cuda.is_initialized()
+                and torch.cuda.get_device_capability(torch.cuda.current_device())
+                == (7, 5)
+            ):
+                # Turing worker: the FlashQLA-SM70 GDN kernels ask for 86016 B
+                # of dynamic shared memory and Turing caps at 65536 B. The
+                # upstream layer brings its own sm75 attention backend, and its
+                # forward already returns the result, so it needs no adapter.
+                # Same split as qwen3_5.py, which established this pairing.
+                from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn_sm75 import (  # noqa: E501
+                    QwenGatedDeltaNetAttentionForkCall as QwenGatedDeltaNetAttentionSM75,
+                )
+
+                self.linear_attn = QwenGatedDeltaNetAttentionSM75(
+                    config=config,
+                    vllm_config=vllm_config,
+                    prefix=f"{prefix}.linear_attn",
+                    gqa_interleaved_layout=False,
+                )
+            else:
+                self.linear_attn = QwenGatedDeltaNetAttention(
+                    config,
+                    vllm_config=vllm_config,
+                    prefix=f"{prefix}.linear_attn",
+                    gqa_interleaved_layout=False,
+                )
         elif layer_type == "full_attention":
             use_qsa = getattr(config, "indexer_n_heads", None) is not None
             if not use_qsa:
@@ -635,6 +656,10 @@ class Qwen4ExpModel(nn.Module):
             "token_lookup",
             "hyper_connection_mixer.block_inject_weight",
         ]
+        # v100-skinny smoke fix: the final mixer exists only on the last PP
+        # rank (see __init__); skip its checkpoint tensors elsewhere.
+        if not get_pp_group().is_last_rank:
+            skip_substrs.append("hyper_connection_mixer.")
         loader = AutoWeightsLoader(
             self,
             skip_substrs=skip_substrs,

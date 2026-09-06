@@ -70,7 +70,11 @@ def is_exact_sm70_cuda_platform() -> bool:
     cannot use :func:`is_exact_sm70_cuda`. Keep this platform check separate
     from the tensor-based helpers used by linear weight preparation.
     """
-    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+    # Fork fix (v100-skinny): decide on the WORKER'S device, not device 0
+    # of the visibility list -- on a heterogeneous pipeline (RTX 8000
+    # first) every rank saw sm75 and the V100 stages silently lost their
+    # SM70 paths (torch-reference indexer, generic projection/insert).
+    return current_platform.is_cuda() and torch.cuda.get_device_capability(torch.cuda.current_device()) == (7, 0)
 
 
 def should_use_mxfp4_moe_turbomind() -> bool:

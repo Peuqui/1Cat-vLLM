@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.3.0
+# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
+# Changes: USE_SOFTWARE_FP8 keyed on the absence of native FP8 units
+# (< SM89) instead of exactly SM70, for mixed V100+RTX8000 pipelines.
 """
 Fused compressor + FP8/MXFP4 UE8M0 quantization + KV cache insert kernels.
 
@@ -254,7 +259,13 @@ def compress_norm_rope_store_triton(
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
         USE_SOFTWARE_FP8=(
-            current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+            # Native FP8-Einheiten gibt es erst ab Ada (sm89). Die
+            # urspruengliche Bedingung traf GENAU sm70 — auf einer reinen
+            # V100-Kiste richtig, auf einem gemischten Aufbau falsch: die
+            # sm75-Stufen (RTX 8000) liefen in den Hardware-Pfad, den es
+            # dort nicht gibt (2026-09-01, Gruppe A der sm75-Koexistenz).
+            current_platform.is_cuda()
+            and not current_platform.has_device_capability((8, 9))
         ),
         USE_PRIVATE_STATE=use_private_state,
         USE_DENSE_PRIVATE_STATE=use_dense_private_state,

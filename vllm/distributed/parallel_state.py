@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.5.0
+# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
+# Changes: is_last_pp_first_tp_rank() -- the rank that emits per-step
+# spec-decode reports under pipeline parallelism (PR #512 upstream).
 
 # Copyright 2023 The vLLM team.
 # Adapted from
@@ -2440,6 +2445,26 @@ def is_global_first_rank() -> bool:
     except Exception:
         # If anything goes wrong, assume this is the first rank
         return True
+
+
+def is_last_pp_first_tp_rank() -> bool:
+    """
+    Check if the current process is the first tensor-parallel rank of the
+    last pipeline-parallel stage.
+
+    Sampling and speculative decoding only run on the last PP stage, so
+    per-step reports about them have to be emitted from that stage; the
+    global first rank (see `is_global_first_rank`) is never on it when
+    PP > 1.
+
+    Returns:
+        bool: True on the first TP rank of the last PP stage. Returns True
+              if the model-parallel groups are not initialized
+              (single process).
+    """
+    if _PP is None or _TP is None:
+        return True
+    return _PP.is_last_rank and _TP.rank_in_group == 0
 
 
 def is_local_first_rank() -> bool:

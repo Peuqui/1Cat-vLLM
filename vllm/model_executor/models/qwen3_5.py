@@ -531,12 +531,32 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self.layer_idx = extract_layer_index(prefix)
 
         if self.layer_type == "linear_attention":
-            self.linear_attn = Qwen3_5GatedDeltaNet(
-                config=config,
-                vllm_config=vllm_config,
-                prefix=f"{prefix}.linear_attn",
-                gqa_interleaved_layout=False,
-            )
+            if (
+                torch.cuda.is_initialized()
+                and torch.cuda.get_device_capability(torch.cuda.current_device())
+                == (7, 5)
+            ):
+                # Turing worker: the FlashQLA-SM70 kernels cannot run here
+                # (64 KB dynamic smem limit vs. the kernels' 84 KB), so this
+                # stage builds the upstream GDN layer, which brings its own
+                # upstream attention backend (gdn_attn_sm75).
+                from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn_sm75 import (  # noqa: E501
+                    QwenGatedDeltaNetAttentionForkCall as QwenGatedDeltaNetAttentionSM75,
+                )
+
+                self.linear_attn = QwenGatedDeltaNetAttentionSM75(
+                    config=config,
+                    vllm_config=vllm_config,
+                    prefix=f"{prefix}.linear_attn",
+                    gqa_interleaved_layout=False,
+                )
+            else:
+                self.linear_attn = Qwen3_5GatedDeltaNet(
+                    config=config,
+                    vllm_config=vllm_config,
+                    prefix=f"{prefix}.linear_attn",
+                    gqa_interleaved_layout=False,
+                )
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(
                 config,

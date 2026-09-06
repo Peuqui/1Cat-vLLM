@@ -5,7 +5,7 @@ import itertools
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, overload
+from typing import Any, Literal, Protocol, TypeAlias, overload
 
 import regex as re
 import torch
@@ -38,12 +38,15 @@ from vllm.utils.torch_utils import (
 logger = init_logger(__name__)
 
 
+ShardId: TypeAlias = str | int | tuple[int, ...]
+
 @dataclass
 class WeightsMapper:
     """Maps the name of each weight if they match the following patterns.
 
     If a key maps to a value of `None`, the corresponding weight is ignored."""
 
+    orig_to_new_renaming: list["WeightRenaming"] = field(default_factory=list)
     orig_to_new_regex: Mapping[re.Pattern, str | None] = field(default_factory=dict)
     orig_to_new_substr: Mapping[str, str | None] = field(default_factory=dict)
     orig_to_new_stacked: Mapping[str, tuple[str, str | int | tuple[int, ...]]] = field(
@@ -55,6 +58,10 @@ class WeightsMapper:
     def __or__(self, other: "WeightsMapper") -> "WeightsMapper":
         """Combine two `WeightsMapper`s by merging their mappings."""
         return WeightsMapper(
+            orig_to_new_renaming=[
+                *self.orig_to_new_renaming,
+                *other.orig_to_new_renaming,
+            ],
             orig_to_new_regex={**self.orig_to_new_regex, **other.orig_to_new_regex},
             orig_to_new_substr={**self.orig_to_new_substr, **other.orig_to_new_substr},
             orig_to_new_stacked={
@@ -66,12 +73,27 @@ class WeightsMapper:
         )
 
     def _map_name(self, key: str) -> str | None:
+        """Map a weight name (wrapper that discards shard_id)."""
         result = self._map_name_with_shard(key)
         return result[0] if result is not None else None
 
     def _map_name_with_shard(
         self, key: str
     ) -> tuple[str, str | int | tuple[int, ...] | None] | None:
+        """Map a weight name and extract any shard_id metadata."""
+        # Deprecation warnings
+        if key.endswith(".kv_scale"):
+            logger.warning_once(
+                "DEPRECATED. Found kv_scale in the checkpoint. "
+                "This format is deprecated in favor of separate k_scale and "
+                "v_scale tensors and will be removed in a future release. "
+                "Functionally, we will remap kv_scale to k_scale and duplicate "
+                "k_scale to v_scale"
+            )
+
+        for renaming in self.orig_to_new_renaming:
+            key, _ = renaming.rename_source_key(key)
+
         for pattern, new_key in self.orig_to_new_regex.items():
             if pattern.search(key):
                 if new_key is None:
@@ -133,6 +155,27 @@ class WeightsMapper:
             for name, value in values.items()
             if (out_name := self._map_name(name)) is not None
         }
+
+    def get_rename_mapper(self) -> "WeightsMapper":
+        """Mapper variant keeping only the renames.
+
+        This is what consumers that *name* modules rather than load them need:
+        LoRA name parsing and the quantization config's layer lists.
+
+        Stacked maps are dropped so that constituent names (e.g. `q_proj`) survive
+        rather than being rewritten to the stacked vLLM name (`qkv_proj`). Mappings to
+        `None` are dropped because "do not load this weight" is meaningless to such a
+        consumer, and applying it would silently shrink a quantization config's ignore
+        list or make LoRA name parsing fail."""
+        remove_none = lambda d: {k: v for k, v in d.items() if v is not None}
+        return replace(
+            self,
+            orig_to_new_regex=remove_none(self.orig_to_new_regex),
+            orig_to_new_substr=remove_none(self.orig_to_new_substr),
+            orig_to_new_stacked={},
+            orig_to_new_prefix=remove_none(self.orig_to_new_prefix),
+            orig_to_new_suffix=remove_none(self.orig_to_new_suffix),
+        )
 
 
 class AutoWeightsLoader:
@@ -243,8 +286,15 @@ class AutoWeightsLoader:
                 )
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            # WeightsMapper.apply tags weights that `orig_to_new_stacked`
+            # folded into one packed parameter; their loaders take the shard
+            # as a third argument (fork). Upstream's error context is kept.
+            shard_id = getattr(weight_data, "shard_id", None)
             try:
-                weight_loader(param, weight_data)
+                if shard_id is None:
+                    weight_loader(param, weight_data)
+                else:
+                    weight_loader(param, weight_data, shard_id)
             except Exception as exc:
                 raise RuntimeError(
                     f"Error loading weight {weight_qualname!r} "
@@ -978,3 +1028,72 @@ def scatter_output_slices(
         sliced = output[offset : offset + n_tok]
         dest[idx] = sliced.clone() if clone else sliced
         offset += n_tok
+
+
+def maybe_fuse_shared_experts(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    *,
+    n_routed_experts: int,
+    n_shared_experts: int,
+    ckpt_prefix: str = "mlp.shared_experts",
+    enabled: bool | None = None,
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Route AITER fused-shared-expert checkpoint weights into fused slots.
+
+    When AITER fused-shared-experts is active, shared experts are packed into
+    the routed expert tensor. The checkpoint stores them under `ckpt_prefix`
+    as a single (possibly widened) tensor; this splits it into
+    `n_shared_experts` chunks named `mlp.experts.{n_routed_experts + j}` so
+    the `RoutedExperts` loader treats them as extra experts. Yields the input
+    unchanged when the fusion is inactive, so callers can wrap unconditionally.
+
+    Args:
+        weights: Iterable of `(name, tensor)` checkpoint pairs.
+        n_routed_experts: Number of routed experts; offsets the fused slots.
+        n_shared_experts: Number of shared experts packed into the tensor.
+        ckpt_prefix: Checkpoint module name of the shared experts.
+        enabled: Whether AITER fused-shared-experts is active. Defaults to
+            `rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()`; pass an
+            explicit value only when the model gates on something more (e.g.
+            quant-spec compatibility) and it must match its construction-time
+            decision.
+
+    Yields:
+        `(name, tensor)` pairs with shared experts routed to fused slots.
+    """
+    if enabled is None:
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        enabled = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+    if not enabled:
+        yield from weights
+        return
+
+    # Match on the dotted boundary so e.g. "mlp.shared_expert." does not also
+    # catch a sibling "mlp.shared_expert_gate".
+    prefix = f"{ckpt_prefix}."
+    for name, loaded_weight in weights:
+        if prefix not in name:
+            yield name, loaded_weight
+            continue
+        # gate/up split on the output dim; down_proj on the input dim.
+        split_dim = 1 if ("down_proj.weight" in name and loaded_weight.ndim > 1) else 0
+        total = loaded_weight.shape[split_dim]
+        if total % n_shared_experts != 0:
+            raise ValueError(
+                f"FSE shared-expert weight {name!r} has size {total} along axis "
+                f"{split_dim}, not divisible by n_shared_experts={n_shared_experts}."
+            )
+        chunk = total // n_shared_experts
+        for j in range(n_shared_experts):
+            sl = slice(j * chunk, (j + 1) * chunk)
+            if loaded_weight.ndim == 1:
+                chunk_weight = loaded_weight[sl]
+            elif split_dim == 0:
+                chunk_weight = loaded_weight[sl, :]
+            else:
+                chunk_weight = loaded_weight[:, sl]
+            yield (
+                name.replace(prefix, f"mlp.experts.{n_routed_experts + j}."),
+                chunk_weight,
+            )

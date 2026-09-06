@@ -3,6 +3,7 @@
 """Qwen4Exp position-learning enhancement layers."""
 
 import math
+import os
 from collections.abc import Iterable, Sequence
 from contextlib import nullcontext
 
@@ -64,7 +65,14 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
-from ..common.ple import copy_ple_embedding_shard_
+from ..common.ple import (
+    auto_ple_host_budget_bytes,
+    available_host_bytes,
+    copy_ple_embedding_shard_,
+    copy_ple_embedding_shard_split_,
+    kv_cache_bytes_for_max_model_len,
+    plan_ple_placement,
+)
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -323,8 +331,50 @@ def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
     explicit = getattr(config, "ple_offload_embedding", None)
     if explicit is not None:
         return bool(explicit)
-    capability = current_platform.get_device_capability()
-    return capability is not None and capability.to_int() == 70
+    # Fork fix (v100-skinny): decide on the WORKER'S device, not device 0 of
+    # the visibility list (#412 fix class) — on a heterogeneous pipeline the
+    # PLE stage may be an RTX 8000 while device 0 differs. And the split
+    # placement below serves every pre-Ampere card, not just exact Volta:
+    # neither can hold the fp16-materialized table the generic path compiles.
+    if not current_platform.is_cuda():
+        return False
+    major, _minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    return major < 8
+
+
+def _ple_host_budget_bytes() -> int | None:
+    """Host memory per rank for the PLE table, or None to derive it.
+
+    Read on every call rather than captured at import time: module-level
+    constants have repeatedly made switches in this fork silently ineffective.
+    """
+
+    raw = os.getenv("VLLM_QWEN4EXP_PLE_HOST_GIB", "").strip()
+    if not raw or raw.lower() == "auto":
+        return None
+    budget = float(raw)
+    if budget < 0:
+        raise ValueError(
+            f"VLLM_QWEN4EXP_PLE_HOST_GIB must not be negative, got {budget}"
+        )
+    return int(budget * 1024**3)
+
+
+def _ple_vram_reserve_bytes(device_total_bytes: int) -> int:
+    """Device memory the automatic placement keeps free.
+
+    It covers the activation peak and the graph pool, which the engine only
+    measures after the weights are placed -- so they cannot be read here. On
+    this deployment the gap between (weights + KV) and the utilization budget
+    stayed between 1.8 and 2.3 GiB of a 47 GiB card; the default leaves a
+    slightly wider margin. Overshooting costs host memory, undershooting makes
+    the KV allocator fail late.
+    """
+
+    raw = os.getenv("VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB", "").strip()
+    if raw:
+        return int(float(raw) * 1024**3)
+    return min(int(device_total_bytes * 0.08), 4 * 1024**3)
 
 
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
@@ -365,19 +415,27 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         meta_weight = self._parameters.get("weight")
         if not isinstance(meta_weight, torch.Tensor):
             raise RuntimeError("Qwen4Exp PLE meta weight was not initialized")
-        host_weight = ModelWeightParameter(
+        # Fork change (v100-skinny): split placement instead of an all-pinned
+        # table. Neither extreme fits this machine class: the full pinned
+        # shard exceeds host RAM, the full device shard leaves no room for
+        # the stage's layers. The real tables are built lazily by
+        # materialize_tables() on the first checkpoint shard, when every
+        # other weight of this stage is allocated and the auto budget can
+        # measure real headroom (same lifecycle as the 1.3.0 fork).
+        self._meta_weight_shape = tuple(meta_weight.shape)
+        self._meta_weight_dtype = meta_weight.dtype
+        placeholder = ModelWeightParameter(
             data=torch.empty(
-                tuple(meta_weight.shape),
+                (0, self.embedding_dim),
                 dtype=meta_weight.dtype,
                 device="cpu",
-                pin_memory=True,
             ),
             input_dim=1,
             output_dim=0,
             weight_loader=self.weight_loader,
         )
-        host_weight._vllm_keep_on_cpu = True
-        self.weight = host_weight
+        placeholder._vllm_keep_on_cpu = True
+        self.weight = placeholder
         self.weight_scale = create_fp8_scale_parameter(
             PerTensorScaleParameter,
             [self.num_embeddings_per_partition],
@@ -389,9 +447,129 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self._accelerator_weight_views: dict[int, torch.Tensor] = {}
         self._accelerator_weight_ptrs: dict[int, int] = {}
         self._output_dtype = self.weight_scale.dtype
+        self._vllm_config_ref = get_current_vllm_config()
+        self._device_rows = 0
+        self._host_rows = 0
+        self._device_table_ptr = 0
+        self.ple_device_table: torch.Tensor | None = None
+        self.ple_host_storage: torch.Tensor | None = None
+
+    def _resolve_host_budget(self, device: torch.device) -> int:
+        """Host bytes for the table: as configured, or derived from headroom.
+
+        Derived means: keep the table in device memory and spill only what
+        the requested context needs beside it (1.3.0 fork cascade).
+        """
+        explicit = _ple_host_budget_bytes()
+        if explicit is not None:
+            return explicit
+        vllm_config = self._vllm_config_ref
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        kv_bytes = kv_cache_bytes_for_max_model_len(vllm_config)
+        reserve_bytes = _ple_vram_reserve_bytes(total_bytes)
+        gmu = vllm_config.cache_config.gpu_memory_utilization
+        table_bytes = self._meta_weight_shape[0] * self.embedding_dim
+        budget = auto_ple_host_budget_bytes(
+            table_bytes=table_bytes,
+            device_total_bytes=total_bytes,
+            device_allocated_bytes=total_bytes - free_bytes,
+            gpu_memory_utilization=gmu,
+            kv_cache_bytes=kv_bytes,
+            reserve_bytes=reserve_bytes,
+        )
         logger.info(
-            "Qwen4Exp PLE shard allocated in pinned host memory: %s",
-            format_gib(self.weight.numel() * self.weight.element_size()),
+            "PLE auto placement: %.2f GiB usable at gmu=%.2f, %.2f GiB "
+            "already allocated, %.2f GiB KV for %d tokens, %.2f GiB reserve "
+            "-> %.2f GiB of the table go to host memory",
+            total_bytes * gmu / 1024**3,
+            gmu,
+            (total_bytes - free_bytes) / 1024**3,
+            kv_bytes / 1024**3,
+            vllm_config.model_config.max_model_len,
+            reserve_bytes / 1024**3,
+            budget / 1024**3,
+        )
+        return budget
+
+    def materialize_tables(self) -> None:
+        """Allocate the device and host halves of the FP8 table."""
+        if self.ple_device_table is not None:
+            return
+        device = torch.device("cuda", torch.cuda.current_device())
+        total_rows = self._meta_weight_shape[0]
+        host_budget = self._resolve_host_budget(device)
+        placement = plan_ple_placement(
+            total_rows=total_rows,
+            row_bytes=self.embedding_dim,
+            host_budget_bytes=host_budget,
+        )
+        needed = placement.host_rows * self.embedding_dim
+        available = available_host_bytes()
+        if needed and available is not None and needed > available:
+            raise RuntimeError(
+                f"PLE placement needs {needed / 1024**3:.2f} GiB of pinned "
+                f"host memory but only {available / 1024**3:.2f} GiB is "
+                "available, and every tensor-parallel rank pins its own "
+                "share. Lower the requested context or the host budget."
+            )
+        self.ple_device_table = torch.empty(
+            (placement.vram_rows, self.embedding_dim),
+            dtype=self._meta_weight_dtype,
+            device=device,
+        )
+        if placement.host_rows:
+            if not is_pin_memory_available():
+                raise RuntimeError(
+                    "PLE host placement needs pinned memory, which this "
+                    "platform reports as unavailable."
+                )
+            self.ple_host_storage = torch.empty(
+                (placement.host_rows, self.embedding_dim),
+                dtype=self._meta_weight_dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+        else:
+            self.ple_host_storage = torch.empty(
+                (0, self.embedding_dim),
+                dtype=self._meta_weight_dtype,
+                device="cpu",
+            )
+        self._device_rows = placement.vram_rows
+        self._host_rows = placement.host_rows
+        # Cached as a plain int: torch.compile cannot trace data_ptr() inside
+        # the forward (DataPtrVariable), the same reason the host pointer is
+        # cached in _accelerator_weight_ptrs.
+        self._device_table_ptr = self.ple_device_table.data_ptr()
+        logger.info(
+            "PLE table placement: %d of %d rows on device (%s), %d rows in "
+            "pinned host memory (%s)",
+            placement.vram_rows,
+            placement.total_rows,
+            format_gib(placement.vram_rows * self.embedding_dim),
+            placement.host_rows,
+            format_gib(placement.host_rows * self.embedding_dim),
+        )
+
+    def load_shard(
+        self,
+        loaded_weight: torch.Tensor,
+        *,
+        checkpoint_start: int,
+        tp_start: int,
+        tp_end: int,
+    ) -> int:
+        """Copy one checkpoint shard into whichever half owns its rows."""
+        self.materialize_tables()
+        assert self.ple_device_table is not None
+        assert self.ple_host_storage is not None
+        return copy_ple_embedding_shard_split_(
+            self.ple_device_table,
+            self.ple_host_storage,
+            loaded_weight,
+            checkpoint_start=checkpoint_start,
+            tp_start=tp_start,
+            tp_end=tp_end,
         )
 
     def get_accelerator_weight(self, device: torch.device) -> torch.Tensor:
@@ -410,8 +588,16 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 raise RuntimeError(
                     "Qwen4Exp PLE UVA view must be prepared before CUDA graph capture"
                 )
-            with torch.accelerator.device_index(device_index):
-                view = get_accelerator_view_from_cpu_tensor(self.weight)
+            assert self.ple_host_storage is not None, (
+                "PLE tables were never materialized"
+            )
+            if self.ple_host_storage.numel():
+                with torch.accelerator.device_index(device_index):
+                    view = get_accelerator_view_from_cpu_tensor(
+                        self.ple_host_storage
+                    )
+            else:
+                view = self.ple_host_storage
             self._accelerator_weight_views[device_index] = view
             self._accelerator_weight_ptrs[device_index] = view.data_ptr()
         return view
@@ -422,29 +608,69 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         )
 
     def embedding_lookup(self, input_: torch.Tensor) -> torch.Tensor:
-        """Gather FP8 UVA rows and emit scaled model-dtype values."""
+        """Gather FP8 rows from the device/host split and emit scaled values.
+
+        Both gathers always run (fork rule): branching on whether any id
+        falls into the host half would need a device-to-host sync on every
+        decode step. The unused gather reads row 0 and coalesces.
+        """
 
         device_index = (
             torch.accelerator.current_device_index()
             if input_.device.index is None
             else input_.device.index
         )
-        weight_ptr = self._accelerator_weight_ptrs.get(device_index)
-        if weight_ptr is None:
+        host_ptr = self._accelerator_weight_ptrs.get(device_index)
+        if host_ptr is None:
             self.get_accelerator_weight(input_.device)
-            weight_ptr = self._accelerator_weight_ptrs[device_index]
+            host_ptr = self._accelerator_weight_ptrs[device_index]
+        assert self.ple_device_table is not None
+        flat_ids = input_.reshape(-1)
         output = torch.empty(
             (*input_.shape, self.embedding_dim),
             dtype=self._output_dtype,
             device=input_.device,
         )
+        out_flat = output.reshape(-1, self.embedding_dim)
+        if self._host_rows == 0:
+            torch.ops.vllm.qwen4_exp_ple_pinned_gather(
+                flat_ids,
+                out_flat,
+                self.weight_scale,
+                self._device_table_ptr,
+                self.embedding_dim,
+            )
+            return output
+        if self._device_rows == 0:
+            torch.ops.vllm.qwen4_exp_ple_pinned_gather(
+                flat_ids,
+                out_flat,
+                self.weight_scale,
+                host_ptr,
+                self.embedding_dim,
+            )
+            return output
+        boundary = self._device_rows
+        on_host = flat_ids >= boundary
+        zero = flat_ids.new_zeros(())
+        device_ids = torch.where(on_host, zero, flat_ids)
+        host_ids = torch.where(on_host, flat_ids - boundary, zero)
+        host_out = torch.empty_like(out_flat)
         torch.ops.vllm.qwen4_exp_ple_pinned_gather(
-            input_.reshape(-1),
-            output.reshape(-1, self.embedding_dim),
+            device_ids,
+            out_flat,
             self.weight_scale,
-            weight_ptr,
+            self._device_table_ptr,
             self.embedding_dim,
         )
+        torch.ops.vllm.qwen4_exp_ple_pinned_gather(
+            host_ids,
+            host_out,
+            self.weight_scale,
+            host_ptr,
+            self.embedding_dim,
+        )
+        out_flat.copy_(torch.where(on_host.unsqueeze(-1), host_out, out_flat))
         return output
 
 
@@ -827,13 +1053,24 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                         f"expected {expected_shape}, got "
                         f"{tuple(loaded_weight.shape)}"
                     )
-                copy_ple_embedding_shard_(
-                    embedding.weight.data,
-                    loaded_weight,
-                    checkpoint_start=checkpoint_start,
-                    tp_start=embedding.shard_indices.org_vocab_start_index,
-                    tp_end=embedding.shard_indices.org_vocab_end_index,
-                )
+                if isinstance(embedding, Qwen4ExpPinnedHostEmbedding):
+                    # Fork change (v100-skinny): split placement — the
+                    # embedding routes each shard into its device or host
+                    # half itself (lazy materialization on first shard).
+                    embedding.load_shard(
+                        loaded_weight,
+                        checkpoint_start=checkpoint_start,
+                        tp_start=embedding.shard_indices.org_vocab_start_index,
+                        tp_end=embedding.shard_indices.org_vocab_end_index,
+                    )
+                else:
+                    copy_ple_embedding_shard_(
+                        embedding.weight.data,
+                        loaded_weight,
+                        checkpoint_start=checkpoint_start,
+                        tp_start=embedding.shard_indices.org_vocab_start_index,
+                        tp_end=embedding.shard_indices.org_vocab_end_index,
+                    )
                 loaded.add("ngram_embedding.weight")
                 continue
             regular_weights.append((name, loaded_weight))

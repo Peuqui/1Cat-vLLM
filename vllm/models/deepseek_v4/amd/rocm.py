@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.3.0
+# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
+# Changes: SWA ragged copy sized from the actual dense row width (drafting rows are wider than window_size).
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
@@ -553,8 +557,9 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             and base.decode_swa_indices is not None
             and base.decode_swa_lens is not None
         ):
+            dense_swa = base.decode_swa_indices.reshape(base.num_decode_tokens, -1)
             ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
-                base.decode_swa_indices.reshape(base.num_decode_tokens, -1),
+                dense_swa,
                 base.decode_swa_lens,
             )
             ragged_indices, ragged_indptr = _copy_ragged_to_graph_buffers(
@@ -563,7 +568,12 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
                 self.decode_swa_ragged_indices_buffer,
                 self.decode_swa_ragged_indptr_buffer,
                 base.num_decode_tokens,
-                self.window_size,
+                # Fork fix (v100-skinny): size the stable slice from the
+                # actual dense row width. The drafting path (DSpark block)
+                # builds SWA rows wider than `window_size` (window + block
+                # overlap), and the window_size assumption cut the copy
+                # short: 5 draft rows x 256 entries vs a 5 x 128 slice.
+                dense_swa.shape[1],
             )
 
         return DeepseekV4ROCMAiterSparseSWAMetadata(

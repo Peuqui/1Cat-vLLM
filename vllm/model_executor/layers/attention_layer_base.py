@@ -38,3 +38,12 @@ class AttentionLayerBase(ABC):
         May be None if the layer does not need KV cache.
         """
         pass
+
+    def bind_kv_cache(self, kv_cache: "torch.Tensor") -> None:
+        """Attach the allocated cache to this layer.
+
+        Layers that need derived views of their cache override this; the QSA
+        state caches, for instance, slice out the key window and the RoPE
+        position window. The default just stores the tensor.
+        """
+        self.kv_cache = kv_cache

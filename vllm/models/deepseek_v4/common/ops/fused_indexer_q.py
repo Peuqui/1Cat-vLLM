@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.3.0
+# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
+# Changes: the SM70 software indexer branch is keyed on the absence of
+# native FP8 units (< SM89) instead of exactly SM70, for mixed
+# V100+RTX8000 pipelines.
 
 import torch
 
@@ -388,7 +394,12 @@ def fused_indexer_q_rope_quant(
 
     index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
 
-    if current_platform.is_cuda() and current_platform.is_device_capability((7, 0)):
+    # Native FP8-Einheiten gibt es erst ab Ada (sm89). Die urspruengliche
+    # Bedingung traf GENAU sm70; die sm75-Stufen (RTX 8000) brauchen den
+    # Software-Pfad genauso (2026-09-01, Gruppe A der sm75-Koexistenz).
+    if current_platform.is_cuda() and not current_platform.has_device_capability(
+        (8, 9)
+    ):
         if use_fp4:
             raise RuntimeError(
                 "DeepSeek V4 SM70 uses the FP8 indexer cache; FP4 indexer "

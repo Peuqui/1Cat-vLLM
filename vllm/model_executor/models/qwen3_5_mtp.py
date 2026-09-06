@@ -35,6 +35,7 @@ from .interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
     _require_is_multimodal,
+    SupportsPP,
 )
 from .utils import (
     AutoWeightsLoader,
@@ -196,7 +197,10 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        if get_pp_group().is_first_rank:
+        # PP-Fix (Mini 2026-08-24): Der MTP-Drafter lebt vollstaendig auf der
+        # letzten Pipeline-Stufe und ist aus eigener Sicht einstufig — nach
+        # tatsaechlichem Input verzweigen, nicht nach globalem PP-Rank.
+        if intermediate_tensors is None:
             if inputs_embeds is None:
                 inputs_embeds = self.embed_input_ids(input_ids)
             assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
@@ -434,7 +438,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         "hidden_states": 0,
     }
 )
-class Qwen3_5MTP(nn.Module, SupportsMultiModal):
+class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -510,6 +514,7 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
             prefix=maybe_prefix(prefix, "mtp"),
             share_target_embed_tokens=self.share_target_io_weights,
         )
+        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
         if get_pp_group().is_last_rank:
             if self.share_target_io_weights:

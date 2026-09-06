@@ -170,6 +170,28 @@ def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
     return sorted(capture_sizes)
 
 
+
+def _any_visible_device_has_capability(capability: tuple[int, int]) -> bool:
+    """True if ANY visible CUDA device has exactly this compute capability.
+
+    ``current_platform.is_device_capability`` only ever looks at device 0,
+    which is the wrong question for a heterogeneous pipeline-parallel
+    deployment where each stage sits on a different architecture.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    try:
+        device_count = torch.cuda.device_count()
+    except Exception:
+        return current_platform.is_device_capability(capability)
+    for device_id in range(device_count):
+        if current_platform.is_device_capability(capability, device_id=device_id):
+            return True
+    return False
+
+
 def _sm70_mtp_cudagraph_capture_sizes(
     max_num_seqs: int,
     decode_query_len: int,
@@ -330,7 +352,7 @@ def apply_prefix_anchored_swa_constraints(cfg: "VllmConfig") -> None:
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     if not (
-        current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+        current_platform.is_cuda() and _any_visible_device_has_capability((7, 0))
     ):
         raise ValueError("prefix_anchored_decode_window requires an NVIDIA SM70 GPU")
 
@@ -1464,7 +1486,7 @@ class VllmConfig:
             and self.parallel_config.tensor_parallel_size <= 2
             and sm70_fp8_kv_requested
             and current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0))
+            and _any_visible_device_has_capability((7, 0))
             and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
             and envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             and "VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK" not in os.environ
@@ -1483,7 +1505,7 @@ class VllmConfig:
             and self.model_config.quantization == "fp8"
             and self.model_config.is_moe
             and current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0))
+            and _any_visible_device_has_capability((7, 0))
             and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
             and envs.VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK
             and not envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
@@ -1503,9 +1525,19 @@ class VllmConfig:
             attention_backend is None
             or attention_backend_name in ("FLASH_ATTN_V100", "FLASHINFER_SM70")
         )
+        # Heterogeneous PP: this block runs ONCE, in the parent process, and
+        # its env defaults are inherited by every worker. Keying it on device 0
+        # silently strips the whole SM70 tuning (GDN decode FlashQLA, the GDN
+        # schedules, packed recurrent decode, the 0DOT3 compile graph) from the
+        # V100 workers whenever device 0 happens to be a Turing/Ampere+ stage —
+        # which produced coherent-looking but progressively degrading output.
+        # Decide on the deployment, not on one card: if ANY visible device is
+        # SM70, the SM70 stage needs its baseline. The defaults are SM70-gated
+        # at their point of use, so a mixed deployment's other stages ignore
+        # them.
         sm70_flash_v100_baseline = (
             current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0))
+            and _any_visible_device_has_capability((7, 0))
             and envs.VLLM_SM70_FLASH_ATTN_V100
             and sm70_flash_v100_backend
         )
@@ -1635,7 +1667,7 @@ class VllmConfig:
                 )
             elif (
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_visible_device_has_capability((7, 0))
                 and envs.VLLM_SM70_FLASH_ATTN_V100
             ):
                 self.compilation_config.mode = CompilationMode.VLLM_COMPILE
@@ -1822,7 +1854,7 @@ class VllmConfig:
                 )
             elif (
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_visible_device_has_capability((7, 0))
                 and envs.VLLM_SM70_FLASH_ATTN_V100
             ):
                 capture_size = max(
@@ -1877,7 +1909,7 @@ class VllmConfig:
                 self.model_config is not None
                 and self.model_config.quantization == "fp8"
                 and current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_visible_device_has_capability((7, 0))
                 and envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             )
 
