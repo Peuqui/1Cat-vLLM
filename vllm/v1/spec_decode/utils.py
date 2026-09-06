@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -9,6 +10,10 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
 )
+from vllm.v1.utils import CpuGpuBuffer
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 PADDING_SLOT_ID = -1
 
@@ -316,6 +321,63 @@ def eagle_prepare_next_token_padded_kernel(
             tl.store(next_token_ids_ptr + req_idx, backup_token)
 
         tl.store(valid_sampled_tokens_count_ptr + req_idx, valid_count)
+
+
+def fill_backup_next_token_ids(
+    backup_next_token_ids: CpuGpuBuffer,
+    requests: dict[str, "CachedRequestState"],
+    gpu_input_batch: "InputBatch",
+) -> torch.Tensor:
+    """Fill the per-row backup token ids and return the GPU view.
+
+    The backup token is the last token before the speculative slots. It is
+    the next token for discarded requests, whose sampled row is dummy, and
+    for rows without a valid sampled token.
+    """
+    num_reqs = gpu_input_batch.num_reqs
+    for i in range(num_reqs):
+        backup_next_token_ids.np[i] = requests[gpu_input_batch.req_ids[i]].get_token_id(
+            gpu_input_batch.num_tokens_no_spec[i] - 1
+        )
+    backup_next_token_ids.copy_to_gpu(num_reqs)
+    return backup_next_token_ids.gpu
+
+
+def prepare_next_token_ids_padded(
+    sampled_token_ids: torch.Tensor,
+    discard_request_mask: torch.Tensor,
+    backup_next_token_ids: torch.Tensor,
+    vocab_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Next token id and number of valid sampled tokens per request row.
+
+    ``sampled_token_ids`` is the -1 padded [num_reqs, num_spec_tokens + 1]
+    sampler output. Only the contiguous valid prefix of a row counts; the
+    next token is its last token, or the backup token when the row is
+    discarded or has no valid token (see the kernel).
+    """
+    assert discard_request_mask.dtype == torch.bool
+    assert backup_next_token_ids.dtype == torch.int32
+
+    batch_size, num_tokens = sampled_token_ids.shape
+    device = sampled_token_ids.device
+    next_token_ids = torch.empty(batch_size, dtype=torch.int32, device=device)
+    valid_sampled_tokens_count = next_token_ids.new_empty(batch_size)
+
+    # Kernel grid: one program per request (row)
+    eagle_prepare_next_token_padded_kernel[(batch_size,)](
+        sampled_token_ids,
+        discard_request_mask,
+        backup_next_token_ids,
+        next_token_ids,
+        valid_sampled_tokens_count,
+        vocab_size,
+        num_tokens,
+        batch_size,
+        sampled_token_ids.stride(0),
+        BLOCK_SIZE_TOKENS=next_power_of_2(num_tokens),
+    )
+    return next_token_ids, valid_sampled_tokens_count
 
 
 def compute_new_slot_mapping(

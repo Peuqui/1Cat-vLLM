@@ -15,6 +15,7 @@ from vllm.model_executor.model_loader import get_model
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backend import AttentionMetadataBuilder, CommonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+from vllm.v1.spec_decode.utils import fill_backup_next_token_ids
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -315,13 +316,9 @@ class ExtractHiddenStatesProposer:
         num_reqs = gpu_input_batch.num_reqs
 
         # Precompute backup token IDs for discarded requests.
-        num_reqs = gpu_input_batch.num_reqs
-        for i in range(num_reqs):
-            self.backup_next_token_ids.np[i] = requests[
-                gpu_input_batch.req_ids[i]
-            ].get_token_id(gpu_input_batch.num_tokens_no_spec[i] - 1)
-        self.backup_next_token_ids.copy_to_gpu(num_reqs)
-        backup_tokens_gpu = self.backup_next_token_ids.gpu[:num_reqs]
+        backup_tokens_gpu = fill_backup_next_token_ids(
+            self.backup_next_token_ids, requests, gpu_input_batch
+        )[:num_reqs]
 
         assert discard_request_mask.dtype == torch.bool
 
