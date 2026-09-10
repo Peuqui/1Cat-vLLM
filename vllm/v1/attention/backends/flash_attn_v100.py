@@ -1319,8 +1319,13 @@ def _get_sm70_splitd_d256_ops():
             "sm70_d256_splitd_n32_paged_fwd",
         )
         with suppress(ImportError):
-            # Importing the interface loads the bundled FA2 torch library.
-            from vllm.vllm_flash_attn import flash_attn_interface  # noqa: F401
+            # The SM70 FA2 library carries these operators; load the one built
+            # for this worker's GPU.
+            from vllm.vllm_flash_attn import flash_attn_interface
+
+            flash_attn_interface.load_fa2_library(
+                torch.device("cuda", torch.cuda.current_device())
+            )
 
         namespace = getattr(torch.ops, "_vllm_fa2_C", None)
         if namespace is None or not all(
