@@ -8,6 +8,86 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
+# ---------------------------------------------------------------------------
+# fork (v100-skinny): torch reference implementations of the mHC block.
+# Historic role: fp16 execution path while the TileLang kernels were believed
+# to be bf16-only. Since the 1.3.0 rebase the TileLang kernels are dtype-
+# parameterized (use_fp16) and upstream added the SM70 Triton decode route
+# (backported in kernels/mhc/triton.py), so the public entries below dispatch
+# fp16 into the fast kernels again. These references remain for
+#   (a) mhc_post_fp32 -- the DSpark aux-hidden-state extraction reads the
+#       post reconstruction WITHOUT the final fp16 cast (BOS attention-sink
+#       row exceeds 65504 and poisoned every draft logit), and
+#   (b) numerics debugging against the kernel paths.
+# Math mirrors kernels/mhc/torch.py, fp32 internally.
+# ---------------------------------------------------------------------------
+
+
+def _mhc_pre_torch_generic(residual, fn, hc_scale, hc_base, rms_eps,
+                           hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
+                           sinkhorn_repeat, norm_weight=None, norm_eps=1e-6):
+    hc_mult, hidden = residual.shape[-2], residual.shape[-1]
+    outer = residual.shape[:-2]
+    rf = residual.reshape(-1, hc_mult, hidden)
+    t = rf.shape[0]
+    x = rf.reshape(t, hc_mult * hidden).to(torch.float32)
+    mixes = x @ fn.t()
+    sqrsum = x.square().sum(-1, keepdim=True)
+    mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden) + rms_eps)
+    pre = (torch.sigmoid(mixes[:, :hc_mult] * hc_scale[0]
+                         + hc_base[:hc_mult]) + hc_pre_eps)
+    post = (torch.sigmoid(mixes[:, hc_mult:2 * hc_mult] * hc_scale[1]
+                          + hc_base[hc_mult:2 * hc_mult])
+            * hc_post_mult_value)
+    comb = (mixes[:, 2 * hc_mult:].view(t, hc_mult, hc_mult) * hc_scale[2]
+            + hc_base[2 * hc_mult:].view(1, hc_mult, hc_mult))
+    comb = torch.softmax(comb, -1) + hc_sinkhorn_eps
+    comb = comb / (comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
+    for _ in range(sinkhorn_repeat - 1):
+        comb = comb / (comb.sum(-1, keepdim=True) + hc_sinkhorn_eps)
+        comb = comb / (comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
+    li = torch.sum(pre.unsqueeze(-1) * rf.to(torch.float32), dim=1)
+    if norm_weight is not None:
+        # vLLM RMSNorm semantics: fp32 normalize, cast, then weight.
+        li = li * torch.rsqrt(li.square().mean(-1, keepdim=True) + norm_eps)
+        li = li.to(residual.dtype) * norm_weight.to(residual.dtype)
+    else:
+        li = li.to(residual.dtype)
+    return (post.view(*outer, hc_mult, 1),
+            comb.view(*outer, hc_mult, hc_mult),
+            li.view(*outer, hidden))
+
+
+def _mhc_post_torch_generic(x, residual, post_layer_mix, comb_res_mix,
+                            out_dtype=None):
+    mixed = torch.einsum("...ij,...ih->...jh", comb_res_mix.to(torch.float32),
+                         residual.to(torch.float32))
+    post_term = (post_layer_mix.to(torch.float32)
+                 * x.unsqueeze(-2).to(torch.float32))
+    return (mixed + post_term).to(out_dtype or residual.dtype)
+
+
+def mhc_post_fp32(x, residual, post_layer_mix, comb_res_mix):
+    """Fork addition (v100-skinny): the mHC post reconstruction WITHOUT
+    the final cast to the activation dtype. The DSpark aux-hidden-state
+    extraction reads it: under fp16 the BOS row (attention sink) exceeds
+    65504 at that cast and poisoned every draft logit through the
+    drafter's context KV. The target itself never needs the BOS row of
+    its last layers, so it was unaffected. Same math as the fp16 path."""
+    return _mhc_post_torch_generic(x, residual, post_layer_mix, comb_res_mix,
+                                   out_dtype=torch.float32)
+
+
+def _hc_head_torch_generic(hs_flat, fn, hc_scale, hc_base, rms_eps, hc_eps):
+    t, hc, hidden = hs_flat.shape
+    x = hs_flat.reshape(t, hc * hidden).to(torch.float32)
+    mixes = x @ fn.t()
+    r = torch.rsqrt(x.square().sum(-1, keepdim=True) / (hc * hidden) + rms_eps)
+    pre = torch.sigmoid(mixes * r * hc_scale[0] + hc_base) + hc_eps
+    out = torch.einsum("tm,tmh->th", pre, hs_flat.to(torch.float32))
+    return out.to(hs_flat.dtype)
+
+
 logger = init_logger(__name__)
 
 
@@ -16,8 +96,9 @@ def _is_exact_sm70_glm_mhc(
 ) -> bool:
     if residual.dtype != torch.float16 or not current_platform.is_cuda():
         return False
-    capability = current_platform.get_device_capability()
-    if capability is None or capability.to_int() != 70:
+    # fork (v100-skinny): decide on the WORKER'S device, not device 0 --
+    # on the heterogeneous pipeline device 0 is a Turing card.
+    if torch.cuda.get_device_capability(torch.cuda.current_device()) != (7, 0):
         return False
     if residual.shape[-2:] != (4, 4096):
         return False
@@ -465,13 +546,16 @@ def mhc_pre_broadcast_tilelang(
     assert norm_weight is not None
 
     num_tokens = residual.shape[0]
+    # fork (v100-skinny): worker-local capability (see _is_exact_sm70_glm_mhc).
     capability = (
-        current_platform.get_device_capability() if current_platform.is_cuda() else None
+        torch.cuda.get_device_capability(torch.cuda.current_device())
+        if current_platform.is_cuda()
+        else None
     )
     use_sm70_triton = (
         use_fp16
         and capability is not None
-        and capability.to_int() == 70
+        and capability == (7, 0)
         and hidden_size == 4096
         and hc_mult == 4
     )
@@ -777,15 +861,18 @@ def mhc_fused_post_pre_tilelang(
         else:
             n_splits = 1
 
+    # fork (v100-skinny): worker-local capability (see _is_exact_sm70_glm_mhc).
     capability = (
-        current_platform.get_device_capability() if current_platform.is_cuda() else None
+        torch.cuda.get_device_capability(torch.cuda.current_device())
+        if current_platform.is_cuda()
+        else None
     )
     use_sm70_fp32_stage = (
         envs.VLLM_SM70_DSV4_MHC_FP32_STAGE
         and use_small_fma
         and use_fp16
         and capability is not None
-        and capability.to_int() == 70
+        and capability == (7, 0)
         and 1 <= num_tokens <= 8
         and hidden_size == 4096
         and hc_mult == 4
@@ -974,7 +1061,7 @@ def mhc_fused_post_pre_tilelang(
     use_sm70_pre_norm = (
         use_fp16
         and capability is not None
-        and capability.to_int() == 70
+        and capability == (7, 0)
         and norm_weight is not None
         and hidden_size == 4096
         and hc_mult == 4
@@ -1118,6 +1205,19 @@ def hc_head_fused_kernel_tilelang(
 ) -> torch.Tensor:
     """Apply the fused hc_head kernel and preserve the activation dtype."""
     activation_dtype = _require_mhc_activation_dtype(hs_flat)
+    if (
+        activation_dtype == torch.float16
+        and current_platform.is_cuda()
+        and torch.cuda.get_device_capability(torch.cuda.current_device()) < (8, 0)
+    ):
+        # fork (v100-skinny): the hc_head TileLang codegen crashes on
+        # pre-Ampere targets (verified on SM70 AND SM75: tvm-ffi raises
+        # during BuildTileLangCUDA and the exception path segfaults).
+        # hc_head runs once per forward on the last PP stage only, so the
+        # proven torch reference -- the production path to date -- stays.
+        return _hc_head_torch_generic(
+            hs_flat, fn, hc_scale, hc_base, rms_eps, hc_eps
+        )
     num_tokens, hc_mult, hidden_size = hs_flat.shape
     out = torch.empty(
         num_tokens, hidden_size, dtype=activation_dtype, device=hs_flat.device

@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.3.0
+# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
+# Changes: per-rank KV availability logging.
 """A GPU worker class."""
 
 import gc
@@ -207,7 +211,25 @@ class Worker(WorkerBase):
                 f"{parallel_config.data_parallel_size} local ranks)"
             )
         if parallel_config.pipeline_parallel_size != 1:
-            unsupported.append(f"PP={parallel_config.pipeline_parallel_size}")
+            # Fork fix (v100-skinny): PP is fine as long as every PLE layer
+            # sits on the first pipeline stage (same partition rule as the
+            # GPUModelRunner / Qwen4ExpModelState gates) -- the offload
+            # worker serves exactly the tp ranks of stage 0, which is the
+            # dp*tp worker count computed in spawn_ple_offload.
+            from vllm.distributed.utils import get_pp_indices
+
+            text_config = self.model_config.hf_text_config
+            ple_layer_ids = getattr(text_config, "ple_layer_ids", ()) or ()
+            num_hidden_layers = int(text_config.num_hidden_layers)
+            _, first_rank_end = get_pp_indices(
+                num_hidden_layers, 0, parallel_config.pipeline_parallel_size
+            )
+            if any(layer_id >= first_rank_end for layer_id in ple_layer_ids):
+                unsupported.append(
+                    f"PP={parallel_config.pipeline_parallel_size} with PLE "
+                    f"layers outside stage 0 (stage 0 holds layers "
+                    f"0..{first_rank_end - 1})"
+                )
         if parallel_config.prefill_context_parallel_size != 1:
             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
         if parallel_config.decode_context_parallel_size != 1:
@@ -622,7 +644,7 @@ class Worker(WorkerBase):
             format_gib(free_gpu_memory - unrequested_memory),
         )
         logger.debug(profile_result)
-        logger.info_once(
+        logger.info(
             "Available KV cache memory: %s GiB",
             format_gib(self.available_kv_cache_memory_bytes),
         )

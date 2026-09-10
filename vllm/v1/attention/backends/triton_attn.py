@@ -54,7 +54,14 @@ _logged_sm70_fp8_kv_cpp_cache_update = False
 
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
-NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+# SPEC-DECODE-3D-FIX Teil 2 (2026-08-29): 16 Segmente heissen bei 30k
+# Kontext ~1.900 Token SERIELL je Segment-Programm — auf Karten ohne
+# FlashAttention-Backend (sm75) ist das der Decode-Flaschenhals
+# (RTX 8000: 15,3 tok/s @30k). Mehr Segmente = mehr Parallelitaet ueber
+# die Kontextachse; bei kurzen Sequenzen regelt act_num_segments die
+# ueberzaehligen Segmente ohnehin ab. Override: VLLM_TRITON_SOFTMAX_SEGMENTS.
+import os as _os
+NUM_PAR_SOFTMAX_SEGMENTS = int(_os.environ.get("VLLM_TRITON_SOFTMAX_SEGMENTS", "64"))
 
 
 def _sm70_fp8_kv_needs_cpp_cache_update(

@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.5.0
+# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
+# Changes: is_last_pp_first_tp_rank() -- the rank that emits per-step
+# spec-decode reports under pipeline parallelism (PR #512 upstream).
 
 # Copyright 2023 The vLLM team.
 # Adapted from
@@ -487,12 +492,27 @@ class GroupCoordinator:
         self_cpu_group = None
 
         from vllm.distributed.utils import get_cpu_distributed_timeout_or_none
+        from vllm.config import get_current_vllm_config_or_none
 
         timeout = get_cpu_distributed_timeout_or_none()
+        # Upstream hands --distributed-timeout-seconds to init_process_group
+        # (the world group) and to the gloo CPU groups, but creates the NCCL
+        # subgroups without it, so TP and PP silently keep PyTorch's 600 s
+        # default. On a COLD boot with pipeline parallelism the first stage
+        # compiles Triton kernels for minutes while the next stage sits in its
+        # receive; the watchdog then kills the waiting rank and the boot dies
+        # at a timeout instead of an error (Flash-Next MTP, 2026-09-06). The
+        # subgroups follow the configured value; unset means PyTorch's default.
+        _config = get_current_vllm_config_or_none()
+        device_timeout = None
+        if _config is not None:
+            _seconds = _config.parallel_config.distributed_timeout_seconds
+            if _seconds is not None:
+                device_timeout = timedelta(seconds=_seconds)
 
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
+                ranks, backend=torch_distributed_backend, timeout=device_timeout
             )
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.

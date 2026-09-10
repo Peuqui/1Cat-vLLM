@@ -670,8 +670,10 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             self.c128a_prefill_buffer,
             max_compressed_tokens=active_topk_width,
             fixed_row_stride=(
+                # Fork fix (v100-skinny): worker-local capability; the
+                # layout is consumed on this same rank only.
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and torch.cuda.get_device_capability(torch.cuda.current_device()) == (7, 0)
             ),
         )
 

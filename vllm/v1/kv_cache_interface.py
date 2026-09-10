@@ -156,6 +156,17 @@ class AttentionSpec(KVCacheSpec):
     dtype: torch.dtype
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
+    head_size_v: int = None  # type: ignore[assignment]
+    """Value head size; defaults to ``head_size``. Zero for key-only caches
+    such as the QSA ring, which stores no values at all."""
+
+    def __post_init__(self):
+        if self.head_size_v is None:
+            object.__setattr__(self, "head_size_v", self.head_size)
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return True
 
     @property
     def page_size_bytes(self) -> int:
@@ -175,20 +186,21 @@ class AttentionSpec(KVCacheSpec):
     @property
     def real_page_size_bytes(self) -> int:
         if self.kv_quant_mode.is_nvfp4:
-            # Packed layout: fp4 data + fp8 block scales per head.
+            # Packed layout per head: fp4 data + fp8 block scales.
+            # fp4 data: head_size//2 bytes (2 fp4 values per byte)
+            # fp8 block scale: head_size//16 bytes (1 scale per 16 elements)
             full_dim = nvfp4_kv_cache_full_dim(self.head_size)
+            full_dim_v = nvfp4_kv_cache_full_dim(self.head_size_v)
             return (
-                2
-                * self.block_size
+                self.block_size
                 * self.num_kv_heads
-                * full_dim
+                * (full_dim + full_dim_v)
                 * get_dtype_size(self.dtype)
             )
         return (
-            2
-            * self.block_size
+            self.block_size
             * self.num_kv_heads
-            * self.head_size
+            * (self.head_size + self.head_size_v)
             * get_dtype_size(self.dtype)
         )
 
@@ -204,17 +216,11 @@ class FullAttentionSpec(AttentionSpec):
     In this case, we use FullAttentionSpec and record the sliding window size.
     """
 
-    head_size_v: int = None  # type: ignore[assignment]
-
     sliding_window: int | None = None
     """
     Default to None for not using sliding window attention.
     """
     attention_chunk_size: int | None = None
-
-    def __post_init__(self):
-        if self.head_size_v is None:
-            object.__setattr__(self, "head_size_v", self.head_size)
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
@@ -283,28 +289,6 @@ class FullAttentionSpec(AttentionSpec):
             "layers is not supported."
         )
         return merged_spec
-
-    @property
-    def real_page_size_bytes(self) -> int:
-        if self.kv_quant_mode.is_nvfp4:
-            # Packed layout per head: fp4 data + fp8 block scales.
-            # fp4 data: head_size//2 bytes (2 fp4 values per byte)
-            # fp8 block scale: head_size//16 bytes (1 scale per 16 elements)
-            last_dim = nvfp4_kv_cache_full_dim(
-                self.head_size
-            ) + nvfp4_kv_cache_full_dim(self.head_size_v)
-            return (
-                self.block_size
-                * self.num_kv_heads
-                * last_dim
-                * get_dtype_size(self.dtype)
-            )
-        return (
-            self.block_size
-            * self.num_kv_heads
-            * (self.head_size + self.head_size_v)
-            * get_dtype_size(self.dtype)
-        )
 
 
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
@@ -495,31 +479,6 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
 @dataclass(frozen=True, kw_only=True)
 class SlidingWindowSpec(AttentionSpec):
     sliding_window: int
-    head_size_v: int = None  # type: ignore[assignment]
-
-    def __post_init__(self):
-        if self.head_size_v is None:
-            object.__setattr__(self, "head_size_v", self.head_size)
-
-    @property
-    def real_page_size_bytes(self) -> int:
-        # Mirror ``FullAttentionSpec.real_page_size_bytes`` for NVFP4 KV cache.
-        if self.kv_quant_mode.is_nvfp4:
-            last_dim = nvfp4_kv_cache_full_dim(
-                self.head_size
-            ) + nvfp4_kv_cache_full_dim(self.head_size_v)
-            return (
-                self.block_size
-                * self.num_kv_heads
-                * last_dim
-                * get_dtype_size(self.dtype)
-            )
-        return (
-            self.block_size
-            * self.num_kv_heads
-            * (self.head_size + self.head_size_v)
-            * get_dtype_size(self.dtype)
-        )
 
     def max_admission_blocks_per_request(
         self, max_in_flight_tokens: int, max_model_len: int
@@ -559,6 +518,16 @@ class CircularBufferSpec(AttentionSpec):
 
     head_size_v: int = 0
 
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, "KVCacheSpec"]
+    ) -> bool:
+        # 1.3.0 semantics: the ring group is uniform when every member is a
+        # ring spec (block sizes are pre-checked by is_uniform_type).
+        return all(
+            isinstance(spec, CircularBufferSpec)
+            for spec in kv_cache_specs.values()
+        )
+
     @property
     def real_page_size_bytes(self) -> int:
         return (
@@ -588,6 +557,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     model_version: str | None = None
 
     def __post_init__(self):
+        super().__post_init__()
         _apply_alignment_padding(self)
 
     @property
@@ -813,6 +783,10 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         one_spec = next(iter(kv_cache_specs.values()))
         # NOTE: Check subclasses before parent classes since isinstance()
         # returns True for subclasses.
+        if isinstance(one_spec, CircularBufferSpec):
+            # The ring spec decides for itself; see its
+            # is_uniform_with_collection.
+            return one_spec.is_uniform_with_collection(kv_cache_specs)
         if isinstance(one_spec, SlidingWindowMLASpec):
             # SlidingWindowMLASpec is uniform if all specs are SlidingWindowMLASpec
             # with the same sliding_window size.
@@ -820,10 +794,6 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
                 isinstance(spec, SlidingWindowMLASpec)
                 and spec.sliding_window == one_spec.sliding_window
                 for spec in kv_cache_specs.values()
-            )
-        elif isinstance(one_spec, CircularBufferSpec):
-            return all(
-                isinstance(spec, CircularBufferSpec) for spec in kv_cache_specs.values()
             )
         elif isinstance(one_spec, FullAttentionSpec):
             return all(
@@ -869,7 +839,7 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         else:
             return None
 
-    # NOTE: below util functions are only used by DeepseekV4 for now.
+    # Helpers for cache formats composed of repeated physical layer tuples.
     def get_page_sizes(self) -> list[int]:
         return list(set(spec.page_size_bytes for spec in self.kv_cache_specs.values()))
 
@@ -975,7 +945,15 @@ class KVCacheConfig:
 
     @property
     def has_mamba_layers(self) -> bool:
-        return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)
+        for group in self.kv_cache_groups:
+            group_spec = group.kv_cache_spec
+            if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                # 1.5.0 dropped the 1.3.0 first_spec property; the group is
+                # uniform by construction, so any member decides the type.
+                group_spec = next(iter(group_spec.kv_cache_specs.values()))
+            if isinstance(group_spec, MambaSpec):
+                return True
+        return False
 
     @property
     def needs_kv_cache_zeroing(self) -> bool:

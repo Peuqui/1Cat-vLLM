@@ -1,5 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.2.2
+# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
+# Changes: adds checkpoint_kv_quant_allowed() -- a checkpoint's
+# kv_cache_quant_algo describes how its WEIGHTS were made, so below SM80
+# it is no longer honoured as a KV-cache directive. Without this the
+# verbatim checkpoint silently booted an FP8 KV cache and lost the
+# tensor-core decode route (+4.82 ms/round).
 import contextlib
 import importlib.metadata
 import os
@@ -373,6 +381,40 @@ def get_kv_cache_quant_algo_dtype(quant_cfg: dict[str, Any]) -> torch.dtype | No
     return None
 
 
+def checkpoint_kv_quant_allowed() -> bool:
+    """May a checkpoint's own metadata select a quantized KV cache here?
+
+    A checkpoint that declares `kv_cache_quant_algo` / `kv_cache_scheme` is
+    describing how its WEIGHTS were produced. vLLM has historically read that
+    as standing permission to also run the KV cache quantized whenever the
+    user left --kv-cache-dtype at "auto". On hardware with no FP8 support
+    that is a bad trade: pre-Ampere parts have to unpack FP8 in software and
+    the tensor-core decode kernel becomes unavailable, so the KV cache is
+    quantized at a large speed cost the user never asked for.
+
+    Measured on 4x V100 (SM70), Qwen3.8-27B, the inherited FP8 KV cache moved
+    decode attention from the tensor-core `xqa_tc` route to `scalar_paged`
+    and cost +4.82 ms/round -- 4.5x the entire cost of the FP8 weights it
+    shipped alongside. See results/mixed_regression_closed_20260818.md.
+
+    So: weight-quantization metadata is not permission to quantize the KV
+    cache. Below SM80 the directive is ignored unless the user asked for a
+    quantized KV cache explicitly (an explicit --kv-cache-dtype never reaches
+    this function). Set VLLM_SM70_ALLOW_CKPT_KV_QUANT=1 for the old behaviour.
+    """
+    import os
+
+    if os.getenv("VLLM_SM70_ALLOW_CKPT_KV_QUANT", "0") == "1":
+        return True
+    try:
+        from vllm.platforms import current_platform
+
+        return bool(current_platform.has_device_capability(80))
+    except Exception:
+        # Never let a capability probe break startup; default to upstream.
+        return True
+
+
 def resolve_kv_cache_dtype_string(
     kv_cache_dtype: str, model_config: ModelConfig
 ) -> str:
@@ -388,6 +430,16 @@ def resolve_kv_cache_dtype_string(
         if quant_cfg is not None:
             kv_algo_str = get_kv_cache_quant_algo_string(quant_cfg)
             if kv_algo_str is not None:
+                if not checkpoint_kv_quant_allowed():
+                    logger.info(
+                        "Ignoring the checkpoint's kv_cache quantization "
+                        "directive (%s): this device has no FP8 support, so "
+                        "the KV cache stays unquantized and decode attention "
+                        "keeps its tensor-core route. Pass --kv-cache-dtype "
+                        "explicitly to override.",
+                        kv_algo_str,
+                    )
+                    return "auto"
                 return kv_algo_str
 
     # Default to auto (will be handled by downstream code)

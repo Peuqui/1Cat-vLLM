@@ -308,6 +308,28 @@ def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
     return sorted(capture_sizes)
 
 
+
+def _any_visible_device_has_capability(capability: tuple[int, int]) -> bool:
+    """True if ANY visible CUDA device has exactly this compute capability.
+
+    ``current_platform.is_device_capability`` only ever looks at device 0,
+    which is the wrong question for a heterogeneous pipeline-parallel
+    deployment where each stage sits on a different architecture.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    try:
+        device_count = torch.cuda.device_count()
+    except Exception:
+        return current_platform.is_device_capability(capability)
+    for device_id in range(device_count):
+        if current_platform.is_device_capability(capability, device_id=device_id):
+            return True
+    return False
+
+
 def _sm70_mtp_cudagraph_capture_sizes(
     max_num_seqs: int,
     decode_query_len: int,
@@ -1839,6 +1861,19 @@ class VllmConfig:
             attention_backend is None
             or attention_backend_name in ("FLASH_ATTN_V100", "FLASHINFER_SM70")
         )
+        # Heterogeneous PP: this block runs ONCE, in the parent process, and
+        # its env defaults are inherited by every worker. Keying it on device 0
+        # silently strips the whole SM70 tuning (GDN decode FlashQLA, the GDN
+        # schedules, packed recurrent decode, the 0DOT3 compile graph) from the
+        # V100 workers whenever device 0 happens to be a Turing/Ampere+ stage —
+        # which produced coherent-looking but progressively degrading output.
+        # Decide on the deployment, not on one card: if ANY visible device is
+        # SM70, the SM70 stage needs its baseline. The defaults are SM70-gated
+        # at their point of use, so a mixed deployment's other stages ignore
+        # them.
+        # FIX2: die SM70-Grundabstimmung ist eine pre-Ampere-Abstimmung, keine
+        # Volta-Abstimmung. Ein reines Turing-System bekam sie nie und lieferte
+        # Muell.
         sm70_flash_v100_baseline = (
             current_platform.is_cuda()
             and _any_participating_device_is_pre_ampere(self)
@@ -2139,28 +2174,16 @@ class VllmConfig:
                             "configuration: regular torch.compile reproduced "
                             "deterministic greedy token drift."
                         )
-                if envs.VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING:
-                    logger.warning_once(
-                        "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING=1: "
-                        "leaving VLLM_DISABLE_COMPILE_CACHE unset for "
-                        "diagnostic profiling. This reuses compile artifacts "
-                        "and is not a quality-parity baseline."
-                    )
-                elif "VLLM_DISABLE_COMPILE_CACHE" not in os.environ:
-                    os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
-                    logger.info_once(
-                        "Auto-setting VLLM_DISABLE_COMPILE_CACHE=1 for SM70 "
-                        "Flash-V100 0.0.3 compile graph quality parity; "
-                        "decode throughput is preserved, but AOT artifact "
-                        "reload stays disabled until its token drift is fixed."
-                    )
-                elif os.environ.get("VLLM_DISABLE_COMPILE_CACHE") == "0":
-                    logger.warning_once(
-                        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 with "
-                        "explicit VLLM_DISABLE_COMPILE_CACHE=0 is a "
-                        "diagnostic-only configuration: cached AOT artifact "
-                        "reload reproduced deterministic greedy token drift."
-                    )
+                # Der Compile-Cache lief hier zwangsabgeschaltet, weil das
+                # Wiederladen eines AOT-Artefakts reproduzierbares Token-Drift
+                # erzeugte. Ursache gefunden (2026-09-06): compile_factors()
+                # kannte die roh gelesenen VLLM_-Schalter nicht, die den
+                # Kernelweg umlegen -- der Schluessel unterschied die Wege also
+                # nicht und ein fremdes Artefakt wurde geladen (belegt bis zum
+                # Startabbruch mit KeyError 'skinny_codes'). Der Fix sitzt in
+                # envs.py (1Cat PR #536, upstream gemergt als 53199eb8); damit
+                # ist die Zwangsabschaltung gegenstandslos. Leerer Cache kostete
+                # in der Kalibration rund zwei Stunden je Lauf.
                 self.compilation_config.inductor_compile_config["combo_kernels"] = True
                 self.compilation_config.inductor_compile_config[
                     "benchmark_combo_kernel"

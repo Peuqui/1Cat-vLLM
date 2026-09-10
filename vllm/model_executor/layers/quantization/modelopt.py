@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.2.2
+# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
+# Changes: adds the SM70 QPN8 FP8 W8A16 path (custom mma.sync.m8n8k4
+# kernels incl. the MT=2 two-tile variant), lowers the ModelOpt minimum
+# compute capability from SM89 to SM70, and adds route/census logging.
 
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any
@@ -115,6 +121,12 @@ QUANT_ALGOS = [
     "MIXED_PRECISION",
 ]
 KV_CACHE_QUANT_ALGOS = ["FP8", "NVFP4"]
+
+
+import os as _os
+
+_SM70_MODELOPT = _os.environ.get("VLLM_SM70_MODELOPT", "1") == "1"
+_SM70_MIN_CAP = 70
 
 
 class ModelOptKVCacheMethod(BaseKVCacheMethod):
@@ -406,7 +418,7 @@ class ModelOptFp8Config(ModelOptQuantConfigBase):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 89
+        return _SM70_MIN_CAP if _SM70_MODELOPT else 89
 
     @classmethod
     def override_quantization_method(
@@ -435,6 +447,335 @@ class ModelOptFp8Config(ModelOptQuantConfigBase):
             kv_cache_quant_method,
             exclude_modules,
         )
+
+
+
+_SM70_FP8_REFERENCE = _os.environ.get("VLLM_SM70_FP8_REFERENCE", "1") == "1"
+_sm70_fp8_census_seen: set = set()
+
+
+def _sm70_fp8_process(layer) -> None:
+    """Keep FP8 codes exactly as published; record slice scales."""
+    import torch as _torch
+    w = layer.weight.data
+    scales = layer.weight_scale.data.detach().clone().float().flatten()
+    widths = list(getattr(layer, "logical_widths", None) or [w.shape[0]])
+    layer._sm70_fp8 = True
+    layer._sm70_widths = widths
+    layer.weight = _torch.nn.Parameter(w, requires_grad=False)
+    layer.weight_scale = _torch.nn.Parameter(scales, requires_grad=False)
+    try:
+        layer._qpn8_ok = _sm70_qpn8_stash(layer)
+        if not layer._qpn8_ok:
+            logger.warning("QPN8_CENSUS_LOAD layer=%s eligible=NO "
+                           "reason=shape/scale gate", getattr(layer, "prefix", "?"))
+    except Exception as exc:                      # never fail a boot on this
+        logger.warning("QPN8_CENSUS_LOAD layer=%s eligible=NO reason=%s",
+                       getattr(layer, "prefix", "?"), exc)
+        layer._qpn8_ok = False
+    name = getattr(layer, "prefix", "") or "?"
+    key = name.rsplit(".", 1)[-1]
+    if key not in _sm70_fp8_census_seen:
+        _sm70_fp8_census_seen.add(key)
+        logger.info("SM70 FP8 census: %s dtype=%s shape=%s widths=%s scales=%s",
+                    name, w.dtype, tuple(w.shape), widths,
+                    [round(float(v), 9) for v in scales[:4]])
+
+
+from torch.library import custom_op as _sm70_custom_op
+
+
+@_sm70_custom_op("sm70_fp8::reference_linear", mutates_args=())
+def _sm70_fp8_reference_linear(x: torch.Tensor, w: torch.Tensor,
+                               scales: torch.Tensor,
+                               widths: list[int]) -> torch.Tensor:
+    """BRING-UP REFERENCE ONLY -- materializes fp16 weights per call.
+
+    Opaque to Inductor: Volta's Triton cannot emit an fp8e4nv cast.
+    QPN8 replaces this entirely; nothing here is the shipping design.
+    """
+    wf = w.to(x.dtype)
+    if scales.numel() > 1 and len(widths) == scales.numel():
+        off = 0
+        for i, wd in enumerate(widths):
+            wf[off:off + wd] = wf[off:off + wd] * scales[i].to(x.dtype)
+            off += wd
+    elif scales.numel():
+        wf = wf * scales.max().to(x.dtype)
+    return torch.nn.functional.linear(x, wf)
+
+
+@_sm70_fp8_reference_linear.register_fake
+def _sm70_fp8_reference_linear_fake(x, w, scales, widths):
+    return x.new_empty(x.shape[:-1] + (w.shape[0],))
+
+
+# The dispatch shape this path shipped with before it was refactored to match
+# MarlinNvFp4LinearKernel: branch on M in Python, emit one of TWO ops. Kept
+# behind a flag so the two forms can be A/B'd by a boot flag instead of a
+# revert -- the single-op refactor was adopted on a boot that later proved to
+# be an outlier, so the comparison was never actually made cleanly.
+_SM70_QPN8_TWOOP = _os.environ.get("VLLM_SM70_QPN8_TWOOP", "0") == "1"
+# Highest M served by chunked native calls before falling back to a transient
+# fp16 reconstruct. Measured crossover is 104-116 per shape; see the dispatch
+# comment in _sm70_qpn8_linear. Set to 16 to restore the old boundary.
+_SM70_QPN8_CHUNK_MAX = int(_os.environ.get("VLLM_SM70_QPN8_CHUNK_MAX", "96"))
+# MT=2 serves M=9..16 with ONE weight pass (two m8n8k4 row-tiles against one B
+# fragment) instead of chunking's two. Measured 1.65x over chunked across the
+# protected set at M=16 (5.182 -> 3.132 ms/round), same 2.75e-4 as native.
+# It wants its own geometry -- nacc=1 + the fast decoder, opposite to the
+# native table's nacc=2 -- so the table is separate. Key is (N, K); the nacc
+# field carries +2 to select the fast decoder, matching the launcher's
+# splitk*10+nacc encoding.
+_SM70_QPN8_MT2 = _os.environ.get("VLLM_SM70_QPN8_MT2", "1") == "1"
+# split16 / nacc1 / fast decoder wins on all three shapes once the fast
+# decoder is correct (it had two bugs and had never produced a right answer;
+# see fp8x8_to_half2x4_fast). Every entry here is validated numerically by
+# benchmarks/qpn8_mt2_eval.py, which now refuses to recommend a config it
+# has not checked -- a timing-only sweep once selected a NaN-producing path
+# and the server happily accepted 98.8% of drafts at every position.
+_SM70_QPN8_MT2_TABLE = {(4096, 5120): (16, 3), (5120, 1536): (16, 3),
+                        (3584, 5120): (16, 3)}
+
+
+def _sm70_fp8_apply(layer, x, bias):
+    _ok = getattr(layer, "_qpn8_ok", False)
+    if _ok:
+        # Mirror MarlinNvFp4LinearKernel.apply_weights exactly: reshape, ONE op
+        # call (routing lives inside the op, so the FX graph holds a single
+        # node for every M), bias, reshape.
+        n, k = layer._qpn8_shape
+        splitk, nacc = layer._qpn8_cfg
+        xc = x.reshape(-1, k).contiguous()
+        if _SM70_QPN8_TWOOP:
+            y = (torch.ops.sm70_fp8.qpn8_linear(
+                     xc, layer._qpn8_codes, layer._qpn8_tscale,
+                     n, k, splitk, nacc)
+                 if xc.shape[0] <= 16 else
+                 torch.ops.sm70_fp8.qpn8_prefill(
+                     xc, layer._qpn8_codes, layer._qpn8_tscale, n, k))
+        else:
+            y = torch.ops.sm70_fp8.qpn8_linear(
+                xc, layer._qpn8_codes, layer._qpn8_tscale, n, k, splitk, nacc)
+        if bias is not None:
+            y = y + bias
+        return y.reshape(x.shape[:-1] + (n,))
+    y = torch.ops.sm70_fp8.reference_linear(
+        x, layer.weight, layer.weight_scale, layer._sm70_widths)
+    if bias is not None:
+        y = y + bias
+    return y
+
+
+
+_SM70_QPN8 = _os.environ.get("VLLM_SM70_QPN8", "1") == "1"
+_SM70_QPN8_TABLE = {(4096, 5120): (16, 2), (5120, 1536): (8, 2),
+                    (3584, 5120): (16, 2)}
+_sm70_qpn8_verified = [0]
+_sm70_qpn8_verified_shapes: set = set()
+_sm70_qpn8_calls = [0]
+_sm70_census_seen: set = set()
+_sm70_qpn8_eligible = [0]
+
+_KORDER8 = [0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15]
+
+
+
+_sm70_qpn8_indices_cache: dict = {}
+
+
+def _sm70_qpn8_indices(n, k, dev):
+    # Pro (n, k, dev) deterministisch; der Aufruf laeuft bei JEDEM
+    # Prefill-Reconstruct-GEMM (~9 % CPU-Zeit je Schritt im Profil
+    # 2026-08-30) — deshalb memoisiert.
+    key = (n, k, str(dev))
+    hit = _sm70_qpn8_indices_cache.get(key)
+    if hit is not None:
+        return hit
+    tiles, groups = n // 32, k // 16
+    lane = torch.arange(32, device=dev)
+    col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) > 0).long() * 4
+    korder = torch.tensor(_KORDER8, device=dev)
+    g = torch.arange(groups, device=dev)
+    kidx = g.view(groups, 1) * 16 + korder.view(1, 16)
+    _sm70_qpn8_indices_cache[key] = (tiles, groups, col, kidx)
+    return tiles, groups, col, kidx
+
+
+def _sm70_qpn8_unpack(packed, n, k):
+    """Inverse permutation -> original (N,K) byte order. Bytes unchanged."""
+    dev = packed.device
+    tiles, groups, col, kidx = _sm70_qpn8_indices(n, k, dev)
+    src = packed.view(tiles, groups, 32, 16)
+    out = torch.empty(n, k, dtype=torch.uint8, device=dev)
+    chunk = max(1, 36864 // max(groups, 1))
+    for t0 in range(0, tiles, chunk):
+        t1 = min(t0 + chunk, tiles)
+        tt = t1 - t0
+        ncol = (torch.arange(t0, t1, device=dev).view(tt, 1) * 32
+                + col.view(1, 32))
+        out[ncol.view(tt, 1, 32, 1).expand(tt, groups, 32, 16),
+            kidx.view(1, groups, 1, 16).expand(tt, groups, 32, 16)] = src[t0:t1]
+    return out
+
+
+@_sm70_custom_op("sm70_fp8::qpn8_linear", mutates_args=())
+def _sm70_qpn8_linear(x: torch.Tensor, codes: torch.Tensor,
+                      tscale: torch.Tensor, n: int, k: int, splitk: int,
+                      nacc: int) -> torch.Tensor:
+    from vllm.model_executor.kernels.linear.nvfp4.marlin import _get_skinny_ext
+    ext = _get_skinny_ext()
+    _rt = ("qpn8" if x.shape[0] <= 8
+           else ("qpn8-mt2" if (_SM70_QPN8_MT2 and hasattr(ext, "gemm_qpn8_mt2"))
+                 else "qpn8-chunked") if x.shape[0] <= 16
+           else "qpn8-chunked" if x.shape[0] <= _SM70_QPN8_CHUNK_MAX
+           else "qpn8-prefill-reconstruct")
+    _ck = (int(k), int(n), int(x.shape[0]))
+    if _ck not in _sm70_census_seen:
+        _sm70_census_seen.add(_ck)
+        logger.info("QPN8_CENSUS_RUN K=%d N=%d M=%d route=%s split=%d nacc=%d",
+                    int(k), int(n), int(x.shape[0]), _rt, int(splitk), int(nacc))
+    _sm70_qpn8_calls[0] += 1
+    if _sm70_qpn8_calls[0] % 2000 == 0:
+        logger.info("QPN8 op-body executions: %d (a captured op runs its body "
+                    "only at capture time)", _sm70_qpn8_calls[0])
+    m = x.shape[0]
+    if m <= 8:
+        return ext.gemm_qpn8(x, codes, tscale, n, splitk, nacc)
+    # qpn8 chunked: ceil(M/8) blocks of <=8 rows. m8n8k4 gives 8 rows per
+    # tile, so anything above 8 needs more than one, and each block re-streams
+    # the weights.
+    #
+    # The band used to stop at 16 (the second capture size) on the assumption
+    # that reconstruct wins above it. Measured, it does not: chunking beats
+    # reconstruct all the way to M~112 on all three protected shapes, by 3.1x
+    # at M=32 and 1.24x at M=96 (benchmarks/qpn8_m_sweep.py). The live route
+    # census shows real prefill chunks at M=20 and M=103, i.e. squarely inside
+    # the window we were conceding. 96 is the conservative crossover -- the
+    # per-shape crossings are 104-116, so 96 is below all of them.
+    #
+    # Ragged tails (M=17 -> 8+8+1, M=20 -> 8+8+4) are validated to the same
+    # 2.75e-4 as the native path in benchmarks/qpn8_chunk_validate.py.
+    # Shapes stay static per M, so graph capture is unaffected.
+    if m <= 16 and _SM70_QPN8_MT2 and hasattr(ext, "gemm_qpn8_mt2"):
+        msp, mna = _SM70_QPN8_MT2_TABLE.get((int(n), int(k)), (splitk, nacc))
+        return ext.gemm_qpn8_mt2(x, codes, tscale, n, msp, mna)
+    if m <= _SM70_QPN8_CHUNK_MAX:
+        outs = [ext.gemm_qpn8(x[i:i + 8].contiguous(), codes, tscale, n,
+                              splitk, nacc) for i in range(0, m, 8)]
+        return torch.cat(outs, 0)
+    # prefill: reconstruct transiently from the packed codes (never persisted)
+    w8 = _sm70_qpn8_unpack(codes, n, k)
+    wf = w8.view(torch.float8_e4m3fn).to(x.dtype)
+    scale = tscale.repeat_interleave(32).to(x.dtype) / 256.0
+    return torch.nn.functional.linear(x, wf * scale.unsqueeze(1))
+
+
+@_sm70_qpn8_linear.register_fake
+def _sm70_qpn8_linear_fake(x, codes, tscale, n, k, splitk, nacc):
+    return x.new_empty((x.shape[0], n))
+
+
+@_sm70_custom_op("sm70_fp8::qpn8_prefill", mutates_args=())
+def _sm70_qpn8_prefill(x: torch.Tensor, codes: torch.Tensor,
+                       tscale: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    """Prefill until the tiled QPN8 kernel lands: reconstruct from the packed
+    codes (transient, never persisted) rather than keeping a second copy."""
+    w8 = _sm70_qpn8_unpack(codes, n, k)
+    wf = w8.view(torch.float8_e4m3fn).to(x.dtype)
+    scale = tscale.repeat_interleave(32).to(x.dtype) / 256.0
+    wf = wf * scale.unsqueeze(1)
+    return torch.nn.functional.linear(x, wf)
+
+
+@_sm70_qpn8_prefill.register_fake
+def _sm70_qpn8_prefill_fake(x, codes, tscale, n, k):
+    return x.new_empty((x.shape[0], n))
+
+
+def _sm70_qpn8_prepack(w8):
+    """(N,K) uint8 -> [tile][group][lane][16B]. Pure permutation."""
+    n, k = w8.shape
+    dev = w8.device
+    tiles, groups = n // 32, k // 16
+    lane = torch.arange(32, device=dev)
+    col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) > 0).long() * 4
+    korder = torch.tensor(_KORDER8, device=dev)
+    g = torch.arange(groups, device=dev)
+    kidx = g.view(groups, 1) * 16 + korder.view(1, 16)
+    out = torch.empty(tiles, groups, 32, 16, dtype=torch.uint8, device=dev)
+    chunk = max(1, 36864 // max(groups, 1))
+    for t0 in range(0, tiles, chunk):
+        t1 = min(t0 + chunk, tiles)
+        tt = t1 - t0
+        ncol = (torch.arange(t0, t1, device=dev).view(tt, 1) * 32
+                + col.view(1, 32))
+        out[t0:t1] = w8[ncol.view(tt, 1, 32, 1).expand(tt, groups, 32, 16),
+                        kidx.view(1, groups, 1, 16).expand(tt, groups, 32, 16)]
+    return out.view(-1).contiguous()
+
+
+def _sm70_qpn8_tile_scales(widths, scales, n):
+    """One scale per N=32 tile; folds the decoder's 2^8 correction."""
+    out = torch.empty(n // 32, dtype=torch.float32, device=scales.device)
+    off = 0
+    for i, wd in enumerate(widths):
+        sc = scales[i] if scales.numel() > 1 else scales.reshape(-1)[0]
+        if off % 32 or wd % 32:
+            return None          # a tile would straddle two scales
+        out[off // 32:(off + wd) // 32] = sc.float() * 256.0
+        off += wd
+    return out if off == n else None
+
+
+def _sm70_qpn8_stash(layer):
+    """Attach QPN8 buffers. Returns True when the layer is QPN8-eligible."""
+    if not _SM70_QPN8:
+        return False
+    w8 = layer.weight.data
+    n, k = w8.shape
+    if n % 32 or k % 64:
+        return False
+    widths = layer._sm70_widths
+    ts = _sm70_qpn8_tile_scales(widths, layer.weight_scale.data, n)
+    if ts is None:
+        return False
+    raw = w8.view(torch.uint8) if w8.dtype != torch.uint8 else w8
+    packed = _sm70_qpn8_prepack(raw)
+    if (n, k) not in _sm70_qpn8_verified_shapes:
+        # ACTUALLY invert the permutation and assert byte identity against the
+        # source. The previous check called _sm70_qpn8_prepack twice and
+        # asserted determinism, which a permutation bug passes trivially --
+        # and since the original weight is freed below, the packed buffer is
+        # the only copy, so a silent corruption would be unrecoverable.
+        assert packed.numel() == n * k, "qpn8 packed size"
+        _rt = _sm70_qpn8_unpack(packed, n, k)
+        assert torch.equal(_rt, raw), (
+            "QPN8 prepack is not invertible for n=%d k=%d" % (n, k))
+        _sm70_qpn8_verified_shapes.add((n, k))
+        logger.info("QPN8 prepack INVERTED and byte-identical: %s n=%d k=%d "
+                    "bytes=%d", getattr(layer, "prefix", "?"), n, k,
+                    packed.numel())
+    layer._qpn8_codes = packed
+    layer._qpn8_tscale = ts
+    layer._qpn8_shape = (n, k)
+    layer._qpn8_wdtype = str(w8.dtype)
+    # The packed buffer is now the only resident copy: release the original
+    # storage per layer, before compile and KV allocation.
+    layer.weight = torch.nn.Parameter(
+        torch.empty(0, dtype=torch.uint8, device=packed.device),
+        requires_grad=False)
+    layer._qpn8_cfg = _SM70_QPN8_TABLE.get((n, k), (16, 2))
+    _sm70_qpn8_eligible[0] += 1
+    logger.info("QPN8_CENSUS_LOAD n=%d layer=%s dtype=%s K=%d N=%d widths=%s "
+                "scales=%s split=%d nacc=%d eligible=YES",
+                _sm70_qpn8_eligible[0], getattr(layer, "prefix", "?"),
+                str(w8.dtype), k, n, widths,
+                [round(float(v), 9) for v in layer.weight_scale.data.flatten()[:4]],
+                layer._qpn8_cfg[0], layer._qpn8_cfg[1])
+    if (k // 16) % layer._qpn8_cfg[0]:
+        layer._qpn8_cfg = (8, 2) if (k // 16) % 8 == 0 else (4, 1)
+    return True
 
 
 class ModelOptFp8LinearMethod(LinearMethodBase):
@@ -509,16 +850,20 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         if self.use_sm70_fp8_turbomind:
             return
 
-        self.fp8_linear = init_fp8_linear_kernel(
-            activation_quant_key=kFp8StaticTensorSym,
-            weight_quant_key=kFp8StaticTensorSym,
-            weight_shape=layer.weight.shape,
-            input_dtype=self.input_dtype,
-            out_dtype=self.out_dtype,
-            module_name=self.__class__.__name__,
-        )
+        if not _SM70_MODELOPT:
+            self.fp8_linear = init_fp8_linear_kernel(
+                activation_quant_key=kFp8StaticTensorSym,
+                weight_quant_key=kFp8StaticTensorSym,
+                weight_shape=layer.weight.shape,
+                input_dtype=self.input_dtype,
+                out_dtype=self.out_dtype,
+                module_name=self.__class__.__name__,
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if _SM70_MODELOPT:
+            _sm70_fp8_process(layer)
+            return
         weight = layer.weight
         max_w_scale = layer.weight_scale.max()
         if not (layer.weight_scale == layer.weight_scale[0]).all():
@@ -595,6 +940,13 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             if bias is not None:
                 out.add_(bias)
             return out.reshape(*x.shape[:-1], layer.output_size_per_partition)
+
+        if _SM70_MODELOPT:
+            if not _SM70_FP8_REFERENCE:
+                raise NotImplementedError(
+                    "QPN8 kernel not wired; set VLLM_SM70_FP8_REFERENCE=1 "
+                    "for the slow bring-up path")
+            return _sm70_fp8_apply(layer, x, bias)
         return self.fp8_linear.apply_weights(layer, x, bias)
 
 
@@ -1185,6 +1537,11 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
 
     @classmethod
     def get_min_capability(cls) -> int:
+        # Fork (v100-skinny): the skinny NVFP4 backend serves sm70/sm75 in
+        # normal operation (heterogeneous grid); admit it via the env gate
+        # before upstream's TurboMind/Marlin/emulation checks.
+        if _SM70_MODELOPT:
+            return _SM70_MIN_CAP
         # Do not unconditionally lower the class-wide gate to 70. W4A4
         # (quant_algo=NVFP4) and W4A16_NVFP4 share this config; SM70 is
         # admitted only when a proven software backend is selected.
@@ -2340,6 +2697,18 @@ ModelOptMxFp8Config.FusedMoEMethodCls = ModelOptMxFp8FusedMoE
 ModelOptMxFp8Config.KVCacheMethodCls = ModelOptKVCacheMethod
 
 
+
+def _sm70_implicit_unquantized(quantized_layers):
+    """GDN gating projections are unquantized by absence, not by listing."""
+    names = []
+    for key in quantized_layers:
+        if key.endswith(".linear_attn.in_proj_qkv"):
+            base = key.rsplit(".in_proj_qkv", 1)[0]
+            names.append(base + ".in_proj_a")
+            names.append(base + ".in_proj_b")
+    return names
+
+
 class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
     """Config class for ModelOpt MIXED_PRECISION.
 
@@ -2362,6 +2731,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         super().__init__(exclude_modules)
         self.kv_cache_quant_method = kv_cache_quant_method
         self.quantized_layers = quantized_layers
+        if _SM70_MODELOPT:
+            self.ignored_layers = _sm70_implicit_unquantized(
+                quantized_layers)
         self.fp8_config = fp8_config
         self.nvfp4_config = nvfp4_config
         self.w4a16_nvfp4_config = w4a16_nvfp4_config
@@ -2374,6 +2746,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
     @classmethod
     def get_min_capability(cls) -> int:
+        if _SM70_MODELOPT:
+            return _SM70_MIN_CAP
         if (
             sm70_tm.is_exact_sm70_cuda_platform()
             and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
@@ -2557,6 +2931,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo == "NVFP4":
+                if _SM70_MODELOPT:
+                    # No FP4 tensor cores here: the stored codes are W4A16-
+                    # compatible and the W4A16 method pins the kernel our
+                    # fork patches. Storage is untouched; only arithmetic
+                    # precision differs (A16 >= A4).
+                    return ModelOptNvFp4W4A16LinearMethod(
+                        self.w4a16_nvfp4_config)
                 return ModelOptNvFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4W4A16LinearMethod(self.w4a16_nvfp4_config)

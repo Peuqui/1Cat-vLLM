@@ -83,7 +83,14 @@ def get_flash_attn_version(
             is_fa_version_supported,
         )
 
-        device_capability = current_platform.get_device_capability()
+        # Heterogene Rigs (v100-skinny): die FA-Version darf NICHT global
+        # von Geraet 0 abgeleitet werden — jeder Worker haelt eine eigene
+        # Karte, und in einem TPxPP-Gitter koennen die Stufen
+        # unterschiedliche Compute-Klassen haben. Sonst bestimmt die
+        # schwaechste Karte auf Position 0 den Kernel fuer alle.
+        import torch as _torch
+        _dev = _torch.cuda.current_device() if _torch.cuda.is_available() else 0
+        device_capability = current_platform.get_device_capability(_dev)
 
         assert device_capability is not None
 

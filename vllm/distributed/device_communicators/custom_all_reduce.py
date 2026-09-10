@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.2.2
+# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
+# Changes: adds env-gated all-reduce residency instrumentation
+# (VLLM_SM70_AR_EVT, default off) -- CUDA event pairs baked into captured
+# graphs plus a harvester thread. Measurement tool, dormant in production.
 
 import os
 from contextlib import contextmanager
@@ -102,6 +108,118 @@ def is_weak_contiguous(inp: torch.Tensor):
         inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
         == inp.numel() * inp.element_size()
     )
+
+
+
+# --- AR residency instrumentation (VLLM_SM70_AR_EVT=1) ----------------------
+# Profiler-off confirmation of all-reduce kernel residency: CUDA event
+# pairs are baked around the registered AR inside captured graphs (the
+# same Event objects re-record on every replay), and eager ARs get their
+# own pairs. A periodic harvest on the eager path prints distributions.
+# Graceful: any event failure disables the instrumentation permanently.
+import os as _os
+
+_AR_EVT = _os.environ.get("VLLM_SM70_AR_EVT", "0") == "1"
+_AR_EVT_OK = [True]
+_AR_GRAPH_PAIRS: list = []          # baked into graphs, re-record at replay
+_AR_EAGER_PAIRS: list = []          # rolling recent eager pairs
+_AR_CALLS = [0]
+
+
+def _ar_evt_new_pair():
+    try:
+        try:
+            pre = torch.cuda.Event(enable_timing=True, external=True)
+            post = torch.cuda.Event(enable_timing=True, external=True)
+        except TypeError:
+            pre = torch.cuda.Event(enable_timing=True)
+            post = torch.cuda.Event(enable_timing=True)
+        return pre, post
+    except Exception:
+        _AR_EVT_OK[0] = False
+        return None, None
+
+
+def _ar_evt_stats(pairs):
+    vals = []
+    for pre, post in pairs:
+        try:
+            if post.query():
+                us = pre.elapsed_time(post) * 1000.0
+                if 0.0 < us < 5000.0:   # filter torn reads across replays
+                    vals.append(us)
+        except Exception:
+            continue
+    if not vals:
+        return None
+    vals.sort()
+    n = len(vals)
+    return (n, sum(vals) / n, vals[n // 2], vals[int(n * 0.95)], vals[-1])
+
+
+def _ar_evt_thread():
+    import threading, time as _t
+
+    def loop():
+        while True:
+            _t.sleep(5.0)
+            try:
+                _ar_evt_harvest()
+            except Exception:
+                return
+    th = threading.Thread(target=loop, daemon=True,
+                          name="ar-evt-harvester")
+    th.start()
+
+
+_AR_THREAD = [False]
+
+
+_AR_LAST_VALS: dict = {}            # pair index -> us at previous harvest
+
+
+def _ar_evt_harvest():
+    # Indexed per-op probe. Events re-record on every replay of their
+    # graph, so a pair whose value is unchanged since the last harvest
+    # belongs to a graph that did not replay (e.g. the idle capture-size
+    # graph) — group-level liveness separates live decode graphs from
+    # stale ones. Within a group, append order is execution order, so
+    # the ordinal names the op's position in that graph.
+    groups: dict = {}
+    for idx, (pre, post, shape) in enumerate(_AR_GRAPH_PAIRS):
+        try:
+            if not post.query():
+                continue
+            us = pre.elapsed_time(post) * 1000.0
+        except Exception:
+            continue
+        if not 0.0 < us < 5000.0:       # torn read across replays
+            continue
+        changed = _AR_LAST_VALS.get(idx) != us
+        _AR_LAST_VALS[idx] = us
+        groups.setdefault(shape, []).append((us, changed))
+    for shape, vals in sorted(groups.items()):
+        tag = "x".join(str(d) for d in shape)
+        n_changed = sum(1 for _, c in vals if c)
+        if n_changed < max(1, len(vals) // 10):
+            print(f"[ar-evt] g{tag}: n={len(vals)} STALE", flush=True)
+            continue
+        us_sorted = sorted(u for u, _ in vals)
+        n = len(us_sorted)
+        bursts = sorted(
+            ((u, i) for i, (u, _) in enumerate(vals) if u > 100.0),
+            reverse=True)[:20]
+        btxt = " ".join(f"{i}:{u:.0f}" for u, i in bursts)
+        print(f"[ar-evt] g{tag}: n={n} changed={n_changed} "
+              f"med={us_sorted[n // 2]:.1f}us p95={us_sorted[int(n * 0.95)]:.1f}us "
+              f"max={us_sorted[-1]:.1f}us bursts[op:us]={btxt}", flush=True)
+    e = _ar_evt_stats(_AR_EAGER_PAIRS)
+    if e:
+        print(f"[ar-evt] EAGER pairs n={e[0]} mean={e[1]:.1f}us "
+              f"median={e[2]:.1f}us p95={e[3]:.1f}us max={e[4]:.1f}us",
+              flush=True)
+    del _AR_EAGER_PAIRS[:-64]
+# ---------------------------------------------------------------------------
 
 
 class CustomAllreduce:
@@ -920,6 +1038,27 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
+                if _AR_EVT and _AR_EVT_OK[0] and len(_AR_GRAPH_PAIRS) < 512:
+                    pre, post = _ar_evt_new_pair()
+                    if pre is not None:
+                        try:
+                            pre.record()
+                            out = self.all_reduce(input, registered=True)
+                            post.record()
+                            _AR_GRAPH_PAIRS.append((pre, post, tuple(input.shape)))
+                            n = len(_AR_GRAPH_PAIRS)
+                            if n == 1 or n % 128 == 0:
+                                print(f"[ar-evt] baked {n} graph pairs",
+                                      flush=True)
+                            if not _AR_THREAD[0]:
+                                _AR_THREAD[0] = True
+                                _ar_evt_thread()
+                            return out
+                        except Exception as exc:
+                            _AR_EVT_OK[0] = False
+                            print(f"[ar-evt] DISABLED at capture: "
+                                  f"{type(exc).__name__}: {exc}",
+                                  flush=True)
                 return self.all_reduce(input, registered=True)
             # Graph warmup can still feed persistent model state (KV, SSM, or
             # CUDA graph metadata buffers). Returning an uninitialized tensor
@@ -931,6 +1070,20 @@ class CustomAllreduce:
             # Note: outside of cuda graph context, custom allreduce incurs a
             # cost of cudaMemcpy, which should be small (<=1% of overall
             # latency) compared to the performance gain of using custom kernels
+            if _AR_EVT and _AR_EVT_OK[0]:
+                _AR_CALLS[0] += 1
+                pre, post = _ar_evt_new_pair()
+                if pre is not None:
+                    try:
+                        pre.record()
+                        out = self.all_reduce(input, registered=False)
+                        post.record()
+                        _AR_EAGER_PAIRS.append((pre, post))
+                        if _AR_CALLS[0] % 2000 == 0:
+                            _ar_evt_harvest()
+                        return out
+                    except Exception:
+                        _AR_EVT_OK[0] = False
             return self.all_reduce(input, registered=False)
 
     def custom_all_reduce_sum2(

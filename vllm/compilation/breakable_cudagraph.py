@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.3.0
+# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
+# Changes: eager_break_during_capture(ignore_full_mode=True) -- a break that
+# also fires under a FULL runtime mode, for host-driven ops (skinny MoE).
 """Breakable CUDA graph capture/replay.
 
 This is an alternative to :class:`CUDAGraphWrapper` that replaces vLLM's
@@ -57,7 +62,7 @@ def is_breakable_cudagraph_enabled() -> bool:
 F = TypeVar("F", bound=Callable[..., Any])
 
 
-def eager_break_during_capture(fn: F) -> F:
+def eager_break_during_capture(fn: F | None = None, *, ignore_full_mode: bool = False):
     """Decorator that turns a custom-op Python kernel into a "break point"
     for the breakable cudagraph capture.
 
@@ -88,6 +93,16 @@ def eager_break_during_capture(fn: F) -> F:
         def unified_attention_with_output(...):
             ...
     """
+    # Fork addition (v100-skinny): ``ignore_full_mode=True`` breaks even
+    # under a FULL runtime mode. Attention ops are capture-safe and only
+    # break in PIECEWISE mode; a host-driven op (the per-expert skinny
+    # NVFP4 MoE routes on ``topk_ids.cpu()``) must leave the capture in
+    # every mode or the capture dies with "operation not permitted when
+    # stream is capturing".
+    if fn is None:
+        return functools.partial(
+            eager_break_during_capture, ignore_full_mode=ignore_full_mode
+        )
     if not is_breakable_cudagraph_enabled():
         return fn
 
@@ -98,7 +113,7 @@ def eager_break_during_capture(fn: F) -> F:
             return fn(*args, **kwargs)
         if not capture._capturing:
             return fn(*args, **kwargs)
-        if is_forward_context_available():
+        if not ignore_full_mode and is_forward_context_available():
             mode = get_forward_context().cudagraph_runtime_mode
             if mode == CUDAGraphMode.FULL:
                 return fn(*args, **kwargs)

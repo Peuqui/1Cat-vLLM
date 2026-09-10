@@ -4,8 +4,8 @@
 import itertools
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, overload
+from dataclasses import dataclass, field, replace
+from typing import Any, Literal, Protocol, TypeAlias, overload
 
 import regex as re
 import torch
@@ -38,6 +38,8 @@ from vllm.utils.torch_utils import (
 logger = init_logger(__name__)
 
 
+ShardId: TypeAlias = str | int | tuple[int, ...]
+
 @dataclass
 class WeightsMapper:
     """Maps the name of each weight if they match the following patterns.
@@ -66,12 +68,24 @@ class WeightsMapper:
         )
 
     def _map_name(self, key: str) -> str | None:
+        """Map a weight name (wrapper that discards shard_id)."""
         result = self._map_name_with_shard(key)
         return result[0] if result is not None else None
 
     def _map_name_with_shard(
         self, key: str
     ) -> tuple[str, str | int | tuple[int, ...] | None] | None:
+        """Map a weight name and extract any shard_id metadata."""
+        # Deprecation warnings
+        if key.endswith(".kv_scale"):
+            logger.warning_once(
+                "DEPRECATED. Found kv_scale in the checkpoint. "
+                "This format is deprecated in favor of separate k_scale and "
+                "v_scale tensors and will be removed in a future release. "
+                "Functionally, we will remap kv_scale to k_scale and duplicate "
+                "k_scale to v_scale"
+            )
+
         for pattern, new_key in self.orig_to_new_regex.items():
             if pattern.search(key):
                 if new_key is None:
@@ -133,6 +147,27 @@ class WeightsMapper:
             for name, value in values.items()
             if (out_name := self._map_name(name)) is not None
         }
+
+    def get_rename_mapper(self) -> "WeightsMapper":
+        """Mapper variant keeping only the renames.
+
+        This is what consumers that *name* modules rather than load them need:
+        LoRA name parsing and the quantization config's layer lists.
+
+        Stacked maps are dropped so that constituent names (e.g. `q_proj`) survive
+        rather than being rewritten to the stacked vLLM name (`qkv_proj`). Mappings to
+        `None` are dropped because "do not load this weight" is meaningless to such a
+        consumer, and applying it would silently shrink a quantization config's ignore
+        list or make LoRA name parsing fail."""
+        remove_none = lambda d: {k: v for k, v in d.items() if v is not None}
+        return replace(
+            self,
+            orig_to_new_regex=remove_none(self.orig_to_new_regex),
+            orig_to_new_substr=remove_none(self.orig_to_new_substr),
+            orig_to_new_stacked={},
+            orig_to_new_prefix=remove_none(self.orig_to_new_prefix),
+            orig_to_new_suffix=remove_none(self.orig_to_new_suffix),
+        )
 
 
 class AutoWeightsLoader:
@@ -243,8 +278,15 @@ class AutoWeightsLoader:
                 )
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            # WeightsMapper.apply tags weights that `orig_to_new_stacked`
+            # folded into one packed parameter; their loaders take the shard
+            # as a third argument (fork). Upstream's error context is kept.
+            shard_id = getattr(weight_data, "shard_id", None)
             try:
-                weight_loader(param, weight_data)
+                if shard_id is None:
+                    weight_loader(param, weight_data)
+                else:
+                    weight_loader(param, weight_data, shard_id)
             except Exception as exc:
                 raise RuntimeError(
                     f"Error loading weight {weight_qualname!r} "
@@ -978,3 +1020,4 @@ def scatter_output_slices(
         sliced = output[offset : offset + n_tok]
         dest[idx] = sliced.clone() if clone else sliced
         offset += n_tok
+

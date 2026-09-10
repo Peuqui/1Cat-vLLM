@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.3.0
+# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
+# Changes: software-FP8 / CuteDSL gating keyed on the absence of native
+# FP8 units (< SM89) instead of exactly SM70, so the SM75 stages of a
+# mixed V100+RTX8000 pipeline take the software path too (three sites:
+# quantize/insert, dequantize/gather, cutedsl dispatch).
 """
 Triton kernels for DeepseekV4 paged K-cache management and sparse-attention index
 preparation.
@@ -200,7 +207,13 @@ def quantize_and_insert_k_cache(
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
         use_software_fp8=(
-            current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+            # Native FP8-Einheiten gibt es erst ab Ada (sm89). Die
+            # urspruengliche Bedingung traf GENAU sm70 — auf einer reinen
+            # V100-Kiste richtig, auf einem gemischten Aufbau falsch: die
+            # sm75-Stufen (RTX 8000) nahmen den Hardware-Pfad, und Triton
+            # kann tl.float8e4nv dort nicht uebersetzen (2026-09-01).
+            current_platform.is_cuda()
+            and not current_platform.has_device_capability((8, 9))
         ),
     )
 
@@ -363,7 +376,13 @@ def dequantize_and_gather_k_cache_triton(
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
         use_software_fp8=(
-            current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+            # Native FP8-Einheiten gibt es erst ab Ada (sm89). Die
+            # urspruengliche Bedingung traf GENAU sm70 — auf einer reinen
+            # V100-Kiste richtig, auf einem gemischten Aufbau falsch: die
+            # sm75-Stufen (RTX 8000) nahmen den Hardware-Pfad, und Triton
+            # kann tl.float8e4nv dort nicht uebersetzen (2026-09-01).
+            current_platform.is_cuda()
+            and not current_platform.has_device_capability((8, 9))
         ),
     )
 
@@ -383,7 +402,12 @@ def dequantize_and_gather_k_cache(
     offset: int,
 ) -> None:
     use_cutedsl = has_cutedsl() and not (
-        current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+        # Native FP8-Einheiten gibt es erst ab Ada (sm89) — der
+        # CuteDSL-Pfad setzt sie voraus. Die urspruengliche Bedingung
+        # nahm nur sm70 aus; sm75 (RTX 8000) lief hinein
+        # (2026-09-01, Gruppe A der sm75-Koexistenz).
+        current_platform.is_cuda()
+        and not current_platform.has_device_capability((8, 9))
     )
     if use_cutedsl:
         # lazily import, otherwise some tests fail due to CUDA driver init failure.

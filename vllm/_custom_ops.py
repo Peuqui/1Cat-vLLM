@@ -2793,6 +2793,7 @@ def swap_blocks_batch(
     overhead; on older CUDA it falls back to a loop of cudaMemcpyAsync.
 
     is_src_access_order_any: if True, pass CU_MEMCPY_SRC_ACCESS_ORDER_ANY to
+    output_gate_activation: str = "silu",
         cuMemcpyBatchAsync, letting the DMA engine prefetch source bytes
         out of stream order. Only safe when no GPU stream is concurrently
         writing to the source. Defaults to False (STREAM ordering), which
@@ -2811,6 +2812,7 @@ def convert_fp8(
 
 def gather_and_maybe_dequant_cache(
     src_cache: torch.Tensor,
+        output_gate_activation,
     dst: torch.Tensor,
     block_table: torch.Tensor,
     cu_seq_lens: torch.Tensor,

@@ -11,6 +11,7 @@ pieces that have no analogue in V3/V32:
   * V4-specific checkpoint weight-name remapping in ``load_weights``.
 """
 
+import copy
 import typing
 from collections.abc import Callable, Iterable
 
@@ -38,7 +39,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.deepseek_mtp import SharedHead
 from vllm.model_executor.models.deepseek_v2 import get_spec_layer_idx_from_weight_name
-from vllm.model_executor.models.utils import maybe_prefix
+from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.utils import (
+    make_empty_intermediate_tensors_factory,
+    maybe_prefix,
+)
 from vllm.models.deepseek_v4.common.ops import (
     fused_mtp_input_rmsnorm,
     mtp_shared_head_rmsnorm,
@@ -255,14 +260,73 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         return logits
 
 
-class DeepSeekV4MTP(nn.Module):
+class DeepSeekV4MTP(nn.Module, SupportsPP):
+    """Fork addition (v100-skinny): SupportsPP.
+
+    The drafter is a single MTP layer that lives entirely on the last
+    pipeline stage -- it never splits across ranks. But vLLM gates ANY
+    model in a PP deployment on the interface, so without it a PP run
+    dies at startup with "Pipeline parallelism is not supported for this
+    model", and PP is the only way DeepSeek-V4-Flash fits on this box.
+    ``forward`` already accepts ``intermediate_tensors``; only the
+    factory attribute was missing. Same shape as the fork's Qwen3_5MTP.
+    """
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
+        vllm_config = self._with_draft_quant_config(vllm_config)
         self.quant_config = vllm_config.quant_config
         self.model = DeepSeekV4MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual"], self.config.hidden_size
+            )
+        )
+
+    @staticmethod
+    def _with_draft_quant_config(vllm_config: VllmConfig) -> VllmConfig:
+        """Build the MTP branch from the DRAFT checkpoint's quantization.
+
+        Fork addition (v100-skinny). The proposer builds the drafter with
+        the TARGET's VllmConfig (llm_base_proposer._create_draft_vllm_config
+        only overrides kernel/attention settings), so ``quant_config`` here
+        describes the target checkpoint. That is fine while the drafter
+        lives inside the target checkpoint -- the usual case upstream --
+        but a standalone draft directory may be quantized differently:
+        DeepSeek-V4-Flash's dspark drafter is ModelOpt block-FP8, while a
+        compressed-tensors base gives its linears ``weight_scale`` instead
+        of the ``weight_scale_inv`` this file's ``load_weights`` writes.
+        Building the branch from the draft's own config keeps loader and
+        parameters in the same dialect. Same shape as the fork's
+        Qwen3_5MTP, which swaps in its own config for the MTP branch too.
+        """
+        spec = vllm_config.speculative_config
+        draft_model_config = getattr(spec, "draft_model_config", None)
+        if draft_model_config is None:
+            return vllm_config
+        target_model_config = getattr(spec, "target_model_config", None)
+        if (
+            target_model_config is not None
+            and draft_model_config.quantization
+            == target_model_config.quantization
+        ):
+            return vllm_config
+
+        draft_quant_config = VllmConfig.get_quantization_config(
+            draft_model_config, vllm_config.load_config
+        )
+        logger.info(
+            "DeepSeekV4MTP: building the MTP branch with the draft "
+            "checkpoint's quantization (%s) instead of the target's (%s).",
+            draft_model_config.quantization,
+            getattr(target_model_config, "quantization", None),
+        )
+        draft_vllm_config = copy.copy(vllm_config)
+        draft_vllm_config.quant_config = draft_quant_config
+        return draft_vllm_config
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

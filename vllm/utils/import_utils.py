@@ -476,5 +476,14 @@ def has_fbgemm_gpu() -> bool:
 
 
 def has_cutedsl() -> bool:
-    """Whether the optional `cutelass` package is available."""
-    return _has_module("cutlass")
+    """Whether the optional `cutelass` package is available AND usable here."""
+    if not _has_module("cutlass"):
+        return False
+    # fork: CUTLASS DSL's Arch enum starts at sm_80 (base_dsl/arch.py), so on
+    # Volta/Turing every cutedsl kernel dies at launch with KeyError: 'sm_7x'.
+    # The three dispatch sites (dequantize_and_gather_k_cache,
+    # fused_indexer_q_rope_quant fp8/mxfp4) all gate on this helper, so the
+    # capability belongs here rather than repeated at each of them.
+    from vllm.platforms import current_platform
+
+    return current_platform.is_cuda() and current_platform.has_device_capability(80)

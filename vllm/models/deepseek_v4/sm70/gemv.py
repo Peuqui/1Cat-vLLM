@@ -270,8 +270,10 @@ def _has_sm70_dsv4_gemv_contract(
     output_dtype: torch.dtype,
 ) -> bool:
     return (
-        current_platform.is_cuda()
-        and current_platform.is_device_capability((7, 0))
+        envs.VLLM_SM70_DSV4_FP16_GEMV
+        and current_platform.is_cuda()
+        # Fork fix (v100-skinny): worker-local capability (see attention.py).
+        and torch.cuda.get_device_capability(torch.cuda.current_device()) == (7, 0)
         and x.is_cuda
         and weight.is_cuda
         and x.device == weight.device

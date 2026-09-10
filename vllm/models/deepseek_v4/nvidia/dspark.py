@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.3.0
+# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
+# Changes: DSparkDeepseekV4ForCausalLM implements SupportsPP (interface
+# only -- the drafter runs whole on the last stage; intermediate_tensors
+# is accepted and ignored). Without it a `--speculative-config dspark`
+# boot under pipeline parallelism dies at startup. No numeric change.
 """DeepSeek V4 DSpark draft model.
 
 DSpark predicts a non-causal block in one three-layer forward pass, then adds
@@ -35,8 +42,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import maybe_prefix
-from vllm.platforms import current_platform
+from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.utils import (
+    make_empty_intermediate_tensors_factory,
+    maybe_prefix,
+)
+from vllm.sequence import IntermediateTensors
 
 from .model import DeepseekV4DecoderLayer, make_deepseek_v4_expert_params_mapping
 
@@ -138,8 +149,17 @@ class DSparkDeepseekV4Model(nn.Module):
         # overflow before the following RMSNorm. A power-of-two input scale is
         # exact in FP16 and RMSNorm removes it; 2^-6 leaves ample headroom while
         # preserving the FP32-reference normalized result.
+        # Fork fix (v100-skinny): decide on the WORKER'S device and cover
+        # every card without native FP8 units (< SM89) — they all take the
+        # FP16-writing W8A16 path this scale protects. The old device-0
+        # check saw the RTX 8000 first and silently disabled the scale for
+        # a drafter running on SM75 via the same QPN8 route: main_proj
+        # overflowed in FP16 and DSpark acceptance collapsed to ~6 %.
         self.main_proj_input_scale = (
-            2.0**-6 if current_platform.is_device_capability((7, 0)) else 1.0
+            2.0**-6
+            if torch.cuda.get_device_capability(torch.cuda.current_device())
+            < (8, 9)
+            else 1.0
         )
 
         self.topk_indices_buffer = torch.empty(
@@ -193,7 +213,18 @@ class DSparkDeepseekV4Model(nn.Module):
         return self.embed_tokens(input_ids)
 
     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
-        projected = self.main_proj(aux_hidden_states * self.main_proj_input_scale)
+        # Fork fix (v100-skinny): saturate non-finite aux values. The BOS
+        # row is an attention sink whose aux magnitudes exceed the FP16
+        # range under --dtype half (the bf16 DSpark reference has no such
+        # limit); its inf/NaN then poisons EVERY drafter logit through the
+        # softmax over the context KV, collapsing acceptance to ~5 %.
+        # Saturating to the FP16 max mirrors a saturating bf16->fp16 cast:
+        # the sink row stays "very large", nothing turns NaN.
+        # The aux stream arrives in fp32 (mhc_post_fp32); the power-of-two
+        # scale is applied there and the cast to the kernel dtype happens
+        # only afterwards, so the BOS row fits fp16 without saturation.
+        scaled = aux_hidden_states.to(torch.float32) * self.main_proj_input_scale
+        projected = self.main_proj(scaled.to(self.main_norm.weight.dtype))
         return self.main_norm(projected)
 
     @torch.inference_mode()
@@ -264,7 +295,13 @@ def _insert_context_kv(
         dtype=kv.dtype,
         device=kv.device,
     )
-    if current_platform.is_device_capability((7, 0)):
+    # Fork fix (v100-skinny): decide on the WORKER'S device, not device 0
+    # of the visibility list. On a heterogeneous pipeline (RTX 8000 first)
+    # the platform check returned False on every rank, and the V100 stage
+    # crashed in the fused op below ("requires sm_80+; got sm_70"). The
+    # fused op itself draws the line at sm_80, so anything older takes the
+    # sm70 software path.
+    if torch.cuda.get_device_capability(torch.cuda.current_device()) < (8, 0):
         from vllm.models.deepseek_v4.sm70.qnorm_rope_kv_fp8_insert import (
             sm70_qnorm_rope_kv_fp8_insert,
         )
@@ -294,7 +331,18 @@ def _insert_context_kv(
     )
 
 
-class DSparkDeepseekV4ForCausalLM(nn.Module):
+class DSparkDeepseekV4ForCausalLM(nn.Module, SupportsPP):
+    """Fork addition (v100-skinny): SupportsPP.
+
+    Same reasoning as DeepSeekV4MTP in nvidia/mtp.py: the drafter lives
+    entirely on the last pipeline stage and never splits across ranks,
+    but vLLM gates ANY model in a PP deployment on the interface --
+    without it a `--speculative-config dspark` PP boot dies at startup
+    with "Pipeline parallelism is not supported for this model", and PP
+    is the only way DeepSeek-V4-Flash fits on this box.
+    ``intermediate_tensors`` is accepted and ignored.
+    """
+
     has_own_embed_tokens = False
     has_own_lm_head = False
     draft_id_to_target_id = None
@@ -321,6 +369,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual"], self.config.hidden_size
+            )
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -348,7 +401,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
     ) -> torch.Tensor:
+        # intermediate_tensors is part of the SupportsPP contract; the
+        # drafter runs whole on the last stage, so it is never used.
+        del intermediate_tensors
         return self.model(input_ids, positions, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -493,10 +550,27 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 f"parameter {confidence_weight_name!r}."
             )
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
+        if "model.embed_tokens.weight" not in loaded_params:
+            raise RuntimeError(
+                "DSpark drafter: embed.weight was not loaded from the checkpoint; "
+                "under pipeline parallelism the drafter has no shared embedding "
+                "and would run on random embeddings."
+            )
+        logger.info("DSpark drafter: embed_tokens loaded from checkpoint.")
         return loaded_params
 
     @staticmethod
     def _remap_dspark_name(name: str) -> str | None:
+        # Fork fix (v100-skinny): under pipeline parallelism the proposer
+        # does NOT share the target's embed_tokens (they live on the first
+        # stage, the drafter on the last) and expects the draft checkpoint
+        # to supply them -- but every non-mtp.* key was dropped here, so
+        # the drafter ran its block forward on randomly initialised
+        # embeddings (DSpark acceptance ~5 %). Map the target's embedding
+        # onto the drafter's own table; with PP=1 the shared table replaces
+        # it afterwards, so nothing changes there.
+        if name == "embed.weight":
+            return "model.embed_tokens.weight"
         match = re.match(r"mtp\.(\d+)\.(.*)", name)
         if match is None:
             return None

@@ -833,7 +833,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         )
 
     def embedding_lookup(self, input_: torch.Tensor) -> torch.Tensor:
-        """Gather FP8 rows from the device/host split, emit scaled values."""
+        """Gather FP8 rows from the device/host split, emit scaled values.
+
+        Both gathers always run: branching on whether any id falls into the
+        host half would need a device-to-host sync on every decode step. The
+        unused gather reads row 0 and coalesces.
+        """
 
         device_index = (
             torch.accelerator.current_device_index()
