@@ -642,27 +642,6 @@ class SpeculativeConfig:
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["LongCatFlashMTPModel"]}
             )
-        if hf_config.model_type in {"qwen4_exp", "qwen4_exp_text"}:
-            hf_config.model_type = "qwen4_exp_mtp"
-        if hf_config.model_type == "qwen4_exp_mtp":
-            text_config = get_hf_text_config(hf_config)
-            n_predict = getattr(
-                text_config,
-                "mtp_num_hidden_layers",
-                getattr(text_config, "num_nextn_predict_layers", None),
-            )
-            share_mtp_indices = getattr(
-                text_config, "index_share_for_mtp_iteration", False
-            )
-            hf_config.update(
-                {
-                    # hc_count is the HC stream multiplier for Qwen MTP feedback.
-                    "hc_mult": int(text_config.hc_count),
-                    "n_predict": n_predict,
-                    "architectures": ["Qwen4ExpMTP"],
-                    "index_share_for_mtp_iteration": share_mtp_indices,
-                }
-            )
 
         if hf_config.model_type in ("step3p5", "step3p7") or hf_config.architectures[
             0
@@ -1554,15 +1533,6 @@ class SpeculativeConfig:
 
     def num_speculative_state_tokens(self) -> int:
         num_spec_tokens = self.num_speculative_tokens or 0
-        if self.index_share_for_mtp_iteration is not None:
-            if self.method != "mtp" or self.draft_model_config is None:
-                raise ValueError(
-                    "index_share_for_mtp_iteration is only supported with method='mtp'"
-                )
-            self.draft_model_config.hf_config.index_share_for_mtp_iteration = (
-                self.index_share_for_mtp_iteration
-            )
-
         if self.use_dflash_ddtree() and not self.ddtree_disable_tree_verify:
             return max(num_spec_tokens, self.ddtree_budget or num_spec_tokens)
         return num_spec_tokens
