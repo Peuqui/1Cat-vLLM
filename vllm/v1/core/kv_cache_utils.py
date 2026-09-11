@@ -1704,14 +1704,7 @@ def get_kv_cache_config_from_groups(
         )
 
     # Determine how model runners should initialize the KV cache tensors.
-    csa_config = _get_kv_cache_config_csa_linear(
-        vllm_config, kv_cache_groups, available_memory
-    )
-    if csa_config is not None:
-        # CSA+linear: two page sizes per block with aliased owners, so neither
-        # the uniform-page nor the DeepseekV4 bucketing applies.
-        num_blocks, kv_cache_tensors = csa_config
-    elif len(kv_cache_groups) == 1 and isinstance(
+    if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         # Special case: all layers have the same type of KV cache but with
@@ -2553,20 +2546,6 @@ def _max_memory_usage_bytes_from_groups(
     """
     if not kv_cache_groups:
         return 0
-
-    csa_layout = _get_csa_linear_tensor_layout(kv_cache_groups)
-    if csa_layout is not None:
-        # CSA+linear: every cache owner aliases into one of the two page slots
-        # a QSA layer occupies in a block, so the hybrid cache costs exactly
-        # one bytes_per_block per block of context -- the mamba states and the
-        # compressor ring ride along in slots that are paid for already. Must
-        # agree with _get_kv_cache_config_csa_linear.
-        num_blocks = max(
-            group.kv_cache_spec.max_memory_usage_pages(vllm_config)
-            for group in kv_cache_groups
-            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-        )
-        return csa_layout.bytes_per_block * num_blocks
 
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs

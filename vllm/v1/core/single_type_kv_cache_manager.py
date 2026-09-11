@@ -69,14 +69,6 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool = block_pool
         self.enable_caching = enable_caching
         self._max_admission_blocks_per_request = max_admission_blocks_per_request
-        # Only full-attention-style specs feed the worker-side zeroing path.
-        # The ring buffer of CircularBufferSpec is overwritten in place and
-        # must never be reported here.
-        self._record_new_block_ids = type(kv_cache_spec) in (
-            FullAttentionSpec,
-            TQFullAttentionSpec,
-            MLAAttentionSpec,
-        )
         self.new_block_ids: list[int] = []
 
         # Mamba ``align`` block tables are sparse and mutable: committed
@@ -268,7 +260,11 @@ class SingleTypeKVCacheManager(ABC):
                 cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
             )
             req_blocks.extend(allocated_blocks)
-            if self._record_new_block_ids:
+            if type(self.kv_cache_spec) in (
+                FullAttentionSpec,
+                TQFullAttentionSpec,
+                MLAAttentionSpec,
+            ):
                 self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
     def allocate_new_blocks(
@@ -296,7 +292,11 @@ class SingleTypeKVCacheManager(ABC):
         else:
             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
             req_blocks.extend(new_blocks)
-            if self._record_new_block_ids:
+            if type(self.kv_cache_spec) in (
+                FullAttentionSpec,
+                TQFullAttentionSpec,
+                MLAAttentionSpec,
+            ):
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return new_blocks
 
@@ -1524,7 +1524,6 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     KpoolTailSpec: KpoolTailManager,
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
     MambaSpec: MambaManager,
-    CircularBufferSpec: CircularBufferManager,
     CrossAttentionSpec: CrossAttentionManager,
     SinkFullAttentionSpec: SinkFullAttentionManager,
     CircularBufferSpec: CircularBufferManager,

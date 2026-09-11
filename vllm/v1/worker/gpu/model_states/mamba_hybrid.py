@@ -95,12 +95,6 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
                     )
                 )
             }
-        # Der sm75-GDN-Builder ist eine eigenstaendige Klasse, keine Unterklasse
-        # des Standardtyps — ohne die zweite Bedingung faellt er hier heraus und
-        # bekommt die Spekulations-Metadaten nie. Der Ziel-Forward wird dann als
-        # Prefill klassifiziert, waehrend der CUDA-Graph als Spekulations-Decode
-        # aufgezeichnet wurde (build_for_cudagraph_capture umgeht diesen Weg).
-        # Der V1-Runner behandelt denselben Fall bereits.
         if not isinstance(
             attn_metadata_builder,
             (

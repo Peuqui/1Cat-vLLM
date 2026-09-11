@@ -308,28 +308,6 @@ def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
     return sorted(capture_sizes)
 
 
-
-def _any_visible_device_has_capability(capability: tuple[int, int]) -> bool:
-    """True if ANY visible CUDA device has exactly this compute capability.
-
-    ``current_platform.is_device_capability`` only ever looks at device 0,
-    which is the wrong question for a heterogeneous pipeline-parallel
-    deployment where each stage sits on a different architecture.
-    """
-    from vllm.platforms import current_platform
-
-    if not current_platform.is_cuda():
-        return False
-    try:
-        device_count = torch.cuda.device_count()
-    except Exception:
-        return current_platform.is_device_capability(capability)
-    for device_id in range(device_count):
-        if current_platform.is_device_capability(capability, device_id=device_id):
-            return True
-    return False
-
-
 def _sm70_mtp_cudagraph_capture_sizes(
     max_num_seqs: int,
     decode_query_len: int,

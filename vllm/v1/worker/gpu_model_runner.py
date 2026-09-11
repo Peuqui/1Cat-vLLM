@@ -2452,10 +2452,6 @@ class GPUModelRunner(
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
         # layers in the draft model.
-        # PP-Fix (Mini 2026-08-24): Nicht-letzte Ranks bekommen drafter=None,
-        # damit isinstance()-Pruefungen ohne AttributeError ins Leere laufen.
-        if self.speculative_config and not get_pp_group().is_last_rank:
-            self.drafter = None  # type: ignore[assignment]
         if self.speculative_config and get_pp_group().is_last_rank:
             self.drafter: (
                 NgramProposer  # noqa: F823
@@ -2883,7 +2879,7 @@ class GPUModelRunner(
         # Non-last PP rank + spec decode: this step's scheduler_output,
         # needed for the hybrid-state update after receiving the accepted
         # tokens from the last rank in sample_tokens().
-        self._pp_nonlast_scheduler_output: "SchedulerOutput | None" = None
+        self._pp_nonlast_scheduler_output: SchedulerOutput | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
