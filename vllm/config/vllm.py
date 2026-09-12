@@ -1875,19 +1875,6 @@ class VllmConfig:
             attention_backend is None
             or attention_backend_name in ("FLASH_ATTN_V100", "FLASHINFER_SM70")
         )
-        # Heterogeneous PP: this block runs ONCE, in the parent process, and
-        # its env defaults are inherited by every worker. Keying it on device 0
-        # silently strips the whole SM70 tuning (GDN decode FlashQLA, the GDN
-        # schedules, packed recurrent decode, the 0DOT3 compile graph) from the
-        # V100 workers whenever device 0 happens to be a Turing/Ampere+ stage —
-        # which produced coherent-looking but progressively degrading output.
-        # Decide on the deployment, not on one card: if ANY visible device is
-        # SM70, the SM70 stage needs its baseline. The defaults are SM70-gated
-        # at their point of use, so a mixed deployment's other stages ignore
-        # them.
-        # FIX2: die SM70-Grundabstimmung ist eine pre-Ampere-Abstimmung, keine
-        # Volta-Abstimmung. Ein reines Turing-System bekam sie nie und lieferte
-        # Muell.
         sm70_flash_v100_baseline = (
             current_platform.is_cuda()
             and _any_participating_device_is_pre_ampere(self)
