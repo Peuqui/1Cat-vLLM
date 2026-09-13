@@ -70,6 +70,18 @@ def load_fa2_library(device: torch.device) -> None:
     )
 
 
+def ensure_fa2_library_loaded() -> None:
+    """Load the FA2 library for this process's current device, once.
+
+    For code that resolves operators from ``torch.ops._vllm_fa2_C`` before the
+    first attention call goes through this module (the SM70 backend looks its
+    prefill and tail operators up at initialisation). Importing this module no
+    longer loads a library, so those lookups ask here first.
+    """
+    if _fa2_loaded_capability is None:
+        load_fa2_library(torch.device("cuda", torch.accelerator.current_device_index()))
+
+
 try:
     from . import _vllm_fa3_C  # type: ignore[attr-defined]  # noqa: F401
 
@@ -109,7 +121,7 @@ def _is_fa2_supported() -> tuple[bool, str | None]:
     # rejected by the C++ entry points.
     # Mixed rigs: ask this worker's own GPU, not device 0 -- otherwise the
     # weakest card in the grid decides for every stage.
-    device = torch.cuda.current_device() if torch.cuda.is_available() else 0
+    device = torch.accelerator.current_device_index()
     if not current_platform.has_device_capability(75, device):
         return False, "FA2 is only supported on devices with compute capability >= 7.5"
     capability = current_platform.get_device_capability(device)

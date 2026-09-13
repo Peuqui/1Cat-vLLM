@@ -218,8 +218,7 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> str | None:
         if has_sink and device_capability < DeviceCapability(9, 0):
             return "sink not supported on compute capability < 9.0"
-        if (device_capability < DeviceCapability(8, 0)
-                and dtype != torch.float16):
+        if device_capability < DeviceCapability(8, 0) and dtype != torch.float16:
             return "the sm75 FA2 build is fp16-only"
         return None
 
