@@ -856,12 +856,12 @@ def maybe_convert_json_str_or_file(value: str | None) -> dict[str, Any] | None:
 
 
 def disable_compile_cache() -> bool:
-    sm70_compile_graph = os.getenv(
-        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH",
-        "0",
-    ).strip().lower() in ("1", "true", "yes", "on")
-    default_value = "1" if sm70_compile_graph else "0"
-    return bool(int(os.getenv("VLLM_DISABLE_COMPILE_CACHE", default_value)))
+    # Overlay (Peuqui 13.09.2026): the SM70 0.0.3 compile graph no longer
+    # forces the cache off. The drift that justified it is fixed (#536, env
+    # switches in the key); the card type is part of the AOT key (measured);
+    # on torch 2.10 the first warm start per artifact generation fails to
+    # load (missing pytorch #173556) and recompiles, every later one loads.
+    return bool(int(os.getenv("VLLM_DISABLE_COMPILE_CACHE", "0")))
 
 
 def use_aot_compile() -> bool:
