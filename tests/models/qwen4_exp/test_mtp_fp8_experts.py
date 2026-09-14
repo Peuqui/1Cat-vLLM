@@ -181,19 +181,22 @@ def _draft_config(dtype=torch.float16, pp_size=1, expert_parallel=False):
         # so pipeline parallelism must not disable checkpoint FP8 experts.
         ({"pp_size": 2}, True),
         ({"pp_size": 5}, True),
+        # Online conversion is only validated on a single stage.
+        ({"online": True}, True),
+        ({"online": True, "pp_size": 2}, False),
         ({"expert_parallel": True}, False),
         ({"dtype": torch.bfloat16}, False),
         ({"exact_sm70": False}, False),
-        ({"quant": None}, False),
         ({"quant": "gptq"}, False),
         ({"sampler": "synthetic"}, False),
     ],
 )
-def test_fp8_experts_support_allows_pipeline_parallelism(overrides, supported):
+def test_fp8_experts_support_allows_checkpoint_experts_under_pp(overrides, supported):
     from vllm.models.qwen4_exp.nvidia.mtp import _mtp_fp8_experts_supported
 
-    quant = overrides.get("quant", "modelopt_mixed")
-    quant_config = None if quant is None else Mock(get_name=Mock(return_value=quant))
+    quant_config = Mock(
+        get_name=Mock(return_value=overrides.get("quant", "modelopt_mixed"))
+    )
     draft = _draft_config(
         dtype=overrides.get("dtype", torch.float16),
         pp_size=overrides.get("pp_size", 1),
@@ -205,7 +208,11 @@ def test_fp8_experts_support_allows_pipeline_parallelism(overrides, supported):
 
     assert (
         _mtp_fp8_experts_supported(
-            draft, quant_config, speculative, overrides.get("exact_sm70", True)
+            draft,
+            quant_config,
+            speculative,
+            overrides.get("exact_sm70", True),
+            overrides.get("online", False),
         )
         is supported
     )
