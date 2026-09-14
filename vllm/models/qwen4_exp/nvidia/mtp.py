@@ -20,11 +20,12 @@ import torch
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig, replace, set_current_vllm_config
+from vllm.config import SpeculativeConfig, VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -149,6 +150,29 @@ def _validate_mtp_expert_weights_loaded(
         )
 
 
+def _mtp_fp8_experts_supported(
+    draft_vllm_config: VllmConfig,
+    draft_quant_config: QuantizationConfig | None,
+    speculative_config: SpeculativeConfig,
+    exact_sm70: bool,
+) -> bool:
+    """Whether the SM70 FP8 MTP expert method can serve this draft.
+
+    Pipeline parallelism is allowed: the V2 runner builds the speculator only
+    on the last pipeline rank, so the drafter is stage-local and the FP8
+    expert padding follows that stage's tensor-parallel size.
+    """
+    return (
+        exact_sm70
+        and draft_vllm_config.model_config.dtype == torch.float16
+        and draft_quant_config is not None
+        and draft_quant_config.get_name()
+        in ("awq", "modelopt_fp4", "modelopt_mixed", "fp8")
+        and not draft_vllm_config.parallel_config.enable_expert_parallel
+        and speculative_config.rejection_sample_method == "standard"
+    )
+
+
 def _make_draft_vllm_config(
     vllm_config: VllmConfig,
     mtp_start_layer_idx: int,
@@ -207,14 +231,11 @@ def _make_draft_vllm_config(
         }
         checkpoint_prefixes = checkpoint_fp8_prefixes(draft_quant_config, prefixes)
     if online_fp8 or checkpoint_prefixes:
-        if (
-            not is_exact_sm70_cuda_platform()
-            or draft_vllm_config.model_config.dtype != torch.float16
-            or draft_quant_config is None
-            or draft_quant_config.get_name()
-            not in ("awq", "modelopt_fp4", "modelopt_mixed", "fp8")
-            or draft_vllm_config.parallel_config.enable_expert_parallel
-            or speculative_config.rejection_sample_method != "standard"
+        if not _mtp_fp8_experts_supported(
+            draft_vllm_config,
+            draft_quant_config,
+            speculative_config,
+            is_exact_sm70_cuda_platform(),
         ):
             raise ValueError(
                 "MTP FP8 experts require SM70, FP16, an AWQ/ModelOpt/FP8 draft "
