@@ -213,14 +213,13 @@ def _make_draft_vllm_config(
             or draft_quant_config is None
             or draft_quant_config.get_name()
             not in ("awq", "modelopt_fp4", "modelopt_mixed", "fp8")
-            or draft_vllm_config.parallel_config.pipeline_parallel_size != 1
             or draft_vllm_config.parallel_config.enable_expert_parallel
             or speculative_config.rejection_sample_method != "standard"
         ):
             raise ValueError(
                 "MTP FP8 experts require SM70, FP16, an AWQ/ModelOpt/FP8 draft "
-                "checkpoint, tensor parallelism without PP or EP, and standard "
-                "rejection sampling"
+                "checkpoint, no expert parallelism, and standard rejection "
+                "sampling"
             )
         draft_quant_config = MTPExpertFp8Config(
             draft_quant_config,
