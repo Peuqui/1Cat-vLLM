@@ -335,6 +335,43 @@ def _apply_sm70_qwen38_hybrid_ple_defaults(
     parallel_config.ensure_ple_offload_ipc_path()
 
 
+def _qwen4exp_ple_cascade_requested(model_config: ModelConfig) -> bool:
+    """Whether the PLE overflow cascade is configured, checking its contract.
+
+    ``VLLM_QWEN4EXP_PLE_STORE_DEVICE`` names the card that stores table rows
+    beyond the device and pinned-host tiers. The PLE offload worker serves
+    those rows next to the resident tables, which is a different contract
+    from the whole-table offload and from the hybrid lane.
+
+    Only a config that carries a model is checked: helper configs without one,
+    such as the PLE offload worker's isolated single-rank world, inherit the
+    variable but have no table to place.
+    """
+    store_device = envs.VLLM_QWEN4EXP_PLE_STORE_DEVICE
+    if store_device is None:
+        return False
+    if store_device < 0:
+        raise ValueError(
+            f"VLLM_QWEN4EXP_PLE_STORE_DEVICE must be non-negative, got {store_device}"
+        )
+    if not getattr(model_config.hf_text_config, "ple_layer_ids", None):
+        raise ValueError(
+            "VLLM_QWEN4EXP_PLE_STORE_DEVICE is set, but the model has no PLE layers"
+        )
+    if envs.VLLM_SM70_QWEN38_HYBRID_PLE or envs.VLLM_PLE_DISK_OFFLOAD:
+        raise ValueError(
+            "VLLM_QWEN4EXP_PLE_STORE_DEVICE cannot be combined with "
+            "VLLM_SM70_QWEN38_HYBRID_PLE or VLLM_PLE_DISK_OFFLOAD"
+        )
+    return True
+
+
+def _apply_qwen4exp_ple_cascade_defaults(parallel_config: ParallelConfig) -> None:
+    """Start the PLE offload worker that serves the cascade's outer tiers."""
+    os.environ["VLLM_PLE_CPU_OFFLOAD"] = "1"
+    parallel_config.ensure_ple_offload_ipc_path()
+
+
 def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
     max_graph_reqs = min(max(int(max_num_seqs), 1), 16)
     capture_sizes = {
@@ -1869,6 +1906,16 @@ class VllmConfig:
                 "VLLM_SM70_FP8_TURBOMIND explicitly to override."
             )
 
+        if self.model_config is not None and _qwen4exp_ple_cascade_requested(
+            self.model_config
+        ):
+            _apply_qwen4exp_ple_cascade_defaults(self.parallel_config)
+            logger.info_once(
+                "Qwen4Exp PLE overflow cascade: store device %d; the PLE offload "
+                "worker serves the rows beyond the resident tiers.",
+                envs.VLLM_QWEN4EXP_PLE_STORE_DEVICE,
+            )
+
         attention_backend = self.attention_config.backend
         attention_backend_name = getattr(attention_backend, "name", attention_backend)
         sm70_flash_v100_backend = (
@@ -2192,16 +2239,16 @@ class VllmConfig:
                             "configuration: regular torch.compile reproduced "
                             "deterministic greedy token drift."
                         )
-                # Der Compile-Cache lief hier zwangsabgeschaltet, weil das
-                # Wiederladen eines AOT-Artefakts reproduzierbares Token-Drift
-                # erzeugte. Ursache gefunden (2026-09-06): compile_factors()
-                # kannte die roh gelesenen VLLM_-Schalter nicht, die den
-                # Kernelweg umlegen -- der Schluessel unterschied die Wege also
-                # nicht und ein fremdes Artefakt wurde geladen (belegt bis zum
-                # Startabbruch mit KeyError 'skinny_codes'). Der Fix sitzt in
-                # envs.py (1Cat PR #536, upstream gemergt als 53199eb8); damit
-                # ist die Zwangsabschaltung gegenstandslos. Leerer Cache kostete
-                # in der Kalibration rund zwei Stunden je Lauf.
+                # The compile cache used to be forced off here because reloading
+                # an AOT artifact reproduced token drift. Root cause found on
+                # 2026-09-06: compile_factors() did not know the VLLM_ switches
+                # read straight from os.environ that select the kernel path, so
+                # the key did not tell those paths apart and a foreign artifact
+                # was loaded (observed up to a startup abort with KeyError
+                # 'skinny_codes'). The fix lives in envs.py (1Cat PR #536,
+                # merged upstream as 53199eb8), which makes the forced shutdown
+                # pointless; an empty cache cost about two hours per
+                # calibration run.
                 self.compilation_config.inductor_compile_config["combo_kernels"] = True
                 self.compilation_config.inductor_compile_config[
                     "benchmark_combo_kernel"

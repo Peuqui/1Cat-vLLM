@@ -797,6 +797,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4EXP_PLE_HOST_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float | None = None
+    VLLM_QWEN4EXP_PLE_STORE_DEVICE: int | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -4712,6 +4713,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         None
         if os.getenv("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "").strip() == ""
         else float(os.getenv("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "0"))
+    ),
+    # Qwen4Exp PLE overflow cascade: visible CUDA index of the card that
+    # stores table rows beyond the device and pinned-host tiers. Setting it
+    # starts the PLE offload worker next to the resident tables; the compute
+    # ranks wait for its rows inside their CUDA graphs. Unset: no cascade.
+    "VLLM_QWEN4EXP_PLE_STORE_DEVICE": lambda: (
+        None
+        if os.getenv("VLLM_QWEN4EXP_PLE_STORE_DEVICE", "").strip() == ""
+        else int(os.getenv("VLLM_QWEN4EXP_PLE_STORE_DEVICE", "0"))
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model

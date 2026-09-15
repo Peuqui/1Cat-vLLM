@@ -18,6 +18,7 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -46,6 +47,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
+    get_masked_input_and_mask,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.parameter import (
@@ -71,6 +73,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from ..common.ple import (
+    PLERemotePlacement,
     auto_ple_host_budget_bytes,
     available_host_bytes,
     cap_host_budget_bytes,
@@ -590,6 +593,22 @@ def _ple_vram_reserve_bytes(device_total_bytes: int) -> int:
     return min(int(device_total_bytes * 0.08), 4 * 1024**3)
 
 
+def _ple_store_device() -> int | None:
+    """Visible CUDA index of the cascade's store card, or None without cascade.
+
+    Setting it enables the overflow cascade: the compute ranks keep their
+    device and pinned-host tiers and the PLE offload worker serves every row
+    beyond them from the store card.
+    """
+
+    device = envs.VLLM_QWEN4EXP_PLE_STORE_DEVICE
+    if device is not None and device < 0:
+        raise ValueError(
+            f"VLLM_QWEN4EXP_PLE_STORE_DEVICE must be non-negative, got {device}"
+        )
+    return device
+
+
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """TP-sharded FP8 PLE table split between device memory and pinned host.
 
@@ -680,6 +699,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.ple_device_table: torch.Tensor | None = None
         self.ple_host_storage: torch.Tensor | None = None
         self._checkpoint_shard_loaded = False
+
+    @property
+    def local_rows(self) -> int:
+        """Rows this rank holds itself: the device tier followed by the host tier."""
+        self.materialize_tables()
+        return self._device_rows + self._host_rows
 
     def _resolve_host_budget(self, device: torch.device) -> int:
         """Host bytes for the table: as configured, or derived from headroom."""
@@ -856,12 +881,46 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             torch.device("cuda", torch.accelerator.current_device_index())
         )
 
-    def embedding_lookup(self, input_: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input_: torch.Tensor, remote_rows: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Gather, merging the rows the PLE offload worker delivered.
+
+        Same masking and reduction as ``VocabParallelEmbedding.forward``. The
+        worker's rows are merged by rank-local id, so that has to happen
+        before the tensor-parallel reduce.
+        """
+        if remote_rows is None:
+            return super().forward(input_)
+        input_mask = None
+        masked_input = input_
+        if self.tp_size > 1:
+            masked_input, input_mask = get_masked_input_and_mask(
+                input_,
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.shard_indices.num_org_vocab_padding,
+                self.shard_indices.added_vocab_start_index,
+                self.shard_indices.added_vocab_end_index,
+            )
+        output_parallel = self.embedding_lookup(masked_input.long(), remote_rows)
+        if input_mask is not None:
+            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+        return tensor_model_parallel_all_reduce(output_parallel)
+
+    def embedding_lookup(
+        self, input_: torch.Tensor, remote_rows: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Gather FP8 rows from the device/host split, emit scaled values.
 
         Both gathers always run: branching on whether any id falls into the
         host half would need a device-to-host sync on every decode step. The
         unused gather reads row 0 and coalesces.
+
+        ``remote_rows`` are the raw FP8 bytes the PLE offload worker wrote for
+        this batch, one row per id in ``input_`` order. Ids beyond the resident
+        rows read row 0 locally and take the worker's row in the final merge,
+        dequantized by the same kernel arithmetic as the resident gathers.
         """
 
         device_index = (
@@ -874,6 +933,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             self.get_accelerator_weight(input_.device)
             host_ptr = self._accelerator_weight_ptrs[device_index]
         flat_ids = input_.reshape(-1)
+        on_remote = None
+        if remote_rows is not None:
+            on_remote = flat_ids >= self._device_rows + self._host_rows
+            flat_ids = torch.where(on_remote, flat_ids.new_zeros(()), flat_ids)
         output = torch.empty(
             (*input_.shape, self.embedding_dim),
             dtype=self._output_dtype,
@@ -889,30 +952,47 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 self._host_rows != 0,
                 self.embedding_dim,
             )
-            return output
-        boundary = self._device_rows
-        on_host = flat_ids >= boundary
-        zero = flat_ids.new_zeros(())
-        device_ids = torch.where(on_host, zero, flat_ids)
-        host_ids = torch.where(on_host, flat_ids - boundary, zero)
-        host_out = torch.empty_like(out_flat)
-        torch.ops.vllm.qwen4_exp_ple_pinned_gather(
-            device_ids,
-            out_flat,
-            self.weight_scale,
-            self.layer_name,
-            False,
-            self.embedding_dim,
-        )
-        torch.ops.vllm.qwen4_exp_ple_pinned_gather(
-            host_ids,
-            host_out,
-            self.weight_scale,
-            self.layer_name,
-            True,
-            self.embedding_dim,
-        )
-        out_flat.copy_(torch.where(on_host.unsqueeze(-1), host_out, out_flat))
+        else:
+            boundary = self._device_rows
+            on_host = flat_ids >= boundary
+            zero = flat_ids.new_zeros(())
+            device_ids = torch.where(on_host, zero, flat_ids)
+            host_ids = torch.where(on_host, flat_ids - boundary, zero)
+            host_out = torch.empty_like(out_flat)
+            torch.ops.vllm.qwen4_exp_ple_pinned_gather(
+                device_ids,
+                out_flat,
+                self.weight_scale,
+                self.layer_name,
+                False,
+                self.embedding_dim,
+            )
+            torch.ops.vllm.qwen4_exp_ple_pinned_gather(
+                host_ids,
+                host_out,
+                self.weight_scale,
+                self.layer_name,
+                True,
+                self.embedding_dim,
+            )
+            out_flat.copy_(torch.where(on_host.unsqueeze(-1), host_out, out_flat))
+        if on_remote is not None:
+            assert remote_rows is not None
+            if (
+                remote_rows.dtype != torch.uint8
+                or not remote_rows.is_contiguous()
+                or remote_rows.numel() != out_flat.numel()
+            ):
+                raise ValueError(
+                    "remote PLE rows must be contiguous raw FP8 bytes, one row "
+                    f"per id: got {remote_rows.dtype} with {remote_rows.numel()} "
+                    f"bytes for {out_flat.numel()} values"
+                )
+            remote_out = torch.empty_like(out_flat)
+            torch.ops.vllm.qwen4_exp_ple_fp8_bytes_dequant(
+                remote_rows, self.weight_scale, remote_out
+            )
+            out_flat.copy_(torch.where(on_remote.unsqueeze(-1), remote_out, out_flat))
         return output
 
 
@@ -996,14 +1076,22 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             embedding_prefix,
             force_fp8_storage=ple_storage_dtype == "float8_e4m3fn",
         )
+        self._store_device = _ple_store_device()
+        self._remote_placements: list[PLERemotePlacement] = []
         self._disk_offload = bool(envs.VLLM_PLE_DISK_OFFLOAD and is_offload_process())
+        # The cascade worker keeps the checkpoint shards file-backed like the
+        # disk lane: it serves only the rows the ranks do not hold and copies
+        # none of the table into anonymous host memory.
+        self._file_backed_shards = self._disk_offload or (
+            self._store_device is not None and is_offload_process()
+        )
         self._disk_shards: list[torch.Tensor | None] = []
         self._disk_mapped_paths: set[str] = set()
         self._disk_executor: ThreadPoolExecutor | None = None
-        if self._disk_offload:
+        if self._file_backed_shards:
             if quant_method is None:
                 raise NotImplementedError(
-                    "Qwen4Exp PLE disk offload requires FP8 checkpoint storage"
+                    "Qwen4Exp PLE file-backed shards require FP8 checkpoint storage"
                 )
             with torch.device("meta"):
                 self.ngram_embedding = VocabParallelEmbedding(
@@ -1027,23 +1115,31 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 )
                 * shard_size
             )
-            num_threads = envs.VLLM_PLE_DISK_OFFLOAD_NUM_THREADS
-            if num_threads < 0:
-                raise ValueError(
-                    "VLLM_PLE_DISK_OFFLOAD_NUM_THREADS must be non-negative"
+            if self._disk_offload:
+                num_threads = envs.VLLM_PLE_DISK_OFFLOAD_NUM_THREADS
+                if num_threads < 0:
+                    raise ValueError(
+                        "VLLM_PLE_DISK_OFFLOAD_NUM_THREADS must be non-negative"
+                    )
+                if num_threads == 0:
+                    num_threads = min(32, os.cpu_count() or 1)
+                self._disk_executor = ThreadPoolExecutor(
+                    max_workers=num_threads,
+                    thread_name_prefix="ple-mmap",
                 )
-            if num_threads == 0:
-                num_threads = min(32, os.cpu_count() or 1)
-            self._disk_executor = ThreadPoolExecutor(
-                max_workers=num_threads,
-                thread_name_prefix="ple-mmap",
-            )
-            logger.info(
-                "Qwen4Exp PLE disk mmap enabled "
-                "(shards=%d, mmap workers=%d, access=random).",
-                self.split_ngram_parts,
-                num_threads,
-            )
+                logger.info(
+                    "Qwen4Exp PLE disk mmap enabled "
+                    "(shards=%d, mmap workers=%d, access=random).",
+                    self.split_ngram_parts,
+                    num_threads,
+                )
+            else:
+                logger.info(
+                    "Qwen4Exp PLE cascade worker: %d checkpoint shards stay "
+                    "file-backed, store device %d.",
+                    self.split_ngram_parts,
+                    self._store_device,
+                )
         elif _should_use_pinned_host_ple(config):
             if quant_method is None:
                 raise NotImplementedError(
@@ -1080,6 +1176,72 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             ),
             persistent=False,
         )
+
+    @classmethod
+    def offload_keeps_local_tables(cls) -> bool:
+        return _ple_store_device() is not None
+
+    def remote_placement(self) -> PLERemotePlacement | None:
+        """The rows of this rank the cascade worker has to serve."""
+        if self._store_device is None:
+            return None
+        embedding = self.ngram_embedding
+        if not isinstance(embedding, Qwen4ExpPinnedHostEmbedding):
+            raise RuntimeError(
+                "Qwen4Exp PLE cascade requires the split device/host table on "
+                "the compute ranks"
+            )
+        return PLERemotePlacement(
+            tp_start=embedding.shard_indices.org_vocab_start_index,
+            tp_end=embedding.shard_indices.org_vocab_end_index,
+            local_rows=embedding.local_rows,
+        )
+
+    def bind_remote_placements(self, placements: list[object]) -> None:
+        """Take the ranks' row geometry inside the cascade worker."""
+        if self._store_device is None or not is_offload_process():
+            raise RuntimeError(
+                "remote PLE placements belong to the cascade offload worker"
+            )
+        bound: list[PLERemotePlacement] = []
+        for tp_rank, placement in enumerate(placements):
+            if not isinstance(placement, PLERemotePlacement):
+                raise TypeError(
+                    f"tensor-parallel rank {tp_rank} sent "
+                    f"{type(placement).__name__} instead of PLERemotePlacement"
+                )
+            if placement.remote_rows:
+                raise NotImplementedError(
+                    f"tensor-parallel rank {tp_rank} leaves {placement.remote_rows} "
+                    "PLE rows to the worker, but the store tier is not built yet"
+                )
+            bound.append(placement)
+        device_count = torch.cuda.device_count()
+        if self._store_device >= device_count:
+            raise ValueError(
+                f"VLLM_QWEN4EXP_PLE_STORE_DEVICE={self._store_device} is not a "
+                f"visible CUDA device ({device_count} visible)"
+            )
+        free_bytes, total_bytes = torch.cuda.mem_get_info(self._store_device)
+        logger.info(
+            "Qwen4Exp PLE cascade worker: store device %d has %s of %s free; "
+            "every rank keeps its rows resident, the worker serves none.",
+            self._store_device,
+            format_gib(free_bytes),
+            format_gib(total_bytes),
+        )
+        self._remote_placements = bound
+
+    def _remote_lookup(self, output: torch.Tensor) -> None:
+        """Fill the worker's output with the rows the ranks left to it."""
+        if not self._remote_placements:
+            raise RuntimeError(
+                "PLE cascade worker received a request before the ranks "
+                "registered their placements"
+            )
+        # Every rank holds all of its rows, so the buffer carries none; the
+        # copy and the signal still run so the ranks' waits are exercised.
+        output.view(torch.uint8).zero_()
 
     @staticmethod
     def _shift_precompute(
@@ -1320,7 +1482,6 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         ngram_context: torch.Tensor,
         output_buffer: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del hidden_states
         input_ids = input_ids.reshape(-1)
         num_tokens = input_ids.shape[0]
         if is_offload_process():
@@ -1351,7 +1512,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 if output.dtype == torch.uint8
                 else output
             )
-            if getattr(self, "_disk_offload", False):
+            if getattr(self, "_store_device", None) is not None:
+                self._remote_lookup(embedding_output)
+            elif getattr(self, "_disk_offload", False):
                 self._disk_embedding_lookup(ngram_ids, embedding_output)
             else:
                 torch.index_select(
@@ -1361,6 +1524,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     out=embedding_output.reshape(-1, self.head_dim),
                 )
             return output
+        if self._is_cpu_offloaded:
+            # Cascade: the resident tiers are gathered here, the rows beyond
+            # them arrive from the worker in the shared output buffer.
+            remote_rows = self.wait_offloaded_output(hidden_states, num_tokens)
+            return self.ngram_embedding(ngram_ids, remote_rows=remote_rows).flatten(-2)
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
     def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
@@ -1378,7 +1546,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
 
-        disk_offload = getattr(self, "_disk_offload", False)
+        file_backed = getattr(self, "_file_backed_shards", False)
 
         # GPU workers keep only the scale required to dequantize the FP8 rows
         # returned by the CPU process. The embedding weights live exclusively
@@ -1386,6 +1554,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         if (
             envs.VLLM_PLE_CPU_OFFLOAD
             and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+            and not self.offload_keeps_local_tables()
             and not is_offload_process()
         ):
             retained: set[str] = set()
@@ -1458,7 +1627,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                         f"expected {expected_shape}, got "
                         f"{tuple(loaded_weight.shape)}"
                     )
-                if disk_offload:
+                if file_backed:
                     if loaded_weight.dtype != embedding.weight.dtype:
                         raise ValueError(
                             "PLE disk shard dtype mismatch: expected "
@@ -1488,13 +1657,13 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     )
                 loaded.add("ngram_embedding.weight")
                 continue
-            if disk_offload and name == "ngram_embedding.weight_scale":
+            if file_backed and name == "ngram_embedding.weight_scale":
                 self._disk_weight_scale = loaded_weight.clone()
                 loaded.add(name)
                 continue
             regular_weights.append((name, loaded_weight))
 
-        if disk_offload:
+        if file_backed:
             missing_shards = [
                 index for index, shard in enumerate(self._disk_shards) if shard is None
             ]
@@ -1555,7 +1724,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         # its N-gram table must own real CPU storage. With offload disabled,
         # preserve the caller's existing device context (including SM70 UVA).
         ple_device = (
-            torch.device(PleOffloadLayer.get_target_device())
+            torch.device(Qwen4ExpNGramEmbedding.get_target_device())
             if envs.VLLM_PLE_CPU_OFFLOAD
             else nullcontext()
         )

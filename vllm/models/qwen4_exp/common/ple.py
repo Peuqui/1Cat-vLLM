@@ -140,6 +140,33 @@ def plan_ple_placement(
     return PLEPlacement(vram_rows=total_rows - host_rows, host_rows=host_rows)
 
 
+@dataclass(frozen=True)
+class PLERemotePlacement:
+    """Rows of one tensor-parallel rank that the PLE offload worker serves.
+
+    ``tp_start`` and ``tp_end`` are the rank's vocabulary range as the
+    checkpoint counts it, without padding. ``local_rows`` are the rows the
+    rank keeps itself, counted from its first row (device tier followed by
+    the pinned-host tier), so every rank-local id at or beyond it is read
+    from the worker's output buffer.
+    """
+
+    tp_start: int
+    tp_end: int
+    local_rows: int
+
+    def __post_init__(self) -> None:
+        if self.tp_start < 0 or self.tp_end < self.tp_start:
+            raise ValueError("invalid TP vocabulary range")
+        if self.local_rows < 0:
+            raise ValueError("local_rows must be non-negative")
+
+    @property
+    def remote_rows(self) -> int:
+        """Rows of this rank the worker has to serve."""
+        return max(0, self.tp_end - self.tp_start - self.local_rows)
+
+
 def copy_ple_embedding_shard_split_(
     vram_table: torch.Tensor,
     host_table: torch.Tensor,
