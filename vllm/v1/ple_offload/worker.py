@@ -333,12 +333,10 @@ class PleOffloadWorkerHandle:
 
 def _init_offload_distributed() -> None:
     """Initialize the single-rank Gloo world required by TP-aware layers."""
-    # Fork fix (v100-skinny): the offload child models an isolated PP1 world
-    # (see the explicit DP1/TP1/PP1 config below), but it inherits the GPU
-    # workers' environment -- a VLLM_PP_LAYER_PARTITION set for the real
-    # pipeline makes get_pp_indices() fail with "len(partitions) != pp_size"
-    # during meta-model construction. Drop it here, same spirit as ignoring
-    # the inherited DP variables.
+    # The worker builds its model in the PP1 world configured below, but it
+    # inherits the GPU workers' environment: a VLLM_PP_LAYER_PARTITION written
+    # for the real pipeline makes get_pp_indices() refuse the single stage
+    # ("len(partitions) != pp_size") while the meta model is constructed.
     os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
     if dist.is_initialized():
         return

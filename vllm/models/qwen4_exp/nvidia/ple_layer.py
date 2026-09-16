@@ -1254,7 +1254,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
     def _check_store_device(self, needed_bytes: int) -> None:
         """Refuse a store tier the configured card cannot hold."""
-        device_count = torch.cuda.device_count()
+        device_count = torch.accelerator.device_count()
         if self._store_device is None or self._store_device >= device_count:
             raise ValueError(
                 f"VLLM_QWEN4EXP_PLE_STORE_DEVICE={self._store_device} is not a "
@@ -1301,7 +1301,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             raise RuntimeError(
                 f"Qwen4Exp PLE store tier loaded {copied} of {store_rows} rows"
             )
-        torch.cuda.synchronize(table.device)
+        torch.accelerator.synchronize(table.device)
         logger.info(
             "Qwen4Exp PLE cascade worker: loaded %d store rows (%s) onto store "
             "device %d in %.1f s.",

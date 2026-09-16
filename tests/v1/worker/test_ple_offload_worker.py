@@ -1067,3 +1067,22 @@ def test_mrv2_ple_offload_skips_ranks_without_ple_layers(
     runner._setup_ple_offload("ipc:///tmp/test-ple-offload")
 
     assert runner._ple_offload_connector is None
+
+
+def test_offload_world_drops_the_pipeline_layer_partition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The worker builds its model as a single pipeline stage; a partition
+    inherited from the GPU workers' pipeline would make get_pp_indices refuse
+    that stage."""
+    from vllm.distributed.utils import get_pp_indices
+
+    set_lazy_env(monkeypatch, "VLLM_PP_LAYER_PARTITION", "24,24")
+    with pytest.raises(ValueError, match="does not match pp_size"):
+        get_pp_indices(48, 0, 1)
+    # An initialized world leaves only the environment handling to run.
+    monkeypatch.setattr(ple_offload_worker.dist, "is_initialized", lambda: True)
+
+    ple_offload_worker._init_offload_distributed()
+
+    assert get_pp_indices(48, 0, 1) == (0, 48)

@@ -515,7 +515,7 @@ def test_plan_ple_placement_cascades_beyond_device_and_host() -> None:
     )
     assert (placement.local_rows, placement.total_rows) == (14, 20)
     # Fastest tier first: a device that holds the whole table leaves the host
-    # share unused (Peuqui 16.09.: "passt nicht ins VRAM allein -> Host-RAM").
+    # share unused, so a fitting table pins no host memory.
     assert _plan(total_rows=20, host_rows=5, vram_rows=99, store_rows=0) == (
         PLEPlacement(vram_rows=20, host_rows=0, store_rows=0, disk_rows=0)
     )
@@ -525,8 +525,11 @@ def test_plan_ple_placement_cascades_beyond_device_and_host() -> None:
     )
     # Without a cascade the configured host share comes first, as before.
     assert plan_ple_placement(
-        total_rows=20, row_bytes=8, host_budget_bytes=5 * 8,
-        vram_budget_bytes=None, store_budget_bytes=0,
+        total_rows=20,
+        row_bytes=8,
+        host_budget_bytes=5 * 8,
+        vram_budget_bytes=None,
+        store_budget_bytes=0,
     ) == PLEPlacement(vram_rows=15, host_rows=5, store_rows=0, disk_rows=0)
     # A store budget larger than needed does not pull rows off the device.
     assert _plan(total_rows=20, host_rows=5, vram_rows=9, store_rows=99) == placement
@@ -1674,7 +1677,7 @@ def test_cascade_worker_binds_resident_placements_and_serves_no_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     layer = _make_cascade_worker_embedding(monkeypatch, store_device=3)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 4)
     monkeypatch.setattr(
         torch.cuda, "mem_get_info", lambda device: (5 * 2**30, 8 * 2**30)
     )
@@ -1704,10 +1707,10 @@ def test_cascade_worker_binds_resident_placements_and_serves_no_rows(
 
     # The store card is only touched when rows actually go there.
     on_store = PLERemotePlacement(tp_start=0, tp_end=100, local_rows=60, store_rows=40)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 3)
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 3)
     with pytest.raises(ValueError, match="not a visible CUDA device"):
         layer.bind_remote_placements([on_store])
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 4)
     # 40 store rows of 16 bytes need 640 bytes on the store device.
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (639, 8 * 2**30))
     with pytest.raises(RuntimeError, match="needs .* only"):

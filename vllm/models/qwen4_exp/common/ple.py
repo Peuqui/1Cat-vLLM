@@ -119,7 +119,8 @@ class PLEPlacement:
     """How many PLE table rows live in each tier of one tensor-parallel rank.
 
     The tiers are consecutive ranges of the rank's rows: device memory first,
-    then pinned host memory, then the store tier the PLE offload worker serves.
+    then pinned host memory, then the store tier and the disk tier, both served
+    by the PLE offload worker.
     """
 
     vram_rows: int
