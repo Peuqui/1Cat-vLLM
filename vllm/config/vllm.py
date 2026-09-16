@@ -347,13 +347,21 @@ def _qwen4exp_ple_cascade_requested(model_config: ModelConfig) -> bool:
     such as the PLE offload worker's isolated single-rank world, inherit the
     variable but have no table to place.
     """
-    store_device = envs.VLLM_QWEN4EXP_PLE_STORE_DEVICE
+    from vllm.models.qwen4_exp.common.ple import (
+        ple_store_budget_bytes,
+        ple_store_device,
+    )
+
+    store_device = ple_store_device()
     if store_device is None:
+        if envs.VLLM_QWEN4EXP_PLE_STORE_GIB is not None:
+            raise ValueError(
+                "VLLM_QWEN4EXP_PLE_STORE_GIB is set without "
+                "VLLM_QWEN4EXP_PLE_STORE_DEVICE"
+            )
         return False
-    if store_device < 0:
-        raise ValueError(
-            f"VLLM_QWEN4EXP_PLE_STORE_DEVICE must be non-negative, got {store_device}"
-        )
+    # Refuses a missing or invalid store budget before any rank loads.
+    ple_store_budget_bytes()
     if not getattr(model_config.hf_text_config, "ple_layer_ids", None):
         raise ValueError(
             "VLLM_QWEN4EXP_PLE_STORE_DEVICE is set, but the model has no PLE layers"

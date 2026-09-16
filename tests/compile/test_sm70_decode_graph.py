@@ -291,13 +291,22 @@ def test_qwen4exp_ple_cascade_starts_the_offload_worker(monkeypatch) -> None:
         "VLLM_PLE_DISK_OFFLOAD",
         "VLLM_SM70_QWEN38_HYBRID_PLE",
         "VLLM_QWEN4EXP_PLE_STORE_DEVICE",
+        "VLLM_QWEN4EXP_PLE_STORE_GIB",
     ):
         set_lazy_env(monkeypatch, name, None)
     model_config = SimpleNamespace(hf_text_config=SimpleNamespace(ple_layer_ids=[1]))
 
     assert not _qwen4exp_ple_cascade_requested(model_config)
-
+    # The two variables only make sense together.
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_GIB", "12")
+    with pytest.raises(ValueError, match="without VLLM_QWEN4EXP_PLE_STORE_DEVICE"):
+        _qwen4exp_ple_cascade_requested(model_config)
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_GIB", None)
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICE", "4")
+    with pytest.raises(ValueError, match="requires VLLM_QWEN4EXP_PLE_STORE_GIB"):
+        _qwen4exp_ple_cascade_requested(model_config)
+
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_GIB", "12")
     assert _qwen4exp_ple_cascade_requested(model_config)
     with pytest.raises(ValueError, match="no PLE layers"):
         _qwen4exp_ple_cascade_requested(

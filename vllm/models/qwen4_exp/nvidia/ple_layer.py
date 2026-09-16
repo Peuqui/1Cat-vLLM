@@ -73,14 +73,23 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from ..common.ple import (
+    PLEPlacement,
     PLERemotePlacement,
+    PLEStoreSegment,
     auto_ple_host_budget_bytes,
     available_host_bytes,
     cap_host_budget_bytes,
     copy_ple_embedding_shard_,
-    copy_ple_embedding_shard_split_,
+    copy_ple_embedding_shard_tiers_,
     kv_cache_bytes_for_max_model_len,
     plan_ple_placement,
+    plan_ple_store_segments,
+    ple_host_budget_bytes,
+    ple_host_reserve_bytes,
+    ple_store_budget_bytes,
+    ple_store_device,
+    ple_store_indices,
+    ple_vram_reserve_bytes,
     total_host_bytes,
 )
 
@@ -538,77 +547,6 @@ def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
     return capability is not None and capability.major < 8
 
 
-def _ple_host_budget_bytes() -> int | None:
-    """Configured host bytes per rank for the PLE table, or None to derive them."""
-
-    budget_gib = envs.VLLM_QWEN4EXP_PLE_HOST_GIB
-    if budget_gib is None:
-        return None
-    if not math.isfinite(budget_gib) or budget_gib < 0:
-        raise ValueError(
-            f"VLLM_QWEN4EXP_PLE_HOST_GIB must be finite and non-negative, "
-            f"got {budget_gib}"
-        )
-    return int(budget_gib * 1024**3)
-
-
-def _ple_host_reserve_bytes(host_total_bytes: int) -> int:
-    """Host memory the automatic placement leaves to everything else.
-
-    The engine processes, the checkpoint loading and other tenants of the
-    host need room that no single rank can measure; on a 30 GB host the
-    default keeps 7.5 GiB.
-    """
-
-    reserve_gib = envs.VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB
-    if reserve_gib is not None:
-        if not math.isfinite(reserve_gib) or reserve_gib < 0:
-            raise ValueError(
-                "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB must be finite and non-negative, "
-                f"got {reserve_gib}"
-            )
-        return int(reserve_gib * 1024**3)
-    return host_total_bytes // 4
-
-
-def _ple_vram_reserve_bytes(device_total_bytes: int) -> int:
-    """Device memory the automatic placement keeps free.
-
-    It covers the activation peak and the graph pool, which the engine only
-    measures after the weights are placed -- so they cannot be read here. On
-    a 48 GB card the gap between (weights + KV) and the utilization budget
-    stayed between 1.8 and 2.3 GiB; the default leaves a slightly wider
-    margin. Overshooting costs host memory, undershooting makes the KV
-    allocator fail late.
-    """
-
-    reserve_gib = envs.VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB
-    if reserve_gib is not None:
-        if not math.isfinite(reserve_gib) or reserve_gib < 0:
-            raise ValueError(
-                "VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB must be finite and non-negative, "
-                f"got {reserve_gib}"
-            )
-        return int(reserve_gib * 1024**3)
-    return min(int(device_total_bytes * 0.08), 4 * 1024**3)
-
-
-def _ple_store_device() -> int | None:
-    """Visible CUDA index of the cascade's store card, or None without cascade.
-
-    Setting it enables the overflow cascade: the compute ranks keep their
-    device and pinned-host tiers and the PLE offload worker serves every row
-    beyond them from the store card.
-    """
-
-    device = envs.VLLM_QWEN4EXP_PLE_STORE_DEVICE
-    if device is not None and device < 0:
-        raise ValueError(
-            f"VLLM_QWEN4EXP_PLE_STORE_DEVICE must be non-negative, got {device}"
-        )
-    return device
-
-
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """TP-sharded FP8 PLE table split between device memory and pinned host.
 
@@ -620,9 +558,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     the KV cache of the requested context and a reserve stay in device
     memory, only the remainder goes to pinned host memory and is gathered
     through a stable UVA view. ``VLLM_QWEN4EXP_PLE_HOST_GIB`` fixes the host
-    share instead. Gathers always read both halves (an unused half reads row
-    0), because branching on the ids would need a device-to-host sync on
-    every decode step.
+    share instead. With the overflow cascade the rows beyond both tiers stay
+    unallocated here and arrive from the PLE offload worker. Gathers always
+    read both halves (an unused half reads row 0), because branching on the
+    ids would need a device-to-host sync on every decode step.
     """
 
     def __init__(
@@ -695,6 +634,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self._output_dtype = self.weight_scale.dtype
         self._device_rows = 0
         self._host_rows = 0
+        self._store_rows = 0
         self._device_table_ptr = 0
         self.ple_device_table: torch.Tensor | None = None
         self.ple_host_storage: torch.Tensor | None = None
@@ -706,18 +646,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.materialize_tables()
         return self._device_rows + self._host_rows
 
-    def _resolve_host_budget(self, device: torch.device) -> int:
-        """Host bytes for the table: as configured, or derived from headroom."""
-        explicit = _ple_host_budget_bytes()
-        if explicit is not None:
-            return explicit
+    def _device_spill_bytes(self, device: torch.device, table_bytes: int) -> int:
+        """Bytes of the table that do not fit beside the weights and the KV cache."""
         vllm_config = get_current_vllm_config()
         free_bytes, total_bytes = torch.cuda.mem_get_info(device)
         kv_bytes = kv_cache_bytes_for_max_model_len(vllm_config)
-        reserve_bytes = _ple_vram_reserve_bytes(total_bytes)
+        reserve_bytes = ple_vram_reserve_bytes(total_bytes)
         gmu = vllm_config.cache_config.gpu_memory_utilization
-        table_bytes = self._meta_weight_shape[0] * self.embedding_dim
-        budget = auto_ple_host_budget_bytes(
+        spill = auto_ple_host_budget_bytes(
             table_bytes=table_bytes,
             device_total_bytes=total_bytes,
             device_allocated_bytes=total_bytes - free_bytes,
@@ -727,66 +663,105 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         )
         logger.info(
             "Qwen4Exp PLE auto placement: %s usable at gmu=%.2f, %s already "
-            "allocated, %s KV for %d tokens, %s reserve -> %s of the table go "
-            "to host memory",
+            "allocated, %s KV for %d tokens, %s reserve -> %s of the table do "
+            "not fit in device memory",
             format_gib(int(total_bytes * gmu)),
             gmu,
             format_gib(total_bytes - free_bytes),
             format_gib(kv_bytes),
             vllm_config.model_config.max_model_len,
             format_gib(reserve_bytes),
-            format_gib(budget),
+            format_gib(spill),
         )
-        # The table lives on the first pipeline stage only, so its
-        # tensor-parallel ranks are the ones sharing this host's memory.
+        return spill
+
+    def _cap_derived_host_budget(self, budget: int) -> int:
+        """Bound a derived host budget by this rank's share of the host memory.
+
+        What no longer spills to the host stays on the device or goes to the
+        store tier. A configured budget is checked once before the ranks start
+        (check_ple_host_share) and used as given.
+        """
         host_available = available_host_bytes()
         host_total = total_host_bytes()
-        if budget and host_available is not None and host_total is not None:
-            ranks = vllm_config.parallel_config.tensor_parallel_size
-            host_reserve = _ple_host_reserve_bytes(host_total)
-            capped = cap_host_budget_bytes(
-                budget_bytes=budget,
-                available_bytes=host_available,
-                reserve_bytes=host_reserve,
-                ranks_sharing_host=ranks,
+        if not budget or host_available is None or host_total is None:
+            return budget
+        # The table lives on the first pipeline stage only, so its
+        # tensor-parallel ranks are the ones sharing this host's memory.
+        ranks = self.tp_size
+        host_reserve = ple_host_reserve_bytes(host_total)
+        capped = cap_host_budget_bytes(
+            budget_bytes=budget,
+            available_bytes=host_available,
+            reserve_bytes=host_reserve,
+            ranks_sharing_host=ranks,
+        )
+        if capped == budget:
+            return budget
+        logger.warning(
+            "Qwen4Exp PLE host budget cut from %s to %s: %s host memory "
+            "available, %s kept in reserve, shared by %d tensor-parallel ranks. "
+            "The rest of the table stays on the device or goes to the store "
+            "tier; if the requested context no longer fits, the KV allocator "
+            "reports the reachable max_model_len.",
+            format_gib(budget),
+            format_gib(capped),
+            format_gib(host_available),
+            format_gib(host_reserve),
+            ranks,
+        )
+        return capped
+
+    def _plan_placement(self, device: torch.device) -> PLEPlacement:
+        """Place the rows of this rank on the device, the host and the store.
+
+        Without the cascade a configured host share leaves the device the rest
+        unmeasured, as before. With the cascade the device tier is measured,
+        so the rows beyond device and host go to the store tier instead of
+        overcommitting the device.
+        """
+        row_bytes = self.embedding_dim
+        total_rows = self._meta_weight_shape[0]
+        table_bytes = total_rows * row_bytes
+        explicit_host = ple_host_budget_bytes()
+        cascade = ple_store_device() is not None
+        spill = None
+        if explicit_host is None or cascade:
+            spill = self._device_spill_bytes(device, table_bytes)
+        if explicit_host is not None:
+            host_budget = explicit_host
+        else:
+            assert spill is not None
+            host_budget = self._cap_derived_host_budget(spill)
+        vram_budget = None
+        store_budget = 0
+        if cascade:
+            assert spill is not None
+            # A partial row of the spill still fits beside the rest on the
+            # device, as it does without the cascade.
+            vram_budget = table_bytes - (spill // row_bytes) * row_bytes
+            store_budget = ple_store_budget_bytes() // self.tp_size
+        placement = plan_ple_placement(
+            total_rows=total_rows,
+            row_bytes=row_bytes,
+            host_budget_bytes=host_budget,
+            vram_budget_bytes=vram_budget,
+            store_budget_bytes=store_budget,
+        )
+        if placement.store_rows and not placement.local_rows:
+            # The gathers of both resident tiers always run and read row 0.
+            raise RuntimeError(
+                "Qwen4Exp PLE cascade needs at least one resident row per rank; "
+                "raise VLLM_QWEN4EXP_PLE_HOST_GIB or free device memory."
             )
-            if capped < budget:
-                logger.warning(
-                    "Qwen4Exp PLE host budget cut from %s to %s: %s host "
-                    "memory available, %s kept in reserve, shared by %d "
-                    "tensor-parallel ranks. The rest of the table stays on the "
-                    "device; if the requested context no longer fits, the KV "
-                    "allocator reports the reachable max_model_len.",
-                    format_gib(budget),
-                    format_gib(capped),
-                    format_gib(host_available),
-                    format_gib(host_reserve),
-                    ranks,
-                )
-                budget = capped
-        return budget
+        return placement
 
     def materialize_tables(self) -> None:
         """Allocate the device and host parts of the FP8 table (idempotent)."""
         if self.ple_device_table is not None:
             return
         device = torch.device("cuda", torch.accelerator.current_device_index())
-        total_rows = self._meta_weight_shape[0]
-        host_budget = self._resolve_host_budget(device)
-        placement = plan_ple_placement(
-            total_rows=total_rows,
-            row_bytes=self.embedding_dim,
-            host_budget_bytes=host_budget,
-        )
-        needed = placement.host_rows * self.embedding_dim
-        available = available_host_bytes()
-        if needed and available is not None and needed > available:
-            raise RuntimeError(
-                f"Qwen4Exp PLE placement needs {format_gib(needed)} of pinned "
-                f"host memory but only {format_gib(available)} is available, "
-                "and every tensor-parallel rank pins its own share. Lower the "
-                "requested context or VLLM_QWEN4EXP_PLE_HOST_GIB."
-            )
+        placement = self._plan_placement(device)
         device_table = torch.empty(
             (placement.vram_rows, self.embedding_dim),
             dtype=self._meta_weight_dtype,
@@ -804,17 +779,21 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.ple_host_storage = host_storage
         self._device_rows = placement.vram_rows
         self._host_rows = placement.host_rows
+        self._store_rows = placement.store_rows
         # Cached as a plain int: torch.compile cannot trace data_ptr() inside
         # the forward, the same reason the host pointer is cached below.
         self._device_table_ptr = self.ple_device_table.data_ptr()
         logger.info(
             "Qwen4Exp PLE table placement: %d of %d rows in device memory "
-            "(%s), %d rows in pinned host memory (%s)",
+            "(%s), %d rows in pinned host memory (%s), %d rows on the store "
+            "tier (%s)",
             placement.vram_rows,
             placement.total_rows,
             format_gib(placement.vram_rows * self.embedding_dim),
             placement.host_rows,
             format_gib(placement.host_rows * self.embedding_dim),
+            placement.store_rows,
+            format_gib(placement.store_rows * self.embedding_dim),
         )
 
     def load_shard(
@@ -825,13 +804,17 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         tp_start: int,
         tp_end: int,
     ) -> int:
-        """Copy one checkpoint shard into whichever part owns its rows."""
+        """Copy one checkpoint shard into whichever resident tier owns its rows."""
         self.materialize_tables()
         assert self.ple_device_table is not None
         assert self.ple_host_storage is not None
-        copied = copy_ple_embedding_shard_split_(
-            self.ple_device_table,
-            self.ple_host_storage,
+        # The store tier's rows are loaded by the PLE offload worker.
+        copied = copy_ple_embedding_shard_tiers_(
+            [
+                (self._device_rows, self.ple_device_table),
+                (self._host_rows, self.ple_host_storage),
+                (self._store_rows, None),
+            ],
             loaded_weight,
             checkpoint_start=checkpoint_start,
             tp_start=tp_start,
@@ -932,6 +915,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         if host_ptr is None:
             self.get_accelerator_weight(input_.device)
             host_ptr = self._accelerator_weight_ptrs[device_index]
+        if remote_rows is None and self._store_rows:
+            # Ids on the store tier would read past the resident tables.
+            raise RuntimeError(
+                "Qwen4Exp PLE rows live on the store tier, but the lookup got "
+                "no rows from the PLE offload worker"
+            )
         flat_ids = input_.reshape(-1)
         on_remote = None
         if remote_rows is not None:
@@ -1076,8 +1065,12 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             embedding_prefix,
             force_fp8_storage=ple_storage_dtype == "float8_e4m3fn",
         )
-        self._store_device = _ple_store_device()
+        self._store_device = ple_store_device()
         self._remote_placements: list[PLERemotePlacement] = []
+        self._store_segments: list[PLEStoreSegment] = []
+        # Worker only: the rows every rank leaves to the store tier, end to
+        # end on the store card; None while every rank holds all of its rows.
+        self._store_table: torch.Tensor | None = None
         self._disk_offload = bool(envs.VLLM_PLE_DISK_OFFLOAD and is_offload_process())
         # The cascade worker keeps the checkpoint shards file-backed like the
         # disk lane: it serves only the rows the ranks do not hold and copies
@@ -1179,7 +1172,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
     @classmethod
     def offload_keeps_local_tables(cls) -> bool:
-        return _ple_store_device() is not None
+        return ple_store_device() is not None
 
     def remote_placement(self) -> PLERemotePlacement | None:
         """The rows of this rank the cascade worker has to serve."""
@@ -1210,38 +1203,98 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     f"tensor-parallel rank {tp_rank} sent "
                     f"{type(placement).__name__} instead of PLERemotePlacement"
                 )
-            if placement.remote_rows:
-                raise NotImplementedError(
-                    f"tensor-parallel rank {tp_rank} leaves {placement.remote_rows} "
-                    "PLE rows to the worker, but the store tier is not built yet"
-                )
             bound.append(placement)
+        segments = plan_ple_store_segments(bound)
         device_count = torch.cuda.device_count()
         if self._store_device >= device_count:
             raise ValueError(
                 f"VLLM_QWEN4EXP_PLE_STORE_DEVICE={self._store_device} is not a "
                 f"visible CUDA device ({device_count} visible)"
             )
+        store_rows = sum(placement.remote_rows for placement in bound)
+        store_bytes = store_rows * self.head_dim
         free_bytes, total_bytes = torch.cuda.mem_get_info(self._store_device)
         logger.info(
             "Qwen4Exp PLE cascade worker: store device %d has %s of %s free; "
-            "every rank keeps its rows resident, the worker serves none.",
+            "the ranks leave %d rows (%s) to the store tier: %s",
             self._store_device,
             format_gib(free_bytes),
             format_gib(total_bytes),
+            store_rows,
+            format_gib(store_bytes),
+            segments,
         )
+        if store_bytes > free_bytes:
+            raise RuntimeError(
+                f"Qwen4Exp PLE store tier needs {format_gib(store_bytes)} on "
+                f"store device {self._store_device}, but only "
+                f"{format_gib(free_bytes)} is free. Lower "
+                "VLLM_QWEN4EXP_PLE_STORE_GIB or free the store device."
+            )
+        self._store_table = self._load_store_table(segments) if store_rows else None
+        self._store_segments = segments
         self._remote_placements = bound
 
-    def _remote_lookup(self, output: torch.Tensor) -> None:
-        """Fill the worker's output with the rows the ranks left to it."""
+    def _load_store_table(self, segments: list[PLEStoreSegment]) -> torch.Tensor:
+        """Copy the store segments from the mapped checkpoint to the store card."""
+        store_rows = sum(segment.end - segment.start for segment in segments)
+        table = torch.empty(
+            (store_rows, self.head_dim),
+            dtype=torch.uint8,
+            device=torch.device("cuda", self._store_device),
+        )
+        started = time.perf_counter()
+        copied = 0
+        for segment in segments:
+            destination = table.narrow(0, segment.offset, segment.end - segment.start)
+            for shard_index, shard in enumerate(self._disk_shards):
+                assert shard is not None
+                # Raw bytes: the store card only gathers, the ranks dequantize.
+                copied += copy_ple_embedding_shard_(
+                    destination,
+                    shard.view(torch.uint8),
+                    checkpoint_start=shard_index * self._disk_shard_size,
+                    tp_start=segment.start,
+                    tp_end=segment.end,
+                )
+        if copied != store_rows:
+            raise RuntimeError(
+                f"Qwen4Exp PLE store tier loaded {copied} of {store_rows} rows"
+            )
+        torch.cuda.synchronize(table.device)
+        logger.info(
+            "Qwen4Exp PLE cascade worker: loaded %d store rows (%s) onto store "
+            "device %d in %.1f s.",
+            store_rows,
+            format_gib(store_rows * self.head_dim),
+            self._store_device,
+            time.perf_counter() - started,
+        )
+        return table
+
+    def _remote_lookup(self, ngram_ids: torch.Tensor, output: torch.Tensor) -> None:
+        """Fill the worker's output with the rows the ranks left to it.
+
+        One buffer serves every tensor-parallel rank: the store segments are
+        disjoint, and each rank merges only the slots of ids in its own
+        segment. The other slots carry store row 0.
+        """
         if not self._remote_placements:
             raise RuntimeError(
                 "PLE cascade worker received a request before the ranks "
                 "registered their placements"
             )
-        # Every rank holds all of its rows, so the buffer carries none; the
-        # copy and the signal still run so the ranks' waits are exercised.
-        output.view(torch.uint8).zero_()
+        output_rows = output.view(torch.uint8).reshape(-1, self.head_dim)
+        if self._store_table is None:
+            # Every rank holds all of its rows, so the buffer carries none; the
+            # copy and the signal still run so the ranks' waits are exercised.
+            output_rows.zero_()
+            return
+        indices = ple_store_indices(ngram_ids.reshape(-1), self._store_segments)
+        store_indices = indices.to(self._store_table.device)
+        # Blocking device-to-host copy: the runner starts the asynchronous
+        # copies to the ranks from this pinned buffer right afterwards.
+        output_rows.copy_(self._store_table.index_select(0, store_indices))
 
     @staticmethod
     def _shift_precompute(
@@ -1513,7 +1566,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 else output
             )
             if getattr(self, "_store_device", None) is not None:
-                self._remote_lookup(embedding_output)
+                self._remote_lookup(ngram_ids, embedding_output)
             elif getattr(self, "_disk_offload", False):
                 self._disk_embedding_lookup(ngram_ids, embedding_output)
             else:
