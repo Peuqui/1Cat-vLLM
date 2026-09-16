@@ -154,12 +154,13 @@ def plan_ple_placement(
     """Split the PLE rows of one rank into device, host, store and disk tiers.
 
     The table is addressed by hashes, so every row is equally likely to be read
-    and the split points carry no meaning beyond capacity. The host tier takes
-    its budget, the device tier the rest up to its budget, the store tier what
-    its budget holds, and only then the disk tier, which is the mapped
-    checkpoint and needs no budget. Without a device budget the device holds
-    the rest unmeasured and both outer tiers stay empty. Rows are never
-    dropped: a remainder with no tier left to hold it is an error.
+    and the split points carry no meaning beyond capacity -- so every tier is
+    filled before the next, fastest first: the device up to its measured
+    budget, then the pinned host share, then the store card, and only then the
+    disk tier, which is the mapped checkpoint and needs no budget. Without a
+    device budget (no cascade) the host share is taken first and the device
+    holds the rest unmeasured, as it always has. Rows are never dropped: a
+    remainder with no tier left to hold it is an error.
     """
 
     if total_rows < 0 or row_bytes <= 0:
@@ -168,10 +169,12 @@ def plan_ple_placement(
         raise ValueError("host and store budgets must be non-negative")
     if vram_budget_bytes is not None and vram_budget_bytes < 0:
         raise ValueError("device budget must be non-negative")
-    host_rows = min(total_rows, host_budget_bytes // row_bytes)
-    vram_rows = total_rows - host_rows
-    if vram_budget_bytes is not None:
-        vram_rows = min(vram_rows, vram_budget_bytes // row_bytes)
+    if vram_budget_bytes is None:
+        host_rows = min(total_rows, host_budget_bytes // row_bytes)
+        vram_rows = total_rows - host_rows
+    else:
+        vram_rows = min(total_rows, vram_budget_bytes // row_bytes)
+        host_rows = min(total_rows - vram_rows, host_budget_bytes // row_bytes)
     remaining = total_rows - host_rows - vram_rows
     store_rows = min(remaining, store_budget_bytes // row_bytes)
     disk_rows = remaining - store_rows

@@ -514,10 +514,20 @@ def test_plan_ple_placement_cascades_beyond_device_and_host() -> None:
         vram_rows=9, host_rows=5, store_rows=6, disk_rows=0
     )
     assert (placement.local_rows, placement.total_rows) == (14, 20)
-    # A device budget beyond the rest leaves the store empty.
+    # Fastest tier first: a device that holds the whole table leaves the host
+    # share unused (Peuqui 16.09.: "passt nicht ins VRAM allein -> Host-RAM").
     assert _plan(total_rows=20, host_rows=5, vram_rows=99, store_rows=0) == (
-        PLEPlacement(vram_rows=15, host_rows=5, store_rows=0, disk_rows=0)
+        PLEPlacement(vram_rows=20, host_rows=0, store_rows=0, disk_rows=0)
     )
+    # The host takes only what the device could not hold.
+    assert _plan(total_rows=20, host_rows=5, vram_rows=18, store_rows=0) == (
+        PLEPlacement(vram_rows=18, host_rows=2, store_rows=0, disk_rows=0)
+    )
+    # Without a cascade the configured host share comes first, as before.
+    assert plan_ple_placement(
+        total_rows=20, row_bytes=8, host_budget_bytes=5 * 8,
+        vram_budget_bytes=None, store_budget_bytes=0,
+    ) == PLEPlacement(vram_rows=15, host_rows=5, store_rows=0, disk_rows=0)
     # A store budget larger than needed does not pull rows off the device.
     assert _plan(total_rows=20, host_rows=5, vram_rows=9, store_rows=99) == placement
     # Rows are never dropped: a remainder with no tier left to hold it is
