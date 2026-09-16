@@ -339,9 +339,11 @@ def _qwen4exp_ple_cascade_requested(model_config: ModelConfig) -> bool:
     """Whether the PLE overflow cascade is configured, checking its contract.
 
     ``VLLM_QWEN4EXP_PLE_STORE_DEVICE`` names the card that stores table rows
-    beyond the device and pinned-host tiers. The PLE offload worker serves
-    those rows next to the resident tables, which is a different contract
-    from the whole-table offload and from the hybrid lane.
+    beyond the device and pinned-host tiers, ``VLLM_QWEN4EXP_PLE_DISK`` allows
+    the rest to be read from the mapped checkpoint; either one starts the
+    cascade. The PLE offload worker then serves those rows next to the
+    resident tables, which is a different contract from the whole-table
+    offload and from the hybrid lane.
 
     Only a config that carries a model is checked: helper configs without one,
     such as the PLE offload worker's isolated single-rank world, inherit the
@@ -359,16 +361,18 @@ def _qwen4exp_ple_cascade_requested(model_config: ModelConfig) -> bool:
                 "VLLM_QWEN4EXP_PLE_STORE_GIB is set without "
                 "VLLM_QWEN4EXP_PLE_STORE_DEVICE"
             )
-        return False
-    # Refuses a missing or invalid store budget before any rank loads.
-    ple_store_budget_bytes()
+        if not envs.VLLM_QWEN4EXP_PLE_DISK:
+            return False
+    else:
+        # Refuses a missing or invalid store budget before any rank loads.
+        ple_store_budget_bytes()
     if not getattr(model_config.hf_text_config, "ple_layer_ids", None):
         raise ValueError(
-            "VLLM_QWEN4EXP_PLE_STORE_DEVICE is set, but the model has no PLE layers"
+            "The Qwen4Exp PLE cascade is configured, but the model has no PLE layers"
         )
     if envs.VLLM_SM70_QWEN38_HYBRID_PLE or envs.VLLM_PLE_DISK_OFFLOAD:
         raise ValueError(
-            "VLLM_QWEN4EXP_PLE_STORE_DEVICE cannot be combined with "
+            "The Qwen4Exp PLE cascade cannot be combined with "
             "VLLM_SM70_QWEN38_HYBRID_PLE or VLLM_PLE_DISK_OFFLOAD"
         )
     return True
@@ -1918,10 +1922,12 @@ class VllmConfig:
             self.model_config
         ):
             _apply_qwen4exp_ple_cascade_defaults(self.parallel_config)
+            store_device = envs.VLLM_QWEN4EXP_PLE_STORE_DEVICE
             logger.info_once(
-                "Qwen4Exp PLE overflow cascade: store device %d; the PLE offload "
-                "worker serves the rows beyond the resident tiers.",
-                envs.VLLM_QWEN4EXP_PLE_STORE_DEVICE,
+                "Qwen4Exp PLE overflow cascade: store device %s, disk tier %s; "
+                "the PLE offload worker serves the rows beyond the resident tiers.",
+                "none" if store_device is None else store_device,
+                "allowed" if envs.VLLM_QWEN4EXP_PLE_DISK else "off",
             )
 
         attention_backend = self.attention_config.backend

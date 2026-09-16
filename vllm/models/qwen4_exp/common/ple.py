@@ -125,6 +125,7 @@ class PLEPlacement:
     vram_rows: int
     host_rows: int
     store_rows: int
+    disk_rows: int
 
     @property
     def local_rows(self) -> int:
@@ -132,8 +133,13 @@ class PLEPlacement:
         return self.vram_rows + self.host_rows
 
     @property
+    def remote_rows(self) -> int:
+        """Rows the PLE offload worker serves, store tier before disk tier."""
+        return self.store_rows + self.disk_rows
+
+    @property
     def total_rows(self) -> int:
-        return self.vram_rows + self.host_rows + self.store_rows
+        return self.local_rows + self.remote_rows
 
 
 def plan_ple_placement(
@@ -143,15 +149,17 @@ def plan_ple_placement(
     host_budget_bytes: int,
     vram_budget_bytes: int | None,
     store_budget_bytes: int,
+    disk_allowed: bool = False,
 ) -> PLEPlacement:
-    """Split the PLE rows of one rank into device, host and store tiers.
+    """Split the PLE rows of one rank into device, host, store and disk tiers.
 
     The table is addressed by hashes, so every row is equally likely to be read
     and the split points carry no meaning beyond capacity. The host tier takes
-    its budget, the device tier the rest up to its budget, and whatever remains
-    goes to the store tier. Without a device budget the device holds the rest
-    unmeasured and the store stays empty. Rows are never dropped: a remainder
-    beyond the store budget is an error.
+    its budget, the device tier the rest up to its budget, the store tier what
+    its budget holds, and only then the disk tier, which is the mapped
+    checkpoint and needs no budget. Without a device budget the device holds
+    the rest unmeasured and both outer tiers stay empty. Rows are never
+    dropped: a remainder with no tier left to hold it is an error.
     """
 
     if total_rows < 0 or row_bytes <= 0:
@@ -164,15 +172,24 @@ def plan_ple_placement(
     vram_rows = total_rows - host_rows
     if vram_budget_bytes is not None:
         vram_rows = min(vram_rows, vram_budget_bytes // row_bytes)
-    store_rows = total_rows - host_rows - vram_rows
-    if store_rows * row_bytes > store_budget_bytes:
+    remaining = total_rows - host_rows - vram_rows
+    store_rows = min(remaining, store_budget_bytes // row_bytes)
+    disk_rows = remaining - store_rows
+    if disk_rows and not disk_allowed:
         raise ValueError(
-            f"The PLE table does not fit: {store_rows} rows "
-            f"({store_rows * row_bytes} bytes) remain beyond device and host "
-            f"memory, but the store tier holds {store_budget_bytes} bytes. "
-            "Raise VLLM_QWEN4EXP_PLE_STORE_GIB or VLLM_QWEN4EXP_PLE_HOST_GIB."
+            f"The PLE table does not fit: {disk_rows} rows "
+            f"({disk_rows * row_bytes} bytes) remain beyond the device, host "
+            f"and store tiers ({store_rows} rows in a budget of "
+            f"{store_budget_bytes} bytes). Raise VLLM_QWEN4EXP_PLE_STORE_GIB "
+            "or VLLM_QWEN4EXP_PLE_HOST_GIB, or set VLLM_QWEN4EXP_PLE_DISK=1 "
+            "to read the rest from the checkpoint on disk."
         )
-    return PLEPlacement(vram_rows=vram_rows, host_rows=host_rows, store_rows=store_rows)
+    return PLEPlacement(
+        vram_rows=vram_rows,
+        host_rows=host_rows,
+        store_rows=store_rows,
+        disk_rows=disk_rows,
+    )
 
 
 @dataclass(frozen=True)
@@ -183,23 +200,35 @@ class PLERemotePlacement:
     checkpoint counts it, without padding. ``local_rows`` are the rows the
     rank keeps itself, counted from its first row (device tier followed by
     the pinned-host tier), so every rank-local id at or beyond it is read
-    from the worker's output buffer.
+    from the worker's output buffer. Of those, the first ``store_rows`` live
+    on the store card and the rest are read from the mapped checkpoint.
     """
 
     tp_start: int
     tp_end: int
     local_rows: int
+    store_rows: int = 0
 
     def __post_init__(self) -> None:
         if self.tp_start < 0 or self.tp_end < self.tp_start:
             raise ValueError("invalid TP vocabulary range")
-        if self.local_rows < 0:
-            raise ValueError("local_rows must be non-negative")
+        if self.local_rows < 0 or self.store_rows < 0:
+            raise ValueError("local_rows and store_rows must be non-negative")
+        if self.store_rows > self.remote_rows:
+            raise ValueError(
+                f"store_rows ({self.store_rows}) exceeds the rows left to the "
+                f"worker ({self.remote_rows})"
+            )
 
     @property
     def remote_rows(self) -> int:
         """Rows of this rank the worker has to serve."""
         return max(0, self.tp_end - self.tp_start - self.local_rows)
+
+    @property
+    def disk_rows(self) -> int:
+        """Rows of this rank the worker reads from the mapped checkpoint."""
+        return self.remote_rows - self.store_rows
 
 
 @dataclass(frozen=True)
@@ -211,33 +240,43 @@ class PLEStoreSegment:
     offset: int
 
 
-def plan_ple_store_segments(
-    placements: Sequence[PLERemotePlacement],
-) -> list[PLEStoreSegment]:
-    """Lay the rows every rank leaves to the worker end to end in one store.
+@dataclass(frozen=True)
+class PLEDiskSegment:
+    """Global row range ``[start, end)`` the worker reads from the checkpoint."""
 
-    Tensor-parallel ranks own disjoint vocabulary ranges, so the segments are
-    disjoint as well and every row id falls into at most one of them.
+    start: int
+    end: int
+
+
+def plan_ple_worker_segments(
+    placements: Sequence[PLERemotePlacement],
+) -> tuple[list[PLEStoreSegment], list[PLEDiskSegment]]:
+    """Segments the worker serves: the store card first, the checkpoint after.
+
+    The store segments are laid end to end in one table on the card, the disk
+    segments stay addressed by their global row ids. Tensor-parallel ranks own
+    disjoint vocabulary ranges, so all segments are disjoint and every row id
+    falls into at most one of them.
     """
 
-    segments: list[PLEStoreSegment] = []
     ranges = sorted((placement.tp_start, placement.tp_end) for placement in placements)
     for (_, previous_end), (next_start, _) in pairwise(ranges):
         if next_start < previous_end:
             raise ValueError(f"tensor-parallel vocabulary ranges overlap: {ranges}")
+    store: list[PLEStoreSegment] = []
+    disk: list[PLEDiskSegment] = []
     offset = 0
     for placement in placements:
-        if placement.remote_rows == 0:
-            continue
-        segments.append(
-            PLEStoreSegment(
-                start=placement.tp_start + placement.local_rows,
-                end=placement.tp_end,
-                offset=offset,
+        remote_start = placement.tp_start + placement.local_rows
+        disk_start = remote_start + placement.store_rows
+        if placement.store_rows:
+            store.append(
+                PLEStoreSegment(start=remote_start, end=disk_start, offset=offset)
             )
-        )
-        offset += placement.remote_rows
-    return segments
+            offset += placement.store_rows
+        if placement.disk_rows:
+            disk.append(PLEDiskSegment(start=disk_start, end=placement.tp_end))
+    return store, disk
 
 
 def ple_store_indices(
@@ -255,6 +294,17 @@ def ple_store_indices(
         inside = (ids >= segment.start) & (ids < segment.end)
         indices = torch.where(inside, ids - segment.start + segment.offset, indices)
     return indices
+
+
+def ple_disk_mask(
+    ids: torch.Tensor, segments: Sequence[PLEDiskSegment]
+) -> torch.Tensor:
+    """Which row ids the worker has to read from the mapped checkpoint."""
+
+    mask = torch.zeros_like(ids, dtype=torch.bool)
+    for segment in segments:
+        mask |= (ids >= segment.start) & (ids < segment.end)
+    return mask
 
 
 def copy_ple_embedding_shard_tiers_(
@@ -456,6 +506,18 @@ def ple_store_device() -> int | None:
             f"VLLM_QWEN4EXP_PLE_STORE_DEVICE must be non-negative, got {device}"
         )
     return device
+
+
+def ple_disk_tier_allowed() -> bool:
+    """Whether rows beyond every other tier may be read from the checkpoint."""
+
+    return bool(envs.VLLM_QWEN4EXP_PLE_DISK)
+
+
+def ple_cascade_configured() -> bool:
+    """Whether the overflow cascade is on: a store card, a disk tier, or both."""
+
+    return ple_store_device() is not None or ple_disk_tier_allowed()
 
 
 def ple_store_budget_bytes() -> int:

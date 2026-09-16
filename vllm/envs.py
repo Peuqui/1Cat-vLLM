@@ -799,6 +799,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_STORE_DEVICE: int | None = None
     VLLM_QWEN4EXP_PLE_STORE_GIB: float | None = None
+    VLLM_QWEN4EXP_PLE_DISK: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -4733,6 +4734,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         None
         if os.getenv("VLLM_QWEN4EXP_PLE_STORE_GIB", "").strip() == ""
         else float(os.getenv("VLLM_QWEN4EXP_PLE_STORE_GIB", "0"))
+    ),
+    # Qwen4Exp PLE overflow cascade: let the rows beyond every other tier be
+    # read from the mapped checkpoint on disk. Without it such a remainder
+    # fails the startup. The disk tier needs no budget (the checkpoint is
+    # already there) but is the slowest tier by far.
+    "VLLM_QWEN4EXP_PLE_DISK": lambda: (
+        os.getenv("VLLM_QWEN4EXP_PLE_DISK", "False").lower() in ("true", "1")
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model

@@ -292,6 +292,7 @@ def test_qwen4exp_ple_cascade_starts_the_offload_worker(monkeypatch) -> None:
         "VLLM_SM70_QWEN38_HYBRID_PLE",
         "VLLM_QWEN4EXP_PLE_STORE_DEVICE",
         "VLLM_QWEN4EXP_PLE_STORE_GIB",
+        "VLLM_QWEN4EXP_PLE_DISK",
     ):
         set_lazy_env(monkeypatch, name, None)
     model_config = SimpleNamespace(hf_text_config=SimpleNamespace(ple_layer_ids=[1]))
@@ -308,6 +309,16 @@ def test_qwen4exp_ple_cascade_starts_the_offload_worker(monkeypatch) -> None:
 
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_GIB", "12")
     assert _qwen4exp_ple_cascade_requested(model_config)
+
+    # The disk tier alone also starts the cascade: a host with no spare card.
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICE", None)
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_GIB", None)
+    assert not _qwen4exp_ple_cascade_requested(model_config)
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_DISK", "1")
+    assert _qwen4exp_ple_cascade_requested(model_config)
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_DISK", None)
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICE", "4")
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_GIB", "12")
     with pytest.raises(ValueError, match="no PLE layers"):
         _qwen4exp_ple_cascade_requested(
             SimpleNamespace(hf_text_config=SimpleNamespace(ple_layer_ids=[]))
