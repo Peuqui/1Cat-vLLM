@@ -16,6 +16,7 @@ from vllm.v1.sample.logits_processor.builtin import (
     MinPLogitsProcessor,
     MinTokensLogitsProcessor,
 )
+from vllm.v1.sample.logits_processor.interface import AddedRequest
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
@@ -929,7 +930,7 @@ def _min_p_processor(min_p_per_request: list[float]) -> MinPLogitsProcessor:
     vllm_config = Mock()
     vllm_config.scheduler_config.max_num_seqs = len(min_p_per_request)
     processor = MinPLogitsProcessor(vllm_config, DEVICE_TYPE, is_pin_memory=False)
-    added = [
+    added: list[AddedRequest] = [
         (index, SamplingParams(min_p=min_p), None, [])
         for index, min_p in enumerate(min_p_per_request)
     ]
