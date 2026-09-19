@@ -15,6 +15,12 @@ import torch
 
 WorkspaceSpec = tuple[tuple[int, ...], torch.dtype]
 
+# Query tokens attended per pass. The buffers grow with this number, not with
+# the prefill chunk: at 64 heads and 640 keys they take 130 MiB for 128 tokens,
+# and a 256-token chunk reserving twice that ran the V100 stages of a
+# pipeline out of memory. A second pass costs two more BLAS calls per layer.
+MAX_TOKENS_PER_PASS = 128
+
 
 def sparse_prefill_bmm_workspace_specs(
     num_tokens: int,
@@ -24,6 +30,7 @@ def sparse_prefill_bmm_workspace_specs(
     dtype: torch.dtype,
 ) -> list[WorkspaceSpec]:
     """Buffers of `sparse_attn_prefill_bmm`, in its argument order."""
+    num_tokens = min(num_tokens, MAX_TOKENS_PER_PASS)
     return [
         ((num_tokens, width, head_dim), dtype),
         ((num_tokens, num_heads, width), dtype),
@@ -53,23 +60,36 @@ def sparse_attn_prefill_bmm(
 ) -> None:
     """q [T, H, D], kv [S, D], indices [T, W] into kv (-1 = unused), lengths
     [T], attn_sink [H]. The four buffers come from the workspace specs and may
-    be larger than this call needs. The softmax runs in float32 over the keys
-    plus one sink column that only feeds the denominator."""
-    num_tokens, width = indices.shape
+    be larger than this call needs; they hold `MAX_TOKENS_PER_PASS` tokens, so
+    a longer chunk takes several passes. The softmax runs in float32 over the
+    keys plus one sink column that only feeds the denominator."""
+    total_tokens, width = indices.shape
     num_heads = q.shape[1]
-    keys = _fit(keys, (num_tokens, width, kv.shape[-1]))
-    scores = _fit(scores, (num_tokens, num_heads, width))
-    logits = _fit(logits, (num_tokens, num_heads, width + 1))
-    probs = _fit(probs, (num_tokens, num_heads, width + 1))
-
     unused = indices < 0
     unused |= torch.arange(width, device=indices.device)[None, :] >= lengths[:, None]
-    torch.index_select(
-        kv, 0, indices.clamp(min=0).view(-1), out=keys.view(-1, kv.shape[-1])
-    )
-    attend_gathered_keys(
-        q, keys, unused, scale, attn_sink, output, scores, logits, probs
-    )
+    safe_indices = indices.clamp(min=0)
+
+    for start in range(0, total_tokens, MAX_TOKENS_PER_PASS):
+        stop = min(start + MAX_TOKENS_PER_PASS, total_tokens)
+        num_tokens = stop - start
+        pass_keys = _fit(keys, (num_tokens, width, kv.shape[-1]))
+        torch.index_select(
+            kv,
+            0,
+            safe_indices[start:stop].reshape(-1),
+            out=pass_keys.view(-1, kv.shape[-1]),
+        )
+        attend_gathered_keys(
+            q[start:stop],
+            pass_keys,
+            unused[start:stop],
+            scale,
+            attn_sink,
+            output[start:stop],
+            _fit(scores, (num_tokens, num_heads, width)),
+            _fit(logits, (num_tokens, num_heads, width + 1)),
+            _fit(probs, (num_tokens, num_heads, width + 1)),
+        )
 
 
 def attend_gathered_keys(
