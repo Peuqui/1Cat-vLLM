@@ -23,9 +23,19 @@ from vllm.utils.torch_utils import direct_register_custom_op
 # ---------------------------------------------------------------------------
 
 
-def _mhc_pre_torch_generic(residual, fn, hc_scale, hc_base, rms_eps,
-                           hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
-                           sinkhorn_repeat, norm_weight=None, norm_eps=1e-6):
+def _mhc_pre_torch_generic(
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    hc_pre_eps,
+    hc_sinkhorn_eps,
+    hc_post_mult_value,
+    sinkhorn_repeat,
+    norm_weight=None,
+    norm_eps=1e-6,
+):
     hc_mult, hidden = residual.shape[-2], residual.shape[-1]
     outer = residual.shape[:-2]
     rf = residual.reshape(-1, hc_mult, hidden)
@@ -34,13 +44,19 @@ def _mhc_pre_torch_generic(residual, fn, hc_scale, hc_base, rms_eps,
     mixes = x @ fn.t()
     sqrsum = x.square().sum(-1, keepdim=True)
     mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden) + rms_eps)
-    pre = (torch.sigmoid(mixes[:, :hc_mult] * hc_scale[0]
-                         + hc_base[:hc_mult]) + hc_pre_eps)
-    post = (torch.sigmoid(mixes[:, hc_mult:2 * hc_mult] * hc_scale[1]
-                          + hc_base[hc_mult:2 * hc_mult])
-            * hc_post_mult_value)
-    comb = (mixes[:, 2 * hc_mult:].view(t, hc_mult, hc_mult) * hc_scale[2]
-            + hc_base[2 * hc_mult:].view(1, hc_mult, hc_mult))
+    pre = (
+        torch.sigmoid(mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + hc_pre_eps
+    )
+    post = (
+        torch.sigmoid(
+            mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1]
+            + hc_base[hc_mult : 2 * hc_mult]
+        )
+        * hc_post_mult_value
+    )
+    comb = mixes[:, 2 * hc_mult :].view(t, hc_mult, hc_mult) * hc_scale[2] + hc_base[
+        2 * hc_mult :
+    ].view(1, hc_mult, hc_mult)
     comb = torch.softmax(comb, -1) + hc_sinkhorn_eps
     comb = comb / (comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
     for _ in range(sinkhorn_repeat - 1):
@@ -53,9 +69,11 @@ def _mhc_pre_torch_generic(residual, fn, hc_scale, hc_base, rms_eps,
         li = li.to(residual.dtype) * norm_weight.to(residual.dtype)
     else:
         li = li.to(residual.dtype)
-    return (post.view(*outer, hc_mult, 1),
-            comb.view(*outer, hc_mult, hc_mult),
-            li.view(*outer, hidden))
+    return (
+        post.view(*outer, hc_mult, 1),
+        comb.view(*outer, hc_mult, hc_mult),
+        li.view(*outer, hidden),
+    )
 
 
 def saturating_cast(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -69,12 +87,11 @@ def saturating_cast(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return tensor.to(dtype)
 
 
-def _mhc_post_torch_generic(x, residual, post_layer_mix, comb_res_mix,
-                            out_dtype=None):
-    mixed = torch.einsum("...ij,...ih->...jh", comb_res_mix.to(torch.float32),
-                         residual.to(torch.float32))
-    post_term = (post_layer_mix.to(torch.float32)
-                 * x.unsqueeze(-2).to(torch.float32))
+def _mhc_post_torch_generic(x, residual, post_layer_mix, comb_res_mix, out_dtype=None):
+    mixed = torch.einsum(
+        "...ij,...ih->...jh", comb_res_mix.to(torch.float32), residual.to(torch.float32)
+    )
+    post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
     return saturating_cast(mixed + post_term, out_dtype or residual.dtype)
 
 
@@ -85,8 +102,9 @@ def mhc_post_fp32(x, residual, post_layer_mix, comb_res_mix):
     65504 at that cast and poisoned every draft logit through the
     drafter's context KV. The target itself never needs the BOS row of
     its last layers, so it was unaffected. Same math as the fp16 path."""
-    return _mhc_post_torch_generic(x, residual, post_layer_mix, comb_res_mix,
-                                   out_dtype=torch.float32)
+    return _mhc_post_torch_generic(
+        x, residual, post_layer_mix, comb_res_mix, out_dtype=torch.float32
+    )
 
 
 def _hc_head_torch_generic(hs_flat, fn, hc_scale, hc_base, rms_eps, hc_eps):
@@ -110,7 +128,10 @@ def _is_exact_sm70_glm_mhc(
         return False
     # fork (v100-skinny): decide on the WORKER'S device, not device 0 --
     # on the heterogeneous pipeline device 0 is a Turing card.
-    if torch.cuda.get_device_capability(torch.cuda.current_device()) != (7, 0):
+    if torch.cuda.get_device_capability(torch.accelerator.current_device_index()) != (
+        7,
+        0,
+    ):
         return False
     if residual.shape[-2:] != (4, 4096):
         return False
@@ -560,7 +581,7 @@ def mhc_pre_broadcast_tilelang(
     num_tokens = residual.shape[0]
     # fork (v100-skinny): worker-local capability (see _is_exact_sm70_glm_mhc).
     capability = (
-        torch.cuda.get_device_capability(torch.cuda.current_device())
+        torch.cuda.get_device_capability(torch.accelerator.current_device_index())
         if current_platform.is_cuda()
         else None
     )
@@ -875,7 +896,7 @@ def mhc_fused_post_pre_tilelang(
 
     # fork (v100-skinny): worker-local capability (see _is_exact_sm70_glm_mhc).
     capability = (
-        torch.cuda.get_device_capability(torch.cuda.current_device())
+        torch.cuda.get_device_capability(torch.accelerator.current_device_index())
         if current_platform.is_cuda()
         else None
     )
@@ -1220,16 +1241,15 @@ def hc_head_fused_kernel_tilelang(
     if (
         activation_dtype == torch.float16
         and current_platform.is_cuda()
-        and torch.cuda.get_device_capability(torch.cuda.current_device()) < (8, 0)
+        and torch.cuda.get_device_capability(torch.accelerator.current_device_index())
+        < (8, 0)
     ):
         # fork (v100-skinny): the hc_head TileLang codegen crashes on
         # pre-Ampere targets (verified on SM70 AND SM75: tvm-ffi raises
         # during BuildTileLangCUDA and the exception path segfaults).
         # hc_head runs once per forward on the last PP stage only, so the
         # proven torch reference -- the production path to date -- stays.
-        return _hc_head_torch_generic(
-            hs_flat, fn, hc_scale, hc_base, rms_eps, hc_eps
-        )
+        return _hc_head_torch_generic(hs_flat, fn, hc_scale, hc_base, rms_eps, hc_eps)
     num_tokens, hc_mult, hidden_size = hs_flat.shape
     out = torch.empty(
         num_tokens, hidden_size, dtype=activation_dtype, device=hs_flat.device

@@ -1424,8 +1424,6 @@ class GPUModelRunner(
                 model_config.hf_text_config, parallel_config.pipeline_parallel_size
             )
         self._ple_offload_connector: Any | None = None
-
-        self._ple_offload_connector: Any | None = None
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm
 
@@ -2084,9 +2082,7 @@ class GPUModelRunner(
             and current_platform.is_device_capability(70)
         ):
             return False
-        force_spec = (
-            os.getenv("VLLM_SM70_STAGED_PREP_SPEC_FORCE", "0") == "1"
-        )
+        force_spec = os.getenv("VLLM_SM70_STAGED_PREP_SPEC_FORCE", "0") == "1"
         if not force_spec and (
             self.speculative_config is not None or self.num_spec_tokens
         ):
@@ -2138,16 +2134,15 @@ class GPUModelRunner(
         rather than shared by every mamba layer.
         """
         if self._mamba_state_copy_funcs is None:
-            # Diese Stelle war stehengebliebener Upstream-Code: dort liefert
-            # get_mamba_groups ein dict[MambaSpec, list[int]], hier ein
-            # (group_ids, spec)-Tupel — das Iterieren ergab also Listen statt
-            # Specs (AttributeError 'list' object has no attribute
-            # 'mamba_type'). get_mamba_types ist der zur Fork-Signatur
-            # passende Helfer. Die frueher hier aufgerufene Validierung gibt
-            # es nicht mehr; sie sitzt in _get_copy_funcs_for_group und
-            # prueft pro Gruppe zur Nutzungszeit. Erreichbar ist der Zweig
-            # nur ueber mamba_cache_mode == "align", also nur mit
-            # eingeschaltetem Prefix-Caching — deshalb fiel er nie auf.
+            # This was leftover upstream code: there get_mamba_groups returns a
+            # dict[MambaSpec, list[int]], here a (group_ids, spec) tuple, so
+            # iterating it yielded lists instead of specs (AttributeError
+            # 'list' object has no attribute 'mamba_type'). get_mamba_types is
+            # the helper that matches the fork's signature. The validation that
+            # used to be called here no longer exists; it lives in
+            # _get_copy_funcs_for_group and checks each group at use time. The
+            # branch is only reachable through mamba_cache_mode == "align",
+            # that is with prefix caching on, which is why nobody ran into it.
             mamba_types = mamba_utils.get_mamba_types(self.kv_cache_config)
             self._mamba_state_copy_funcs = self.model.get_mamba_state_copy_funcs(
                 mamba_types
@@ -5539,13 +5534,17 @@ class GPUModelRunner(
                         state_block_ids.cpu[req_idx, offset] = block_ids[block_idx]
                     else:
                         import os as _os
+
                         if _os.getenv("VLLM_SM70_GDN_SLOT_DEBUG") == "1":
                             logger.warning(
                                 "GDN_SLOT_DEBUG truncation: req=%s gid=%d "
                                 "state_idx=%d slots=%d len(block_ids)=%d "
                                 "filled=%d",
-                                req_id, kv_cache_gid, state_block_idx,
-                                self.max_spec_state_slots, len(block_ids),
+                                req_id,
+                                kv_cache_gid,
+                                state_block_idx,
+                                self.max_spec_state_slots,
+                                len(block_ids),
                                 offset,
                             )
                         break
@@ -9434,22 +9433,23 @@ class GPUModelRunner(
                     # gating lags ~2 steps). Reset when batch membership
                     # changes. The global flag is exact for
                     # max_num_seqs=1 only.
-                    _end_id = int(os.getenv(
-                        "VLLM_SM70_MTP_THINK_END_TOKEN_ID", "248069"))
+                    _end_id = int(
+                        os.getenv("VLLM_SM70_MTP_THINK_END_TOKEN_ID", "248069")
+                    )
                     _rkey = tuple(self.input_batch.req_ids)
                     if getattr(self, "_sm70_think_rkey", None) != _rkey:
                         self._sm70_think_rkey = _rkey
                         self._sm70_think_flag = torch.zeros(
-                            (), dtype=torch.bool,
-                            device=sampled_token_ids.device)
+                            (), dtype=torch.bool, device=sampled_token_ids.device
+                        )
                         self._sm70_think_flag_cpu = torch.zeros(
-                            (), dtype=torch.bool, pin_memory=True)
-                    self._sm70_think_suppress = bool(
-                        self._sm70_think_flag_cpu)
-                    self._sm70_think_flag |= sampled_token_ids.eq(
-                        _end_id).any()
+                            (), dtype=torch.bool, pin_memory=True
+                        )
+                    self._sm70_think_suppress = bool(self._sm70_think_flag_cpu)
+                    self._sm70_think_flag |= sampled_token_ids.eq(_end_id).any()
                     self._sm70_think_flag_cpu.copy_(
-                        self._sm70_think_flag, non_blocking=True)
+                        self._sm70_think_flag, non_blocking=True
+                    )
                 if input_fits_in_drafter and not getattr(
                     self, "_sm70_think_suppress", False
                 ):
@@ -9569,9 +9569,7 @@ class GPUModelRunner(
             # from the CPU-side sampled ids. MTP proposes drafts BEFORE
             # bookkeeping (eagle-family GPU branch), so suppression applies
             # from the NEXT step — one step of lag, negligible.
-            _end_id = int(
-                os.getenv("VLLM_SM70_MTP_THINK_END_TOKEN_ID", "248069")
-            )
+            _end_id = int(os.getenv("VLLM_SM70_MTP_THINK_END_TOKEN_ID", "248069"))
             _done = getattr(self, "_sm70_think_done_reqs", None)
             if _done is None:
                 _done = set()
@@ -9584,8 +9582,8 @@ class GPUModelRunner(
                 for _rid, _toks in zip(_req_ids, valid_sampled_token_ids):
                     if _rid not in _done and _toks and _end_id in _toks:
                         _done.add(_rid)
-                self._sm70_think_suppress = (
-                    bool(_req_ids) and len(_done) == len(_req_ids)
+                self._sm70_think_suppress = bool(_req_ids) and len(_done) == len(
+                    _req_ids
                 )
 
         if propose_drafts_after_bookkeeping:
@@ -9900,12 +9898,8 @@ class GPUModelRunner(
             (num_reqs, self.num_spec_tokens + 1),
             dtype=torch.int32,
         )
-        torch.distributed.broadcast(
-            sampled_cpu, src=pp.last_rank, group=pp.cpu_group
-        )
-        self._pp_check_token_ids(
-            "sampled", sampled_cpu[:, :1], skip_discarded=True
-        )
+        torch.distributed.broadcast(sampled_cpu, src=pp.last_rank, group=pp.cpu_group)
+        self._pp_check_token_ids("sampled", sampled_cpu[:, :1], skip_discarded=True)
         sampled = sampled_cpu.to(self.device, non_blocking=True)
         valid_counts = _count_contiguous_spec_tokens(sampled)
         next_token_ids = sampled.gather(
@@ -9918,9 +9912,7 @@ class GPUModelRunner(
             (num_reqs, self.num_spec_tokens),
             dtype=torch.int32,
         )
-        torch.distributed.broadcast(
-            drafts_cpu, src=pp.last_rank, group=pp.cpu_group
-        )
+        torch.distributed.broadcast(drafts_cpu, src=pp.last_rank, group=pp.cpu_group)
         self._pp_check_token_ids("draft", drafts_cpu, skip_discarded=False)
         self._draft_token_ids = drafts_cpu.to(self.device, non_blocking=True)
 
@@ -9931,7 +9923,9 @@ class GPUModelRunner(
                 "PP spec decode: missing stashed scheduler_output for the "
                 "hybrid state update on a non-last rank."
             )
-        if torch.cuda.get_device_capability(torch.cuda.current_device()) == (7, 5):
+        if torch.cuda.get_device_capability(
+            torch.accelerator.current_device_index()
+        ) == (7, 5):
             # SM75 stage: the upstream GDN layers roll their speculative
             # states forward inside their own forward, driven by the
             # num_accepted_tokens metadata — only the buffers feeding that
@@ -9963,9 +9957,7 @@ class GPUModelRunner(
             # differed from greedy k=0. Without PP (TP1/TP2 on either card
             # class) greedy k>0 was byte-identical to k=0. Mirrors the
             # non-align branch of _update_states_after_model_execute.
-            self.num_accepted_tokens.cpu[:num_r].copy_(
-                valid_counts, non_blocking=True
-            )
+            self.num_accepted_tokens.cpu[:num_r].copy_(valid_counts, non_blocking=True)
             self.spec_state_slot_selectors.cpu[:num_r].copy_(
                 valid_counts, non_blocking=True
             )
@@ -12625,6 +12617,7 @@ class GPUModelRunner(
         just may have a performance penalty due to that backend treating decodes
         as prefills.
         """
+
         def min_none_high(a, b):
             if b is None:
                 return a

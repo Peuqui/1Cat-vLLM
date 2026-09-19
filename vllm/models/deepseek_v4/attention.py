@@ -26,38 +26,6 @@ from vllm.models.deepseek_v4.common.ops import (
     quantize_and_insert_k_cache,
 )
 from vllm.utils.deep_gemm import fp8_einsum, has_deep_gemm
-
-
-# ---------------------------------------------------------------------------
-# fork: pre-Hopper (no DeepGEMM) reference paths. The fp8_einsum O-projection
-# and the Triton fp8 quant ops need Hopper (Triton refuses fp8e4nv casts on
-# Volta); on such devices wo_a is fp16-dequantized at load (QPN8-blk is_bmm
-# route) and these torch implementations mirror the kernels' documented
-# contracts exactly (incl. the bf16 rounding round-trip of the rotated Q).
-# ---------------------------------------------------------------------------
-
-
-def _torch_indexer_q_rope_quant(positions, q, cos_sin, weights,
-                                softmax_scale, head_scale):
-    t, h, d = q.shape
-    half = cos_sin.shape[-1] // 2
-    rot = 2 * half
-    nope = d - rot
-    x = q.to(torch.float32)
-    cs = cos_sin[positions].to(torch.float32)
-    cos = cs[:, :half].unsqueeze(1)
-    sin = cs[:, half:].unsqueeze(1)
-    xr = x[..., nope:]
-    e, o = xr[..., 0::2], xr[..., 1::2]
-    re = (e * cos - o * sin).to(torch.bfloat16).to(torch.float32)
-    ro = (o * cos + e * sin).to(torch.bfloat16).to(torch.float32)
-    xrot = torch.stack((re, ro), dim=-1).reshape(t, h, rot)
-    xq = torch.cat((x[..., :nope], xrot), dim=-1) if nope else xrot
-    amax = xq.abs().amax(-1).clamp_min(1e-4)
-    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
-    q8 = (xq / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
-    w = weights.to(torch.float32) * scale * softmax_scale * head_scale
-    return q8, w
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inv_rope_einsum
 
 if TYPE_CHECKING:
@@ -128,12 +96,47 @@ def _fill_short_context_topk_indices(
     )
 
 
+# ---------------------------------------------------------------------------
+# fork: pre-Hopper (no DeepGEMM) reference paths. The fp8_einsum O-projection
+# and the Triton fp8 quant ops need Hopper (Triton refuses fp8e4nv casts on
+# Volta); on such devices wo_a is fp16-dequantized at load (QPN8-blk is_bmm
+# route) and these torch implementations mirror the kernels' documented
+# contracts exactly (incl. the bf16 rounding round-trip of the rotated Q).
+# ---------------------------------------------------------------------------
+
+
+def _torch_indexer_q_rope_quant(
+    positions, q, cos_sin, weights, softmax_scale, head_scale
+):
+    t, h, d = q.shape
+    half = cos_sin.shape[-1] // 2
+    rot = 2 * half
+    nope = d - rot
+    x = q.to(torch.float32)
+    cs = cos_sin[positions].to(torch.float32)
+    cos = cs[:, :half].unsqueeze(1)
+    sin = cs[:, half:].unsqueeze(1)
+    xr = x[..., nope:]
+    e, o = xr[..., 0::2], xr[..., 1::2]
+    re = (e * cos - o * sin).to(torch.bfloat16).to(torch.float32)
+    ro = (o * cos + e * sin).to(torch.bfloat16).to(torch.float32)
+    xrot = torch.stack((re, ro), dim=-1).reshape(t, h, rot)
+    xq = torch.cat((x[..., :nope], xrot), dim=-1) if nope else xrot
+    amax = xq.abs().amax(-1).clamp_min(1e-4)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    q8 = (xq / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    w = weights.to(torch.float32) * scale * softmax_scale * head_scale
+    return q8, w
+
+
 def _is_exact_sm70_cuda() -> bool:
     # Fork fix (v100-skinny): decide on the WORKER'S device, not device 0
     # of the visibility list -- on a heterogeneous pipeline (RTX 8000
     # first) every rank saw sm75 and the V100 stages silently lost their
     # SM70 paths (torch-reference indexer, generic projection/insert).
-    return current_platform.is_cuda() and torch.cuda.get_device_capability(torch.cuda.current_device()) == (7, 0)
+    return current_platform.is_cuda() and torch.cuda.get_device_capability(
+        torch.accelerator.current_device_index()
+    ) == (7, 0)
 
 
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
@@ -388,7 +391,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # TurboMind-prepared wo_a. With the QPN8-blk is_bmm route wo_a is
         # fp16-dequantised at load ([N, K] matrix, `_qpn8_dequant16`) and
         # the reference einsum below is the matching implementation --
-        # calling the grouped path on it mis-shapes z by the group count
+        # calling the grouped path on it gives z the wrong shape, off by the group count
         # ("shape '[T, 4096]' is invalid for input of size T*8*4096").
         if self._use_sm70_path and not getattr(self.wo_a, "_qpn8_dequant16", False):
             from vllm.models.deepseek_v4.sm70.projection import (
@@ -424,12 +427,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
                 _apply_inv_rope_ref,
             )
+
             o_ref = _apply_inv_rope_ref(
                 self.rotary_emb, o, positions, self.rope_head_dim
             ).to(o.dtype)
             o_ref = o_ref.view(num_tokens, self.n_local_groups, -1)
-            w = self.wo_a.weight.view(
-                self.n_local_groups, self.o_lora_rank, -1)
+            w = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
             z = torch.einsum("tgd,grd->tgr", o_ref, w)
             return self.wo_b(z.flatten(1))
 
@@ -710,9 +713,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             # rope q and kv separately: forward_native broadcasts cos/sin over
             # a head dimension, which kv ([tokens, head_dim]) does not have.
             q, _ = self.rotary_emb.forward_native(positions, q)
-            kv_roped, _ = self.rotary_emb.forward_native(
-                positions, kv.unsqueeze(1)
-            )
+            kv_roped, _ = self.rotary_emb.forward_native(positions, kv.unsqueeze(1))
             quantize_and_insert_k_cache(
                 kv_roped.squeeze(1).to(torch.bfloat16).contiguous(),
                 swa_kv_cache_2d,
@@ -1075,14 +1076,22 @@ class DeepseekV4Indexer(nn.Module):
             if (
                 current_platform.is_cuda()
                 and not has_deep_gemm()
-                and torch.cuda.get_device_capability(torch.cuda.current_device())
+                and torch.cuda.get_device_capability(
+                    torch.accelerator.current_device_index()
+                )
                 >= (8, 0)
             ):
                 assert not self.use_fp4_kv, (
-                    "torch indexer-q fallback supports the FP8 path only")
+                    "torch indexer-q fallback supports the FP8 path only"
+                )
                 return _torch_indexer_q_rope_quant(
-                    positions, q, rotary_emb.cos_sin_cache, indexer_weights,
-                    self.softmax_scale, self.n_head**-0.5)
+                    positions,
+                    q,
+                    rotary_emb.cos_sin_cache,
+                    indexer_weights,
+                    self.softmax_scale,
+                    self.n_head**-0.5,
+                )
             return fused_indexer_q_rope_quant(
                 positions,
                 q,
