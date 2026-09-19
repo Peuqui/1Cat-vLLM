@@ -58,13 +58,24 @@ def _mhc_pre_torch_generic(residual, fn, hc_scale, hc_base, rms_eps,
             li.view(*outer, hidden))
 
 
+def saturating_cast(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Cast that stores a value beyond float16 as the largest finite float16
+    instead of inf. The model was trained in bfloat16; its attention-sink rows
+    pass 65504 in the last layers, and an inf there turns the next norm or
+    attention into NaN. See FP16_MAX in tilelang_kernels.py."""
+    if dtype == torch.float16 and tensor.dtype != torch.float16:
+        fp16_max = torch.finfo(torch.float16).max
+        tensor = tensor.clamp(-fp16_max, fp16_max)
+    return tensor.to(dtype)
+
+
 def _mhc_post_torch_generic(x, residual, post_layer_mix, comb_res_mix,
                             out_dtype=None):
     mixed = torch.einsum("...ij,...ih->...jh", comb_res_mix.to(torch.float32),
                          residual.to(torch.float32))
     post_term = (post_layer_mix.to(torch.float32)
                  * x.unsqueeze(-2).to(torch.float32))
-    return (mixed + post_term).to(out_dtype or residual.dtype)
+    return saturating_cast(mixed + post_term, out_dtype or residual.dtype)
 
 
 def mhc_post_fp32(x, residual, post_layer_mix, comb_res_mix):
@@ -85,7 +96,8 @@ def _hc_head_torch_generic(hs_flat, fn, hc_scale, hc_base, rms_eps, hc_eps):
     r = torch.rsqrt(x.square().sum(-1, keepdim=True) / (hc * hidden) + rms_eps)
     pre = torch.sigmoid(mixes * r * hc_scale[0] + hc_base) + hc_eps
     out = torch.einsum("tm,tmh->th", pre, hs_flat.to(torch.float32))
-    return out.to(hs_flat.dtype)
+    # Four streams of a sink row add up past float16 before the final norm.
+    return saturating_cast(out, hs_flat.dtype)
 
 
 logger = init_logger(__name__)
