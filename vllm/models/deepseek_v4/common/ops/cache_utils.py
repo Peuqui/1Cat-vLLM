@@ -30,6 +30,17 @@ from vllm.utils.import_utils import has_cutedsl
 from .fp8_software import fp8_e4m3fn_bits_to_fp32, fp32_to_fp8_e4m3fn_bits
 
 
+def needs_software_fp8() -> bool:
+    """Whether Triton has to decode and encode FP8 in software. Native FP8
+    exists from Ada (sm89) on. The original condition matched sm70 exactly,
+    right on a V100-only machine and wrong on a mixed one: the sm75 stages
+    (RTX 8000) took the hardware path, and Triton cannot compile
+    tl.float8e4nv there (2026-09-01)."""
+    return current_platform.is_cuda() and not current_platform.has_device_capability(
+        (8, 9)
+    )
+
+
 @triton.jit
 def quantize_and_insert_k_kernel(
     # Input tensors
@@ -206,15 +217,7 @@ def quantize_and_insert_k_cache(
         block_stride=block_stride,
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
-        use_software_fp8=(
-            # Native FP8-Einheiten gibt es erst ab Ada (sm89). Die
-            # urspruengliche Bedingung traf GENAU sm70 — auf einer reinen
-            # V100-Kiste richtig, auf einem gemischten Aufbau falsch: die
-            # sm75-Stufen (RTX 8000) nahmen den Hardware-Pfad, und Triton
-            # kann tl.float8e4nv dort nicht uebersetzen (2026-09-01).
-            current_platform.is_cuda()
-            and not current_platform.has_device_capability((8, 9))
-        ),
+        use_software_fp8=needs_software_fp8(),
     )
 
 
@@ -375,15 +378,7 @@ def dequantize_and_gather_k_cache_triton(
         output_dim=512,
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
-        use_software_fp8=(
-            # Native FP8-Einheiten gibt es erst ab Ada (sm89). Die
-            # urspruengliche Bedingung traf GENAU sm70 — auf einer reinen
-            # V100-Kiste richtig, auf einem gemischten Aufbau falsch: die
-            # sm75-Stufen (RTX 8000) nahmen den Hardware-Pfad, und Triton
-            # kann tl.float8e4nv dort nicht uebersetzen (2026-09-01).
-            current_platform.is_cuda()
-            and not current_platform.has_device_capability((8, 9))
-        ),
+        use_software_fp8=needs_software_fp8(),
     )
 
 
@@ -401,14 +396,8 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
 ) -> None:
-    use_cutedsl = has_cutedsl() and not (
-        # Native FP8-Einheiten gibt es erst ab Ada (sm89) — der
-        # CuteDSL-Pfad setzt sie voraus. Die urspruengliche Bedingung
-        # nahm nur sm70 aus; sm75 (RTX 8000) lief hinein
-        # (2026-09-01, Gruppe A der sm75-Koexistenz).
-        current_platform.is_cuda()
-        and not current_platform.has_device_capability((8, 9))
-    )
+    # The CuteDSL path needs native FP8 units, see needs_software_fp8.
+    use_cutedsl = has_cutedsl() and not needs_software_fp8()
     if use_cutedsl:
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (

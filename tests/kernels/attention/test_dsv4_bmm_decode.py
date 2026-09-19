@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The split-K QK-D decode branch of the generic DeepSeek V4 sparse MLA impl
+"""The batched-matmul decode branch of the generic DeepSeek V4 sparse MLA impl
 must return what the ragged decode kernel returns for the same metadata."""
 
 from unittest.mock import MagicMock, patch
@@ -16,8 +16,8 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda()
-    or torch.cuda.get_device_capability() not in rocm._QK_DSPLIT_DECODE_CAPABILITIES,
-    reason="split-K QK-D decode is enabled on sm70/sm75 CUDA devices only",
+    or torch.cuda.get_device_capability() not in rocm._BMM_DECODE_CAPABILITIES,
+    reason="batched-matmul decode is enabled on sm70/sm75 CUDA devices only",
 )
 
 HEAD_DIM = 512
@@ -26,13 +26,19 @@ ROPE_HEAD_DIM = 64
 NUM_TOKENS = 6
 WINDOW = 128
 CACHE_BLOCK_SIZE = 256
+BLOCK_PADDING_BYTES = 40
 
 
 def _make_cache(num_rows: int, block_size: int) -> torch.Tensor:
     num_blocks = -(-num_rows // block_size)
-    cache = torch.zeros(
-        (num_blocks, block_size * 584), dtype=torch.uint8, device="cuda"
+    # Blocks of the real paged cache are padded: stride(0) exceeds the bytes
+    # a block holds. A kernel that assumes a dense layout reads the wrong rows.
+    padded = torch.zeros(
+        (num_blocks, block_size * 584 + BLOCK_PADDING_BYTES),
+        dtype=torch.uint8,
+        device="cuda",
     )
+    cache = padded[:, : block_size * 584]
     data = cache[:, : block_size * 576].view(num_blocks, block_size, 576)
     nope = torch.randn((num_blocks, block_size, NOPE_HEAD_DIM), device="cuda")
     data[:, :, :NOPE_HEAD_DIM].copy_(nope.to(torch.float8_e4m3fn).view(torch.uint8))
@@ -43,6 +49,10 @@ def _make_cache(num_rows: int, block_size: int) -> torch.Tensor:
         rope.view(torch.uint8).reshape_as(data[:, :, NOPE_HEAD_DIM:])
     )
     cache[:, block_size * 576 :].fill_(124)
+    # Row 0 stands for a cache row nobody has written (the null block, or
+    # memory from before): its rope half is NaN. Unused slots (-1) read it.
+    nan = torch.full((ROPE_HEAD_DIM,), float("nan"), dtype=torch.bfloat16)
+    data[0, 0, NOPE_HEAD_DIM:].copy_(nan.view(torch.uint8).to("cuda"))
     return cache.view(num_blocks, block_size, 584)
 
 
@@ -53,7 +63,9 @@ def _swa_metadata() -> MagicMock:
     indices = torch.full((NUM_TOKENS, 1, WINDOW), -1, dtype=torch.int32, device="cuda")
     lens = torch.tensor([WINDOW, 1, 17, 64, 100, WINDOW], dtype=torch.int32).cuda()
     for row, length in enumerate(lens.tolist()):
-        indices[row, 0, :length] = torch.randperm(WINDOW, device="cuda")[:length]
+        indices[row, 0, :length] = (
+            1 + torch.randperm(CACHE_BLOCK_SIZE - 1, device="cuda")[:length]
+        )
     metadata.decode_swa_indices = indices
     metadata.decode_swa_lens = lens
     ragged, indptr = build_ragged_indices_from_dense(indices, lens)
@@ -72,18 +84,22 @@ def _c4_case(layer: MagicMock) -> tuple[MagicMock, torch.Tensor]:
     topk = 512
     compressed_block = CACHE_BLOCK_SIZE // 4
     num_blocks = 12
+    block_table = torch.randperm(num_blocks, device="cuda").to(torch.int32)
+    # Local indices that do not map to global cache row 0 (see _make_cache).
+    candidates = torch.arange(num_blocks * compressed_block, device="cuda")
+    maps_to_row_0 = (block_table[candidates // compressed_block] == 0) & (
+        candidates % compressed_block == 0
+    )
+    candidates = candidates[~maps_to_row_0]
     local = torch.full((NUM_TOKENS, topk), -1, dtype=torch.int32, device="cuda")
     for row, length in enumerate([topk, 3, 200, topk, 511, topk]):
-        local[row, :length] = torch.randperm(
-            num_blocks * compressed_block, device="cuda"
-        )[:length]
+        chosen = candidates[torch.randperm(candidates.numel(), device="cuda")]
+        local[row, :length] = chosen[:length].to(torch.int32)
     layer.compress_ratio = 4
     layer.topk_indices_buffer = local
     metadata = MagicMock()
     metadata.block_size = CACHE_BLOCK_SIZE
-    metadata.block_table = torch.randperm(num_blocks, device="cuda").to(torch.int32)[
-        None, :
-    ]
+    metadata.block_table = block_table[None, :]
     return metadata, _make_cache(num_blocks * compressed_block, compressed_block)
 
 
@@ -95,7 +111,7 @@ def _c128_case(layer: MagicMock) -> tuple[MagicMock, torch.Tensor]:
     indices = torch.full((NUM_TOKENS, 1, width), -1, dtype=torch.int32, device="cuda")
     lens = torch.tensor([141, 141, 1, 140, 141, 0], dtype=torch.int32).cuda()
     for row, length in enumerate(lens.tolist()):
-        indices[row, 0, :length] = torch.randperm(width, device="cuda")[:length]
+        indices[row, 0, :length] = 1 + torch.randperm(width - 1, device="cuda")[:length]
     metadata = MagicMock()
     metadata.block_size = CACHE_BLOCK_SIZE
     metadata.c128a_global_decode_topk_indices = indices
@@ -109,7 +125,7 @@ def _c128_case(layer: MagicMock) -> tuple[MagicMock, torch.Tensor]:
 @pytest.mark.parametrize("case", ["swa_only", "c4", "c128"])
 @pytest.mark.parametrize("num_heads", [8, 64])
 @torch.inference_mode()
-def test_qk_dsplit_decode_matches_ragged_decode(case: str, num_heads: int) -> None:
+def test_bmm_decode_matches_ragged_decode(case: str, num_heads: int) -> None:
     torch.manual_seed(0)
     layer = MagicMock()
     layer.swa_cache_layer.kv_cache = _make_cache(WINDOW, CACHE_BLOCK_SIZE)
@@ -139,7 +155,7 @@ def test_qk_dsplit_decode_matches_ragged_decode(case: str, num_heads: int) -> No
     for enabled in (False, True):
         output = torch.empty_like(q)
         with (
-            patch.object(rocm, "_qk_dsplit_decode_enabled", return_value=enabled),
+            patch.object(rocm, "_bmm_sparse_decode_enabled", return_value=enabled),
             patch.object(
                 rocm, "current_workspace_manager", return_value=workspace_manager
             ),

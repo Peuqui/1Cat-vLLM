@@ -333,7 +333,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT: bool = False
-    VLLM_DSV4_TRITON_QK_DSPLIT_DECODE: bool = True
+    VLLM_DSV4_BMM_SPARSE_DECODE: bool = True
     VLLM_DSV4_BMM_SPARSE_PREFILL: bool = True
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
@@ -2612,12 +2612,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT", "0"))
     ),
     # DeepSeek V4 generic Triton sparse-MLA impl (every pre-SM90 CUDA device,
-    # including all stages of a heterogeneous pipeline): run decode through
-    # the split-K QK-D kernel on the device classes it was measured on. The
-    # backend and metadata stay the same on every stage; only the decode
-    # kernel call differs. Set to 0 to fall back to the ragged decode kernel.
-    "VLLM_DSV4_TRITON_QK_DSPLIT_DECODE": lambda: bool(
-        int(os.getenv("VLLM_DSV4_TRITON_QK_DSPLIT_DECODE", "1"))
+    # including all stages of a heterogeneous pipeline): run decode as an
+    # indexed dequantizing gather plus two batched matmuls on the device
+    # classes it was measured on. The backend and metadata stay the same on
+    # every stage; only the decode kernel call differs. Set to 0 for the
+    # ragged Triton decode kernel.
+    "VLLM_DSV4_BMM_SPARSE_DECODE": lambda: bool(
+        int(os.getenv("VLLM_DSV4_BMM_SPARSE_DECODE", "1"))
     ),
     # DeepSeek V4 sparse MLA prefill on CUDA through the generic Triton impl:
     # gather each token's keys once and run the attention as two batched

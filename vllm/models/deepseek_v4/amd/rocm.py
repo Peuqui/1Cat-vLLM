@@ -4,7 +4,7 @@
 # Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.3.0
 # (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
 # Changes: SWA ragged copy sized from the actual dense row width (drafting rows
-# are wider than window_size); split-K QK-D decode kernel on sm70/sm75.
+# are wider than window_size); batched-matmul decode and prefill attention.
 
 import functools
 from dataclasses import dataclass
@@ -18,19 +18,14 @@ from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops import (
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
+    sparse_attn_decode_bmm,
     sparse_attn_prefill_bmm,
+    sparse_decode_bmm_workspace_specs,
     sparse_prefill_bmm_workspace_specs,
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import (
     DeepseekV4FlashMLASparseBackend,
     DeepseekV4SparseMLAAttentionImpl,
-)
-from vllm.models.deepseek_v4.sm70.sparse import (
-    _qk_dsplit_block_h,
-    splitk_workspace_specs,
-)
-from vllm.models.deepseek_v4.sm70.sparse_kernels import (
-    sm70_sparse_attention_paged_fp8_splitk_qk_dsplit,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -618,18 +613,18 @@ class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4FlashMLASparseBackend):
         return DeepseekV4ROCMAiterMLASparseImpl
 
 
-# CUDA device classes the split-K QK-D decode kernel was measured on (V100 and
-# RTX 8000, 64 heads, 6 query tokens: 4-6x over the ragged decode kernel at
-# identical output). Decided per device, so the stages of a heterogeneous
-# pipeline each take the kernel that fits their own card.
-_QK_DSPLIT_DECODE_CAPABILITIES = ((7, 0), (7, 5))
+# CUDA device classes the batched-matmul decode was measured on (V100 and RTX
+# 8000, 64 heads, 6 query tokens: C4 20x, C128 8x, SWA 5x over the ragged
+# decode kernel at identical output). Decided per device, so the stages of a
+# heterogeneous pipeline each take the kernel that fits their own card.
+_BMM_DECODE_CAPABILITIES = ((7, 0), (7, 5))
 
 
 @functools.cache
-def _qk_dsplit_decode_enabled(device: torch.device) -> bool:
-    if not envs.VLLM_DSV4_TRITON_QK_DSPLIT_DECODE or not current_platform.is_cuda():
+def _bmm_sparse_decode_enabled(device: torch.device) -> bool:
+    if not envs.VLLM_DSV4_BMM_SPARSE_DECODE or not current_platform.is_cuda():
         return False
-    return torch.cuda.get_device_capability(device) in _QK_DSPLIT_DECODE_CAPABILITIES
+    return torch.cuda.get_device_capability(device) in _BMM_DECODE_CAPABILITIES
 
 
 def _bmm_sparse_prefill_enabled() -> bool:
@@ -721,17 +716,17 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                     ),
                 )
             )
-            if _qk_dsplit_decode_enabled(q.device):
+            if _bmm_sparse_decode_enabled(q.device):
                 # Decode and prefill never share a step's workspace, so this
                 # only raises the reservation when decode needs more.
                 current_workspace_manager().get_simultaneous(
-                    *splitk_workspace_specs(
+                    *sparse_decode_bmm_workspace_specs(
                         layer.max_decode_query_tokens,
                         q.shape[1],
                         q.shape[-1],
                         round_up(layer.window_size + layer.max_num_batched_tokens, 128),
                         extra_width,
-                        qk_dsplit=True,
+                        q.dtype,
                     )
                 )
             output.zero_()
@@ -792,8 +787,8 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
 
-        if _qk_dsplit_decode_enabled(q.device):
-            cls._forward_decode_qk_dsplit(
+        if _bmm_sparse_decode_enabled(q.device):
+            cls._forward_decode_bmm(
                 layer, q, kv_cache, swa_metadata, attn_metadata, swa_only, output
             )
             return
@@ -848,7 +843,7 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         )
 
     @classmethod
-    def _forward_decode_qk_dsplit(
+    def _forward_decode_bmm(
         cls,
         layer: "DeepseekV4MLAAttention",
         q: torch.Tensor,
@@ -858,8 +853,8 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         swa_only: bool,
         output: torch.Tensor,
     ) -> None:
-        """Decode through the split-K QK-D kernel. Same metadata as the ragged
-        path; it reads the dense index tensors instead of the ragged ones."""
+        """Decode through the batched-matmul attention. Same metadata as the
+        ragged path; it reads the dense index tensors instead of the ragged ones."""
         num_decode_tokens = swa_metadata.num_decode_tokens
         topk_indices = None
         topk_lens = None
@@ -881,7 +876,7 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 topk_lens = attn_metadata.c128a_decode_topk_lens
 
         logger.info_once(
-            "DeepSeek V4 sparse MLA decode: split-K QK-D kernel on %s.",
+            "DeepSeek V4 sparse MLA decode: batched-matmul attention on %s.",
             torch.cuda.get_device_name(q.device),
         )
         swa_indices = swa_metadata.decode_swa_indices
@@ -893,35 +888,28 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             if topk_indices is None
             else topk_indices.reshape(num_decode_tokens, -1).shape[1]
         )
-        partial_max, partial_sum, partial_acc, partial_qk, partial_probs = (
-            current_workspace_manager().get_simultaneous(
-                *splitk_workspace_specs(
-                    num_decode_tokens,
-                    q.shape[1],
-                    q.shape[2],
-                    main_width,
-                    extra_width,
-                    qk_dsplit=True,
-                )
+        buffers = current_workspace_manager().get_simultaneous(
+            *sparse_decode_bmm_workspace_specs(
+                num_decode_tokens,
+                q.shape[1],
+                q.shape[2],
+                main_width,
+                extra_width,
+                q.dtype,
             )
         )
-        sm70_sparse_attention_paged_fp8_splitk_qk_dsplit(
-            q=q,
-            main_cache=layer.swa_cache_layer.kv_cache,
-            main_indices=swa_indices,
-            main_lengths=swa_lens,
-            scale=layer.scale,
-            attn_sink=layer.attn_sink[: q.shape[1]],
-            out=output,
-            extra_cache=kv_cache,
-            extra_indices=topk_indices,
-            extra_lengths=topk_lens,
-            partial_max=partial_max,
-            partial_sum=partial_sum,
-            partial_acc=partial_acc,
-            partial_qk=partial_qk,
-            partial_probs=partial_probs,
-            stage1_block_h=_qk_dsplit_block_h(q.shape[1]),
+        sparse_attn_decode_bmm(
+            q,
+            layer.swa_cache_layer.kv_cache,
+            swa_indices,
+            swa_lens,
+            kv_cache,
+            topk_indices,
+            topk_lens,
+            layer.scale,
+            layer.attn_sink[: q.shape[1]],
+            output,
+            *buffers,
         )
 
     @classmethod

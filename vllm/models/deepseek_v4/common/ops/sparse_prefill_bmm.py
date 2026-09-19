@@ -67,9 +67,29 @@ def sparse_attn_prefill_bmm(
     torch.index_select(
         kv, 0, indices.clamp(min=0).view(-1), out=keys.view(-1, kv.shape[-1])
     )
-    # An unused slot was pointed at row 0, which need not hold a written key:
-    # a short prompt has no compressed entries yet, and whatever the workspace
-    # held before may be NaN. Its weight is zero below, but 0 * NaN is NaN.
+    attend_gathered_keys(
+        q, keys, unused, scale, attn_sink, output, scores, logits, probs
+    )
+
+
+def attend_gathered_keys(
+    q: torch.Tensor,
+    keys: torch.Tensor,
+    unused: torch.Tensor,
+    scale: float,
+    attn_sink: torch.Tensor,
+    output: torch.Tensor,
+    scores: torch.Tensor,
+    logits: torch.Tensor,
+    probs: torch.Tensor,
+) -> None:
+    """Attention of q [T, H, D] over its own gathered keys [T, W, D]; unused
+    [T, W] marks slots that hold no key. Buffers are exactly sized."""
+    width = keys.shape[1]
+    # An unused slot holds whatever the gather read for it, which need not be
+    # a written key: a short prompt has no compressed entries yet, and what
+    # the workspace held before may be NaN. Its weight is zero below, but
+    # 0 * NaN is NaN.
     keys.masked_fill_(unused[:, :, None], 0)
     torch.baddbmm(scores, q, keys.transpose(1, 2), beta=0, alpha=scale, out=scores)
     logits[..., :width].copy_(scores)
