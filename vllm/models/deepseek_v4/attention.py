@@ -814,6 +814,13 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
+        # Most query tokens one decode step can carry: every running request
+        # with its speculative tokens. Sizes the decode kernel workspace.
+        self.max_decode_query_tokens = min(
+            self.max_num_batched_tokens,
+            vllm_config.scheduler_config.max_num_seqs
+            * (1 + vllm_config.num_speculative_tokens),
+        )
         # DeepseekV4 only supports fp8 kv-cache format for now.
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
 

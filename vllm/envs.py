@@ -333,6 +333,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT: bool = False
+    VLLM_DSV4_TRITON_QK_DSPLIT_DECODE: bool = True
+    VLLM_DSV4_BMM_SPARSE_PREFILL: bool = True
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH: bool = False
@@ -2608,6 +2610,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT": lambda: bool(
         int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT", "0"))
+    ),
+    # DeepSeek V4 generic Triton sparse-MLA impl (every pre-SM90 CUDA device,
+    # including all stages of a heterogeneous pipeline): run decode through
+    # the split-K QK-D kernel on the device classes it was measured on. The
+    # backend and metadata stay the same on every stage; only the decode
+    # kernel call differs. Set to 0 to fall back to the ragged decode kernel.
+    "VLLM_DSV4_TRITON_QK_DSPLIT_DECODE": lambda: bool(
+        int(os.getenv("VLLM_DSV4_TRITON_QK_DSPLIT_DECODE", "1"))
+    ),
+    # DeepSeek V4 sparse MLA prefill on CUDA through the generic Triton impl:
+    # gather each token's keys once and run the attention as two batched
+    # matmuls instead of the head-by-head Triton prefill kernel (5-10x on
+    # V100 and RTX 8000, closer to an fp64 reference). Set to 0 for the
+    # Triton prefill kernel.
+    "VLLM_DSV4_BMM_SPARSE_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_DSV4_BMM_SPARSE_PREFILL", "1"))
     ),
     # Diagnostic FP8 MoE fallback lane on V100. Dense FP8 linear can still use
     # TurboMind W8A16, but MoE expert weights are dequantized once to fp16 and

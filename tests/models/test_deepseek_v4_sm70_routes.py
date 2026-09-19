@@ -40,19 +40,17 @@ def test_sm70_sparse_backend_uses_v4_packed_kv_layout():
     ) == (3, 256, 584)
 
 
-def test_sm70_selects_triton_sparse_impl():
+def test_pre_hopper_cuda_selects_the_generic_triton_impl():
+    # Every pre-Hopper stage takes the same impl on purpose: per-stage impls
+    # gave pipeline stages different backends and broke the metadata contract.
     from vllm.models.deepseek_v4 import attention
-    from vllm.models.deepseek_v4.sm70.sparse import DeepseekV4SM70SparseImpl
+    from vllm.models.deepseek_v4.amd.rocm import DeepseekV4ROCMAiterMLASparseImpl
 
     platform = MagicMock()
     platform.is_rocm.return_value = False
-    platform.is_cuda.return_value = True
-    platform.is_device_capability.side_effect = lambda capability: capability == (
-        7,
-        0,
-    )
+    platform.has_device_capability.return_value = False
     with patch.object(attention, "current_platform", platform):
-        assert attention._select_v4_sparse_impl() is DeepseekV4SM70SparseImpl
+        assert attention._select_v4_sparse_impl() is DeepseekV4ROCMAiterMLASparseImpl
 
 
 def test_sm70_sparse_qk_dsplit_uses_graph_workspace():
@@ -111,7 +109,7 @@ def test_sm70_sparse_qk_dsplit_uses_one_tp4_head_group():
     assert _qk_dsplit_block_h(8) == 8
 
 
-def test_sm75_does_not_select_sm70_impl():
+def test_hopper_and_newer_select_flashmla():
     from vllm.models.deepseek_v4 import attention
     from vllm.models.deepseek_v4.nvidia.flashmla import (
         DeepseekV4FlashMLASparseImpl,
@@ -119,9 +117,11 @@ def test_sm75_does_not_select_sm70_impl():
 
     platform = MagicMock()
     platform.is_rocm.return_value = False
-    platform.is_cuda.return_value = True
-    platform.is_device_capability.return_value = False
-    with patch.object(attention, "current_platform", platform):
+    platform.has_device_capability.return_value = True
+    with (
+        patch.object(attention, "current_platform", platform),
+        patch.object(attention, "_is_exact_sm70_cuda", return_value=False),
+    ):
         assert attention._select_v4_sparse_impl() is DeepseekV4FlashMLASparseImpl
 
 

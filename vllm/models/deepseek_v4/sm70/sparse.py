@@ -45,6 +45,31 @@ def _qk_dsplit_block_h(num_heads: int) -> int:
     return 16 if num_heads == 16 else 8
 
 
+def splitk_workspace_specs(
+    num_tokens: int,
+    num_heads: int,
+    head_dim: int,
+    main_width: int,
+    extra_width: int,
+    qk_dsplit: bool,
+) -> list[tuple[tuple[int, ...], torch.dtype]]:
+    """Workspace shapes of the split-K decode kernels, in argument order:
+    partial_max, partial_sum, partial_acc and, with QK-D split, partial_qk and
+    partial_probs."""
+    num_partials = (main_width + 15) // 16 + (extra_width + 15) // 16
+    specs: list[tuple[tuple[int, ...], torch.dtype]] = [
+        ((num_tokens, num_heads, num_partials), torch.float32),
+        ((num_tokens, num_heads, num_partials), torch.float32),
+        ((num_tokens, num_heads, num_partials, head_dim), torch.float32),
+    ]
+    if qk_dsplit:
+        specs.append(
+            ((num_tokens, num_heads, num_partials, head_dim // 64, 16), torch.float32)
+        )
+        specs.append(((num_tokens, num_heads, num_partials, 16), torch.float16))
+    return specs
+
+
 class DeepseekV4SM70SparseBackend(DeepseekV4FlashMLASparseBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16]
 
@@ -207,35 +232,15 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 if topk_indices is None
                 else topk_indices.reshape(num_decode_tokens, -1).shape[1]
             )
-            num_partials = (main_width + 15) // 16 + (extra_width + 15) // 16
             use_qk_dsplit = envs.VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT
-            workspace_specs = [
-                ((num_decode_tokens, q.shape[1], num_partials), torch.float32),
-                ((num_decode_tokens, q.shape[1], num_partials), torch.float32),
-                (
-                    (num_decode_tokens, q.shape[1], num_partials, q.shape[2]),
-                    torch.float32,
-                ),
-            ]
-            if use_qk_dsplit:
-                workspace_specs.extend(
-                    (
-                        (
-                            (
-                                num_decode_tokens,
-                                q.shape[1],
-                                num_partials,
-                                q.shape[2] // 64,
-                                16,
-                            ),
-                            torch.float32,
-                        ),
-                        (
-                            (num_decode_tokens, q.shape[1], num_partials, 16),
-                            torch.float16,
-                        ),
-                    )
-                )
+            workspace_specs = splitk_workspace_specs(
+                num_decode_tokens,
+                q.shape[1],
+                q.shape[2],
+                main_width,
+                extra_width,
+                use_qk_dsplit,
+            )
             workspaces = current_workspace_manager().get_simultaneous(*workspace_specs)
             partial_max, partial_sum, partial_acc = workspaces[:3]
             logger.info_once(
