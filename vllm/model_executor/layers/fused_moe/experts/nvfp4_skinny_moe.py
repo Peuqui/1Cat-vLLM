@@ -9,10 +9,10 @@ weights are re-permuted IN PLACE into the QPN fragment order at load time
 (``process_weights_after_loading`` -> ``_qpn_prepack`` per expert -- a
 byte-equal permutation, so the weight footprint is unchanged and the
 parameter shapes stay checkpoint-shaped). Both serving paths read that
-layout: the grouped decode/verify kernel ``moe_qpn`` (mma.m8n8k4,
-device-side routing, tokens <= 8; 1.3-1.4x over the SIMT predecessor on
-real DeepSeek-V4 experts, V100 and RTX 8000) and the per-expert prefill
-loop via ``gemm_qpn``.
+layout: the grouped kernel ``moe_qpn`` (mma.m8n8k4, device-side routing;
+1.3-1.4x over the SIMT predecessor on real DeepSeek-V4 experts, V100 and
+RTX 8000) for decode/verify and prefill chunks up to
+``_GROUPED_MAX_TOKENS``, and the per-expert loop via ``gemm_qpn`` above.
 
 Deliberate deviation from the emulation: activations stay fp16 (w4a16),
 matching how every NVFP4 *linear* layer in this fork is served. The
@@ -27,6 +27,7 @@ decode/verify regime never chunks).
 """
 
 import os
+from dataclasses import dataclass
 
 import torch
 
@@ -42,8 +43,18 @@ from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExpert
 logger = init_logger(__name__)
 
 _SKINNY_MOE_ENABLED = os.environ.get("VLLM_SM70_NVFP4_MOE_SKINNY", "1") == "1"
-# Grouped kernel bound: rows per expert <= tokens, and the kernel holds 8.
-_GROUPED_MAX_TOKENS = 8
+# Largest batch the grouped kernel serves. It reads an expert's weights once
+# per 8 rows, so it has no structural limit, and on real DeepSeek-V4 layer-5
+# experts (256 experts, top-6) it beats the per-expert loop at every size:
+# 64 tokens 26 -> 5.0/4.2 ms (RTX 8000/V100), 128 tokens 32 -> 6.5/5.5 ms,
+# 512 tokens 37 -> 16/12 ms, 4096 tokens 133 -> 117 / 120 -> 83 ms. The loop
+# costs ~0.13 ms of kernel launches per active expert whatever the card. The
+# bound is about memory: the grouped path holds slot-major intermediates
+# ([tokens * top_k, N] twice and an fp32 [tokens, top_k, K]) that the loop
+# never builds, 0.3 GiB at 2048 tokens and top-10.
+_GROUPED_MAX_TOKENS = int(
+    os.environ.get("VLLM_SM70_NVFP4_MOE_GROUPED_MAX_TOKENS", "512")
+)
 # QPN-prepacked prefill band: qpn (mma.m8n8k4) serves M<=16, chunks above.
 # NOTE gemm_qpn_simt is NOT used here: it disagrees with the current
 # _qpn_prepack order on real expert bytes (latent -- the dense route only
@@ -126,6 +137,21 @@ def skinny_moe_forward(
         output.index_add_(0, rows, y)
 
 
+@dataclass(frozen=True)
+class _ScaleCaches:
+    """Per-expert scales in the forms the two serving paths read."""
+
+    # Global scales as host floats (per-expert loop) and as a device tensor
+    # (grouped kernel).
+    g1: list[float]
+    g2: list[float]
+    g1_t: torch.Tensor
+    g2_t: torch.Tensor
+    # Block scale rasters, viewed as the bytes the kernels decode.
+    w1_scales_u8: torch.Tensor
+    w2_scales_u8: torch.Tensor
+
+
 class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
     """NVFP4 MoE via per-expert skinny GEMMs on checkpoint-layout weights."""
 
@@ -139,18 +165,17 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             "Using Nvfp4SkinnySm70Experts MoE backend: per-expert skinny "
             "NVFP4 GEMMs on checkpoint-layout weights, fp16 activations."
         )
-        self.w1_scale_val = self.quant_config.w1_scale
-        self.w2_scale_val = self.quant_config.w2_scale
+        w1_scale, w2_scale = self.quant_config.w1_scale, self.quant_config.w2_scale
+        assert w1_scale is not None and w2_scale is not None, (
+            "skinny NVFP4 MoE needs the checkpoint's block scales"
+        )
+        self._w1_block_scales: torch.Tensor = w1_scale
+        self._w2_block_scales: torch.Tensor = w2_scale
         self.quant_config._w1.scale = None
         self.quant_config._w2.scale = None
         self.quantization_emulation = False
-        # Lazy caches built on first apply (weights live on the GPU then).
-        self._g1: list[float] | None = None
-        self._g2: list[float] | None = None
-        self._g1_t: torch.Tensor | None = None
-        self._g2_t: torch.Tensor | None = None
-        self._w1_scales_u8: torch.Tensor | None = None
-        self._w2_scales_u8: torch.Tensor | None = None
+        # Built on first apply (weights live on the GPU then).
+        self._scale_caches: _ScaleCaches | None = None
 
     @property
     def quant_dtype(self) -> torch.dtype | str | None:
@@ -170,8 +195,8 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         )
 
         w13, w2 = layer.w13_weight.data, layer.w2_weight.data
-        s13 = self.w1_scale_val.view(torch.uint8)
-        s2 = self.w2_scale_val.view(torch.uint8)
+        s13 = self._w1_block_scales.view(torch.uint8)
+        s2 = self._w2_block_scales.view(torch.uint8)
         for name, w, s in (("w13", w13, s13), ("w2", w2, s2)):
             if w.size(1) % 32 or (w.size(2) * 2) % 64:
                 raise RuntimeError(
@@ -227,11 +252,11 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
     # ops. Address contract: `output`, `hidden_states`, `topk_*` are
     # allocated in the captured segments and written in place; the loop's
     # transients stay local to the eager segment.
-    # Decode/verify batches (<= _GROUPED_MAX_TOKENS tokens) take the grouped
-    # kernel: device-side routing, one launch per weight matrix, no host
-    # sync -- so it captures into CUDA graphs like any other op. Larger
-    # (prefill) batches keep the per-expert loop, which routes on the host
-    # and therefore must leave the capture.
+    # Batches of up to _GROUPED_MAX_TOKENS tokens take the grouped kernel:
+    # device-side routing, one launch per weight matrix, no host sync -- so
+    # it captures into CUDA graphs like any other op. Larger batches keep
+    # the per-expert loop, which routes on the host and therefore must
+    # leave the capture.
     def apply(
         self,
         output,
@@ -297,14 +322,21 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
                 "apply_router_weight_on_input."
             )
 
-    def _ensure_scale_caches(self):
-        if self._g1 is None:
-            self._g1 = self.quant_config.g1_alphas.cpu().tolist()
-            self._g2 = self.quant_config.g2_alphas.cpu().tolist()
-            self._g1_t = self.quant_config.g1_alphas.to(torch.float32).contiguous()
-            self._g2_t = self.quant_config.g2_alphas.to(torch.float32).contiguous()
-            self._w1_scales_u8 = self.w1_scale_val.view(torch.uint8)
-            self._w2_scales_u8 = self.w2_scale_val.view(torch.uint8)
+    def _get_scale_caches(self) -> _ScaleCaches:
+        if self._scale_caches is None:
+            g1, g2 = self.quant_config.g1_alphas, self.quant_config.g2_alphas
+            assert g1 is not None and g2 is not None, (
+                "skinny NVFP4 MoE needs the checkpoint's global scales"
+            )
+            self._scale_caches = _ScaleCaches(
+                g1=g1.cpu().tolist(),
+                g2=g2.cpu().tolist(),
+                g1_t=g1.to(torch.float32).contiguous(),
+                g2_t=g2.to(torch.float32).contiguous(),
+                w1_scales_u8=self._w1_block_scales.view(torch.uint8),
+                w2_scales_u8=self._w2_block_scales.view(torch.uint8),
+            )
+        return self._scale_caches
 
     def _apply_grouped(
         self,
@@ -325,7 +357,7 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             _get_skinny_ext,
         )
 
-        self._ensure_scale_caches()
+        scales = self._get_scale_caches()
         ext = _get_skinny_ext()
         num_tokens, top_k = topk_ids.shape
         inter_dim = self.adjust_N_for_activation(w1.size(1), activation)
@@ -358,8 +390,8 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         ext.moe_qpn(
             hidden_states,
             w1,
-            self._w1_scales_u8,
-            self._g1_t,
+            scales.w1_scales_u8,
+            scales.g1_t,
             perm,
             gids32,
             goff32,
@@ -376,8 +408,8 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         ext.moe_qpn(
             inter,
             w2,
-            self._w2_scales_u8,
-            self._g2_t,
+            scales.w2_scales_u8,
+            scales.g2_t,
             perm,
             gids32,
             goff32,
@@ -430,7 +462,7 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             _get_skinny_ext,
         )
 
-        self._ensure_scale_caches()
+        scales = self._get_scale_caches()
         inter_dim = self.adjust_N_for_activation(w1.size(1), activation)
         skinny_moe_forward(
             ext=_get_skinny_ext(),
@@ -438,10 +470,10 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
-            w1_scales_u8=self._w1_scales_u8,
-            w2_scales_u8=self._w2_scales_u8,
-            g1=self._g1,
-            g2=self._g2,
+            w1_scales_u8=scales.w1_scales_u8,
+            w2_scales_u8=scales.w2_scales_u8,
+            g1=scales.g1,
+            g2=scales.g2,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             inter_dim=inter_dim,
