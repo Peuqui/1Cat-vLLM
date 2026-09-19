@@ -15,6 +15,15 @@ from vllm.utils.torch_utils import set_random_seed
 DEVICE = current_platform.device_type
 
 
+@pytest.fixture(autouse=True)
+def _restore_default_device():
+    # The tests below switch torch's default device; left in place it breaks
+    # any CPU-side test that runs later in the same process.
+    previous = torch.get_default_device()
+    yield
+    torch.set_default_device(previous)
+
+
 def _mhc_test_dtype() -> torch.dtype:
     if current_platform.is_cuda() and torch.cuda.is_available():
         capability = current_platform.get_device_capability()

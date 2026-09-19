@@ -2020,6 +2020,9 @@ def test_deepseek_v4_tuple_width_minimizes_physical_pool_pages():
             decode_context_parallel_size=1,
             prefill_context_parallel_size=1,
         ),
+        # VllmConfig.max_in_flight_tokens with one concurrent batch; the SWA
+        # spec reads it for its recycling-aware admission bound.
+        max_in_flight_tokens=8192,
     )
 
     assert (
