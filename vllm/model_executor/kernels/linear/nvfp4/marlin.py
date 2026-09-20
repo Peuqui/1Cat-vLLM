@@ -186,11 +186,20 @@ def _get_skinny_ext():
         from torch.utils.cpp_extension import load
 
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.0")
+        # Build for both pre-Ampere targets. An sm_70 cubin does run on
+        # Turing through CUDA's upward binary compatibility, but the compiler
+        # then schedules and allocates registers for Volta. Measured on real
+        # expert shapes (64 experts, N=2048, K=4096, decode batch of 6,
+        # RTX 8000): moe_qpn 0.307 -> 0.292 ms at the w13 config (16,1) and
+        # 0.315 -> 0.294 ms at the w2 config (8,1), i.e. 5-7% for free. The
+        # mma.m8n8k4 instruction itself is inline PTX and stays the same.
+        # Cost: first-boot compile grows from ~70 s to ~270 s, cached after.
         _skinny_ext = load(
             name="skinny_nvfp4_v11",
             sources=[_SKINNY_SRC],
             extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo",
-                               "-gencode=arch=compute_70,code=sm_70"],
+                               "-gencode=arch=compute_70,code=sm_70",
+                               "-gencode=arch=compute_75,code=sm_75"],
             verbose=False,
         )
         logger.info_once("SM70 skinny NVFP4 kernel loaded from %s", _SKINNY_SRC)
