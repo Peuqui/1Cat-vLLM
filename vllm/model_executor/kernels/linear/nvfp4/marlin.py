@@ -97,37 +97,45 @@ _SELF_CHECK_CALLS = 3
 _SELF_CHECK_TOL = 3e-2
 
 
-def _qpn_prepack(codes: torch.Tensor, scales: torch.Tensor):
-    """Fragment-order prepack for gemm_qpn: [tile N/32][group K/16]
+def _qpn_prepack(codes: torch.Tensor, scales: torch.Tensor,
+                 scale_group: int = 16):
+    """Fragment-order prepack for gemm_qpn: [tile N/32][group K/scale_group]
     [lane 32] x 8B, nibbles pre-interleaved so the TM decoder's (i, i+4)
     output is exactly the adjacent-k B-fragment register pair. Pure
-    permutation of the checkpoint bytes."""
+    permutation of the checkpoint bytes.
+
+    ``scale_group`` is how many codes share one scale: 16 for NVFP4
+    (fp8-e4m3), 32 for MXFP4 (E8M0). Only the scale table changes size --
+    the code layout is identical, because a 32-code MXFP4 block is just two
+    adjacent 16-code groups that happen to share a scale."""
     n, k2 = codes.shape
     k = k2 * 2
-    if n % 32 or k % 64:
+    if n % 32 or k % 64 or k % scale_group:
         return None, None
     dev = codes.device
-    tiles, groups = n // 32, k // 16
+    tiles, groups = n // 32, k // scale_group
     lane = torch.arange(32, device=dev)
     col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) > 0).long() * 4
     korder = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7,
                            8, 10, 12, 14, 9, 11, 13, 15], device=dev)
     nib = torch.stack([codes & 0xF, codes >> 4], dim=-1).view(n, k)
+    cgroups = k // 16  # code groups: always 16 codes per fragment pair
     g = torch.arange(groups, device=dev)
-    kidx = g.view(groups, 1) * 16 + korder.view(1, 16)
-    qc = torch.empty(tiles, groups, 32, 8, dtype=torch.uint8, device=dev)
+    cg = torch.arange(cgroups, device=dev)
+    kidx = cg.view(cgroups, 1) * 16 + korder.view(1, 16)
+    qc = torch.empty(tiles, cgroups, 32, 8, dtype=torch.uint8, device=dev)
     qs = torch.empty(tiles, groups, 32, dtype=torch.uint8, device=dev)
     # Chunk the gather: the int64 broadcast-index intermediates are 16x
     # the payload — one-shot on lm_head (37984x5120) spikes 2.4 GiB and
     # OOM'd the memory-profiler forward. Cap transients at ~300 MB.
-    chunk = max(1, 36864 // groups)
+    chunk = max(1, 36864 // max(groups, cgroups))
     for t0 in range(0, tiles, chunk):
         t1 = min(t0 + chunk, tiles)
         tt = t1 - t0
         ncol = (torch.arange(t0, t1, device=dev).view(tt, 1) * 32
                 + col.view(1, 32))
-        nb = nib[ncol.view(tt, 1, 32, 1).expand(tt, groups, 32, 16),
-                 kidx.view(1, groups, 1, 16).expand(tt, groups, 32, 16)]
+        nb = nib[ncol.view(tt, 1, 32, 1).expand(tt, cgroups, 32, 16),
+                 kidx.view(1, cgroups, 1, 16).expand(tt, cgroups, 32, 16)]
         qc[t0:t1] = nb[..., 0::2] | (nb[..., 1::2] << 4)
         qs[t0:t1] = scales[ncol.view(tt, 1, 32).expand(tt, groups, 32),
                            g.view(1, groups, 1).expand(tt, groups, 32)]
