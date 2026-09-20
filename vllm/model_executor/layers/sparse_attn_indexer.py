@@ -57,17 +57,19 @@ def _torch_mqa_logits(q_values, k_values, k_scales, weights):
     chunk = max(1, (48 << 20) // max(1, h * n * 2))
     for m0 in range(0, m, chunk):
         m1 = min(m0 + chunk, m)
-        sc = torch.relu_((q16[m0 * h:m1 * h] @ kf16.t()).view(m1 - m0, h, n))
+        sc = torch.relu_((q16[m0 * h : m1 * h] @ kf16.t()).view(m1 - m0, h, n))
         logits[m0:m1] = torch.einsum("mhn,mh->mn", sc, w16[m0:m1]).float()
     return logits
 
 
-def _torch_paged_mqa_logits(q_values, kv_cache, weights, seq_lens,
-                            block_tables, max_model_len, head_dim):
+def _torch_paged_mqa_logits(
+    q_values, kv_cache, weights, seq_lens, block_tables, max_model_len, head_dim
+):
     b, nn, h, d = q_values.shape
     dev = q_values.device
-    logits = torch.full((b * nn, max_model_len), float("-inf"),
-                        dtype=torch.float32, device=dev)
+    logits = torch.full(
+        (b * nn, max_model_len), float("-inf"), dtype=torch.float32, device=dev
+    )
     bs = kv_cache.shape[1]
     kv_flat = kv_cache.view(kv_cache.shape[0], bs, -1)
     for i in range(b):
@@ -82,9 +84,10 @@ def _torch_paged_mqa_logits(q_values, kv_cache, weights, seq_lens,
         kf16 = (kv8.to(torch.float32) * ksc.view(-1, 1)).to(torch.float16)
         q16 = q_values[i].to(torch.float16).reshape(nn * h, d)
         sc = torch.relu_((q16 @ kf16.t()).view(nn, h, length))
-        w16 = weights[i * nn:(i + 1) * nn].to(torch.float16)
-        logits[i * nn:(i + 1) * nn, :length] = (
-            torch.einsum("nhl,nh->nl", sc, w16).float())
+        w16 = weights[i * nn : (i + 1) * nn].to(torch.float16)
+        logits[i * nn : (i + 1) * nn, :length] = torch.einsum(
+            "nhl,nh->nl", sc, w16
+        ).float()
     return logits
 
 
@@ -101,7 +104,9 @@ def _is_exact_sm70_cuda() -> bool:
     # Volta-specific -- everything below Ampere lacks DeepGEMM and would
     # otherwise fall to the torch reference logits path, whose host sync
     # (int(seq_lens[i])) kills CUDA-graph capture on the SM75 stages.
-    return current_platform.is_cuda() and torch.cuda.get_device_capability(torch.cuda.current_device()) < (8, 0)
+    return current_platform.is_cuda() and torch.cuda.get_device_capability(
+        torch.accelerator.current_device_index()
+    ) < (8, 0)
 
 
 def _gather_workspace_shapes(
@@ -314,10 +319,14 @@ def sparse_attn_indexer(
                 )
             elif not has_deep_gemm():
                 assert not use_fp4_cache and q_scale_slice is None, (
-                    "torch indexer fallback supports the FP8 path only")
+                    "torch indexer fallback supports the FP8 path only"
+                )
                 logits = _torch_mqa_logits(
-                    q_slice_cast, k_quant_cast, k_scale_cast,
-                    weights[chunk.token_start : chunk.token_end])
+                    q_slice_cast,
+                    k_quant_cast,
+                    k_scale_cast,
+                    weights[chunk.token_start : chunk.token_end],
+                )
             else:
                 logits = fp8_fp4_mqa_logits(
                     (q_slice_cast, q_scale_slice),
@@ -443,10 +452,17 @@ def sparse_attn_indexer(
             )
         elif not has_deep_gemm():
             assert not use_fp4_cache and padded_q_scale is None, (
-                "torch indexer fallback supports the FP8 path only")
+                "torch indexer fallback supports the FP8 path only"
+            )
             logits = _torch_paged_mqa_logits(
-                padded_q_quant_cast, kv_cache, weights[:num_padded_tokens],
-                seq_lens, decode_metadata.block_table, max_model_len, head_dim)
+                padded_q_quant_cast,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len,
+                head_dim,
+            )
         else:
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
@@ -576,7 +592,8 @@ class SparseAttnIndexer(CustomOp):
             # logits path above serves the indexer instead (eager only).
             logger.warning_once(
                 "DeepGEMM unavailable -- sparse attention indexer uses the "
-                "torch reference logits path (pre-Hopper device).")
+                "torch reference logits path (pre-Hopper device)."
+            )
 
     def forward_native(
         self,
