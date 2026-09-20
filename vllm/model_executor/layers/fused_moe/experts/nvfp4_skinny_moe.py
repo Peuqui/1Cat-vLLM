@@ -60,6 +60,11 @@ _GROUPED_MAX_TOKENS = int(
 # _qpn_prepack order on real expert bytes (latent -- the dense route only
 # reaches it under VLLM_SKINNY_DROP_CT=1, which is off in production).
 _QPN_MAX_M = 16
+# Fold an MXFP4-in-NVFP4 scale raster to one E8M0 scale per 32 codes. Saves
+# half the scale memory (8.62 GiB on DeepSeek-V4-Flash) at bit-identical
+# output; set to 0 to keep the shipped one-per-16 raster.
+_MXFP4_SCALES = os.environ.get("VLLM_SKINNY_MXFP4_SCALES", "1") == "1"
+
 # moe_qpn launch configs (splitk, nacc) per weight matrix, measured winners
 # on real DeepSeek-V4 layer-5 experts (scripts/nvfp4_skinny_moe_qpn_test.py,
 # identical frontier on V100 and RTX 8000): w13 (16,1), w2 (8,1).
@@ -171,6 +176,8 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         )
         self._w1_block_scales: torch.Tensor = w1_scale
         self._w2_block_scales: torch.Tensor = w2_scale
+        # 0 = NVFP4 (fp8-e4m3 per 16 codes), 1 = MXFP4 (E8M0 per 32)
+        self._scale_mode: int = 0
         self.quant_config._w1.scale = None
         self.quant_config._w2.scale = None
         self.quantization_emulation = False
@@ -181,6 +188,66 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
     def quant_dtype(self) -> torch.dtype | str | None:
         # w4a16: activations are never quantized.
         return None
+
+    @staticmethod
+    def _mxfp4_foldable(scales_u8: torch.Tensor) -> bool:
+        """True when the NVFP4 scale raster is MXFP4 in disguise.
+
+        NVFP4 ships one fp8-e4m3 scale per 16 codes. A checkpoint converted
+        from MXFP4 has every scale duplicated across the two halves of its
+        32-code block, and all scales are exact powers of two -- that is what
+        an E8M0 exponent becomes when written as fp8. In that case only half
+        the raster carries information and the kernel can read it as MXFP4.
+        """
+        # Byte arithmetic only: converting the whole raster to float costs
+        # gigabytes of transients mid-load (256 experts per layer).
+        # fp8-e4m3 is [sign:1][exp:4][mantissa:3]; a power of two has zero
+        # mantissa, and the scales are positive.
+        b = scales_u8.reshape(-1)
+        if b.numel() % 2 or b.numel() == 0:
+            return False
+        if bool((b & 0x87).any()):  # sign bit set, or non-zero mantissa
+            return False
+        pairs = b.view(-1, 2)
+        return bool(torch.equal(pairs[:, 0], pairs[:, 1]))
+
+    @staticmethod
+    def _release_by_storage(layer: torch.nn.Module,
+                            tensors: tuple[torch.Tensor, ...]) -> None:
+        """Empty every layer parameter/buffer backed by these tensors."""
+        ptrs = {t.untyped_storage().data_ptr() for t in tensors}
+        freed = 0
+        for holder in (layer._parameters, layer._buffers):
+            for name, val in list(holder.items()):
+                if val is None:
+                    continue
+                data = val.data if isinstance(val, torch.nn.Parameter) else val
+                if data.numel() and data.untyped_storage().data_ptr() in ptrs:
+                    freed += data.numel()
+                    empty = data.new_empty(0)
+                    if isinstance(val, torch.nn.Parameter):
+                        val.data = empty
+                    else:
+                        holder[name] = empty
+        for attr in ("w1_scale", "w2_scale"):
+            if getattr(layer, attr, None) is not None:
+                setattr(layer, attr, None)
+        if freed:
+            torch.cuda.empty_cache()
+            logger.info_once(
+                "Skinny MoE: released %.2f MiB of full-length scale rasters",
+                freed / 2**20,
+            )
+
+    @staticmethod
+    def _fold_to_e8m0(scales_u8: torch.Tensor) -> torch.Tensor:
+        """Drop the duplicate half and rewrite as E8M0 (value = 2^(b-127)).
+
+        With a zero mantissa, fp8-e4m3 is 2^(e-7) where e = byte >> 3, so the
+        E8M0 byte is e + 120. Pure integer work, no float transients.
+        """
+        half = scales_u8[..., ::2]
+        return ((half >> 3) + 120).to(torch.uint8).contiguous()
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Re-permute expert weights + scale rasters into QPN fragment
@@ -204,13 +271,41 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
                     f"(N % 32, K % 64); got {name} N={w.size(1)} "
                     f"K={w.size(2) * 2}"
                 )
+        # MXFP4 keeps one scale per 32 codes where NVFP4 has one per 16. When
+        # the raster is MXFP4 in disguise, half of it is redundant: fold it and
+        # hand the kernel the shorter table. The codes are untouched either way
+        # -- a 32-code MXFP4 block is two adjacent 16-code groups.
+        sg = 16
+        if _MXFP4_SCALES and self._mxfp4_foldable(s13) and \
+                self._mxfp4_foldable(s2):
+            sg = 32
+            full13, full2 = s13, s2
+            s13 = self._fold_to_e8m0(s13)
+            s2 = self._fold_to_e8m0(s2)
+            # Release the full-length rasters. Dropping our own reference is
+            # not enough: the layer still holds the parameters they came from,
+            # so the folded copy would sit on top of the original instead of
+            # replacing it (measured: 1.9 GiB per stage LOST, not gained).
+            # Match by storage pointer rather than by attribute name.
+            self._release_by_storage(layer, (full13, full2))
+            del full13, full2
         for e in range(w13.size(0)):
-            qc, qs = _qpn_prepack(w13[e], s13[e])
+            qc, qs = _qpn_prepack(w13[e], s13[e], sg)
             w13[e].view(-1).copy_(qc)
             s13[e].view(-1).copy_(qs)
-            qc, qs = _qpn_prepack(w2[e], s2[e])
+            qc, qs = _qpn_prepack(w2[e], s2[e], sg)
             w2[e].view(-1).copy_(qc)
             s2[e].view(-1).copy_(qs)
+        if sg == 32:
+            # Release the full-length rasters; the folded ones are resident now.
+            self._w1_block_scales = s13
+            self._w2_block_scales = s2
+            self._scale_mode = 1
+            logger.info_once(
+                "Skinny MoE: scale rasters folded to MXFP4 (one E8M0 scale per "
+                "32 codes), halving scale memory for %d experts",
+                w13.size(0),
+            )
         logger.info_once(
             "Skinny NVFP4 MoE: expert weights re-permuted to QPN fragment "
             "order in place (%d experts)",
@@ -401,6 +496,7 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             num_tokens,
             _MOE_QPN_CFG[0],
             _MOE_QPN_CFG[1],
+            self._scale_mode,
         )
         inter = torch.empty((num_slots, inter_dim), dtype=y13.dtype, device=device)
         self.activation(activation, inter, y13)
@@ -419,6 +515,7 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             num_tokens,
             _MOE_QPN_CFG[2],
             _MOE_QPN_CFG[3],
+            self._scale_mode,
         )
         weighted = y2.view(num_tokens, top_k, -1).float() * topk_weights.to(
             torch.float32
