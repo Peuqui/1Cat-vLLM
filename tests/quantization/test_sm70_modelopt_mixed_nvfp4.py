@@ -112,20 +112,34 @@ def _qwen4_moe_contract(**overrides):
 def test_mixed_min_capability_requires_pre_ampere_and_both_turbomind_routes():
     # Volta takes the TurboMind routes, Turing the QPN routes; both admit the
     # mixed checkpoint when the FP8 and NVFP4 switches are on.
+    #
+    # This fork admits SM70 ModelOpt unconditionally via VLLM_SM70_MODELOPT
+    # (on by default), which short-circuits the decision below. Switch that
+    # override off here so the routes themselves are what gets tested.
     with (
+        patch.object(modelopt, "_SM70_MODELOPT", False),
         patch.object(sm70_tm, "is_pre_ampere_cuda_platform", return_value=True),
         patch.object(sm70_tm, "use_turbomind", side_effect=[True, True]),
     ):
         assert ModelOptMixedPrecisionConfig.get_min_capability() == 70
 
     with (
+        patch.object(modelopt, "_SM70_MODELOPT", False),
         patch.object(sm70_tm, "is_pre_ampere_cuda_platform", return_value=True),
         patch.object(sm70_tm, "use_turbomind", side_effect=[True, False]),
     ):
         assert ModelOptMixedPrecisionConfig.get_min_capability() == 89
 
-    with patch.object(sm70_tm, "is_pre_ampere_cuda_platform", return_value=False):
+    with patch.object(modelopt, "_SM70_MODELOPT", False), patch.object(
+        sm70_tm, "is_pre_ampere_cuda_platform", return_value=False
+    ):
         assert ModelOptMixedPrecisionConfig.get_min_capability() == 89
+
+    # And the fork override itself: on, the routes do not matter.
+    with patch.object(modelopt, "_SM70_MODELOPT", True), patch.object(
+        sm70_tm, "is_pre_ampere_cuda_platform", return_value=False
+    ):
+        assert ModelOptMixedPrecisionConfig.get_min_capability() == 70
 
 
 def test_nvfp4_grouped_prefill_defaults_on_and_can_be_disabled(monkeypatch):
