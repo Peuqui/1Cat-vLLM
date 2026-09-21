@@ -342,13 +342,8 @@ class CudaPlatformBase(Platform):
         # need different backends). Workers have set their device before
         # any attention layer is built.
         device_id = torch.cuda.current_device() if torch.cuda.is_initialized() else 0
-        # ``device_id`` counts in CUDA order, so read the capability through
-        # CUDA too. ``get_device_capability`` goes through NVML, which counts
-        # in PCI order; without CUDA_DEVICE_ORDER=PCI_BUS_ID the two disagree
-        # on a mixed box and the backend would be chosen for another card than
-        # the one the worker loads its kernels for.
-        major, minor = torch.cuda.get_device_capability(device_id)
-        device_capability = DeviceCapability(major=major, minor=minor)
+        device_capability = cls.get_device_capability(device_id)
+        assert device_capability is not None
 
         # First try checking just the selected backend, if there is one.
         if selected_backend is not None:
