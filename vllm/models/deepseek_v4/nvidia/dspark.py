@@ -155,12 +155,10 @@ class DSparkDeepseekV4Model(nn.Module):
         # check saw the RTX 8000 first and silently disabled the scale for
         # a drafter running on SM75 via the same QPN8 route: main_proj
         # overflowed in FP16 and DSpark acceptance collapsed to ~6 %.
-        self.main_proj_input_scale = (
-            2.0**-6
-            if torch.cuda.get_device_capability(torch.cuda.current_device())
-            < (8, 9)
-            else 1.0
+        device_capability = torch.cuda.get_device_capability(
+            torch.accelerator.current_device_index()
         )
+        self.main_proj_input_scale = 2.0**-6 if device_capability < (8, 9) else 1.0
 
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
@@ -301,7 +299,10 @@ def _insert_context_kv(
     # crashed in the fused op below ("requires sm_80+; got sm_70"). The
     # fused op itself draws the line at sm_80, so anything older takes the
     # sm70 software path.
-    if torch.cuda.get_device_capability(torch.cuda.current_device()) < (8, 0):
+    device_capability = torch.cuda.get_device_capability(
+        torch.accelerator.current_device_index()
+    )
+    if device_capability < (8, 0):
         from vllm.models.deepseek_v4.sm70.qnorm_rope_kv_fp8_insert import (
             sm70_qnorm_rope_kv_fp8_insert,
         )
@@ -369,7 +370,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, SupportsPP):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
-        self.make_empty_intermediate_tensors = (
+        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], self.config.hidden_size
             )
@@ -558,6 +559,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, SupportsPP):
             )
         logger.info("DSpark drafter: embed_tokens loaded from checkpoint.")
         return loaded_params
+
+    def skip_checkpoint_weight(self, name: str) -> bool:
+        # The drafter ships inside its target's checkpoint; without this the
+        # loader reads the whole target (~160 GB for DSv4-Flash) only for
+        # load_weights to drop everything but mtp.* and the embedding.
+        return self._remap_dspark_name(name) is None
 
     @staticmethod
     def _remap_dspark_name(name: str) -> str | None:

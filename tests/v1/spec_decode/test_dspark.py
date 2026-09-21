@@ -112,6 +112,16 @@ def test_deepseek_v4_dspark_checkpoint_name_mapping() -> None:
     )
 
 
+def test_dspark_skips_every_checkpoint_weight_it_does_not_load() -> None:
+    drafter = DSparkDeepseekV4ForCausalLM.__new__(DSparkDeepseekV4ForCausalLM)
+
+    assert drafter.skip_checkpoint_weight("layers.3.attn.wq_a.weight")
+    assert drafter.skip_checkpoint_weight("head.weight")
+    assert not drafter.skip_checkpoint_weight("embed.weight")
+    assert not drafter.skip_checkpoint_weight("mtp.0.main_proj.weight")
+    assert not drafter.skip_checkpoint_weight("mtp.1.ffn.experts.7.w2.weight")
+
+
 class _FakeDSparkModel:
     vocab_size = 6
 
@@ -264,7 +274,10 @@ def test_dspark_replicated_linears_return_tensors() -> None:
     draft_model = object.__new__(DSparkDeepseekV4Model)
     nn.Module.__init__(draft_model)
     draft_model.main_proj = nn.Identity()
+    # combine_hidden_states casts to the norm's weight dtype before the
+    # projection, so the stand-in norm needs a weight.
     draft_model.main_norm = nn.Identity()
+    draft_model.main_norm.weight = nn.Parameter(torch.ones(4))
     draft_model.main_proj_input_scale = 2.0**-6
 
     hidden_states = torch.randn(3, 4)
