@@ -39,6 +39,10 @@ from vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe import (
     Nvfp4QuantizationEmulationTritonExperts,
 )
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    QuantKey,
+    kMxfp4Static,
+)
 
 logger = init_logger(__name__)
 
@@ -142,6 +146,74 @@ def skinny_moe_forward(
         output.index_add_(0, rows, y)
 
 
+# The kernels decode an E8M0 scale byte b as the fp16 bit pattern (b - 112)
+# << 10, which is exact only while that exponent field stays inside fp16's
+# normal range 1..30.
+_E8M0_FP16_MIN = 113
+_E8M0_FP16_MAX = 142
+# They then multiply that block scale by the expert's global scale times
+# 2^14 (the code decoder's exponent re-bias) in fp16, so every true scale
+# times 2^14 has to be a power of two fp16 holds, subnormals included.
+_DECODE_REBIAS_EXP = 14
+_FP16_POW2_MIN_EXP = -24
+_FP16_POW2_MAX_EXP = 15
+
+
+def rebase_e8m0_for_fp16(scales_u8: torch.Tensor) -> torch.Tensor:
+    """Shift each expert's E8M0 scales, in place, into the window the kernels
+    decode.
+
+    MXFP4 scales are bare powers of two, 2^(b - 127), and span far more than
+    fp16 can hold. Adding the same d to every byte of one expert and handing
+    2^-d back as that expert's global scale changes nothing numerically, so
+    the rebased raster reproduces the checkpoint exactly. Working on the bytes
+    in place keeps the load-time peak at the raster itself (a 256-expert
+    DeepSeek-V4 layer carries 128 MiB of w13 scales).
+
+    Args:
+        scales_u8: E8M0 bytes, [num_experts, ...]; rewritten in place.
+
+    Returns:
+        The per-expert global scales (float32, [num_experts]).
+
+    Raises:
+        ValueError: if a scale is NaN (0xFF), if an expert's scales span more
+            exponents than fp16 decodes exactly, or if a scale lies outside
+            the range the kernels' fp16 scale product represents. The raster
+            is left untouched then.
+    """
+    flat = scales_u8.view(scales_u8.size(0), -1)
+    if bool((flat == 0xFF).any()):
+        raise ValueError("MXFP4 scale raster contains NaN (E8M0 0xFF)")
+    lo = flat.amin(dim=1).to(torch.int32)
+    hi = flat.amax(dim=1).to(torch.int32)
+    product_lo = int(lo.min()) - 127 + _DECODE_REBIAS_EXP
+    product_hi = int(hi.max()) - 127 + _DECODE_REBIAS_EXP
+    if product_lo < _FP16_POW2_MIN_EXP or product_hi > _FP16_POW2_MAX_EXP:
+        raise ValueError(
+            f"MXFP4 scales 2^{product_lo - _DECODE_REBIAS_EXP}.."
+            f"2^{product_hi - _DECODE_REBIAS_EXP} fall outside what the fp16 "
+            f"skinny kernels represent exactly"
+        )
+    # Lift the smallest scale to the bottom of the decode window, but never
+    # so far down that the global scale times 2^14 leaves fp16.
+    shift = torch.clamp(
+        _E8M0_FP16_MIN - lo, min=_DECODE_REBIAS_EXP - _FP16_POW2_MAX_EXP
+    )
+    too_wide = hi + shift > _E8M0_FP16_MAX
+    if bool(too_wide.any()):
+        expert = int(torch.nonzero(too_wide)[0])
+        raise ValueError(
+            f"MXFP4 scales of expert {expert} span "
+            f"{int(hi[expert] - lo[expert])} exponents; the fp16 skinny "
+            f"kernels decode at most {_E8M0_FP16_MAX - _E8M0_FP16_MIN} exactly"
+        )
+    # uint8 addition wraps modulo 256, so a shift of -1 is added as 255; the
+    # checks above guarantee every result lands inside 113..142.
+    flat.add_((shift % 256).to(torch.uint8).unsqueeze(1))
+    return torch.pow(2.0, -shift.to(torch.float32))
+
+
 @dataclass(frozen=True)
 class _ScaleCaches:
     """Per-expert scales in the forms the two serving paths read."""
@@ -167,8 +239,9 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         # mistakes them for fp scales.
         TritonExperts.__init__(self, moe_config, quant_config)
         logger.info_once(
-            "Using Nvfp4SkinnySm70Experts MoE backend: per-expert skinny "
-            "NVFP4 GEMMs on checkpoint-layout weights, fp16 activations."
+            "Using %s MoE backend: per-expert skinny FP4 GEMMs on "
+            "checkpoint-layout weights, fp16 activations.",
+            type(self).__name__,
         )
         w1_scale, w2_scale = self.quant_config.w1_scale, self.quant_config.w2_scale
         assert w1_scale is not None and w2_scale is not None, (
@@ -212,8 +285,9 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         return bool(torch.equal(pairs[:, 0], pairs[:, 1]))
 
     @staticmethod
-    def _release_by_storage(layer: torch.nn.Module,
-                            tensors: tuple[torch.Tensor, ...]) -> None:
+    def _release_by_storage(
+        layer: torch.nn.Module, tensors: tuple[torch.Tensor, ...]
+    ) -> None:
         """Empty every layer parameter/buffer backed by these tensors."""
         ptrs = {t.untyped_storage().data_ptr() for t in tensors}
         freed = 0
@@ -233,7 +307,7 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             if getattr(layer, attr, None) is not None:
                 setattr(layer, attr, None)
         if freed:
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             logger.info_once(
                 "Skinny MoE: released %.2f MiB of full-length scale rasters",
                 freed / 2**20,
@@ -262,23 +336,43 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         )
 
         w13, w2 = layer.w13_weight.data, layer.w2_weight.data
-        s13 = self._w1_block_scales.view(torch.uint8)
-        s2 = self._w2_block_scales.view(torch.uint8)
-        for name, w, s in (("w13", w13, s13), ("w2", w2, s2)):
+        for name, w in (("w13", w13), ("w2", w2)):
             if w.size(1) % 32 or (w.size(2) * 2) % 64:
                 raise RuntimeError(
                     f"skinny NVFP4 MoE requires QPN-eligible expert shapes "
                     f"(N % 32, K % 64); got {name} N={w.size(1)} "
                     f"K={w.size(2) * 2}"
                 )
+        s13, s2, sg = self._scale_rasters(layer)
+        for e in range(w13.size(0)):
+            qc, qs = _qpn_prepack(w13[e], s13[e], sg)
+            w13[e].view(-1).copy_(qc)
+            s13[e].view(-1).copy_(qs)
+            qc, qs = _qpn_prepack(w2[e], s2[e], sg)
+            w2[e].view(-1).copy_(qc)
+            s2[e].view(-1).copy_(qs)
+        if sg == 32:
+            self._w1_block_scales = s13
+            self._w2_block_scales = s2
+            self._scale_mode = 1
+        logger.info_once(
+            "Skinny MoE: expert weights re-permuted to QPN fragment order in "
+            "place (%d experts, one scale per %d codes)",
+            w13.size(0),
+            sg,
+        )
+
+    def _scale_rasters(
+        self, layer: torch.nn.Module
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Return the w13/w2 scale rasters as bytes and their group size."""
+        s13 = self._w1_block_scales.view(torch.uint8)
+        s2 = self._w2_block_scales.view(torch.uint8)
         # MXFP4 keeps one scale per 32 codes where NVFP4 has one per 16. When
         # the raster is MXFP4 in disguise, half of it is redundant: fold it and
         # hand the kernel the shorter table. The codes are untouched either way
         # -- a 32-code MXFP4 block is two adjacent 16-code groups.
-        sg = 16
-        if _MXFP4_SCALES and self._mxfp4_foldable(s13) and \
-                self._mxfp4_foldable(s2):
-            sg = 32
+        if _MXFP4_SCALES and self._mxfp4_foldable(s13) and self._mxfp4_foldable(s2):
             full13, full2 = s13, s2
             s13 = self._fold_to_e8m0(s13)
             s2 = self._fold_to_e8m0(s2)
@@ -289,28 +383,13 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             # Match by storage pointer rather than by attribute name.
             self._release_by_storage(layer, (full13, full2))
             del full13, full2
-        for e in range(w13.size(0)):
-            qc, qs = _qpn_prepack(w13[e], s13[e], sg)
-            w13[e].view(-1).copy_(qc)
-            s13[e].view(-1).copy_(qs)
-            qc, qs = _qpn_prepack(w2[e], s2[e], sg)
-            w2[e].view(-1).copy_(qc)
-            s2[e].view(-1).copy_(qs)
-        if sg == 32:
-            # Release the full-length rasters; the folded ones are resident now.
-            self._w1_block_scales = s13
-            self._w2_block_scales = s2
-            self._scale_mode = 1
             logger.info_once(
                 "Skinny MoE: scale rasters folded to MXFP4 (one E8M0 scale per "
                 "32 codes), halving scale memory for %d experts",
-                w13.size(0),
+                s13.size(0),
             )
-        logger.info_once(
-            "Skinny NVFP4 MoE: expert weights re-permuted to QPN fragment "
-            "order in place (%d experts)",
-            w13.size(0),
-        )
+            return s13, s2, 32
+        return s13, s2, 16
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -575,4 +654,31 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             topk_ids=topk_ids,
             inter_dim=inter_dim,
             activation_fn=lambda out, inp: self.activation(activation, out, inp),
+        )
+
+
+class Mxfp4SkinnySm70Experts(Nvfp4SkinnySm70Experts):
+    """MXFP4 MoE through the same skinny kernels, in their E8M0 scale mode.
+
+    MXFP4 differs from NVFP4 only in the scale raster: one E8M0 exponent per
+    32 codes instead of an fp8 scale per 16. The codes, their packing and
+    the fragment order are identical. The oracle hands over rasters already
+    rebased by :func:`rebase_e8m0_for_fp16`, with the per-expert global
+    scales as ``g1_alphas``/``g2_alphas``.
+    """
+
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return (weight_key, activation_key) == (kMxfp4Static, None)
+
+    def _scale_rasters(
+        self, layer: torch.nn.Module
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        return (
+            self._w1_block_scales.view(torch.uint8),
+            self._w2_block_scales.view(torch.uint8),
+            32,
         )
