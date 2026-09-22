@@ -192,8 +192,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST: str | None = None
     VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM: bool = False
     VLLM_SM70_NVFP4_QPN2: bool = False
-    VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT: bool = False
-    VLLM_SM70_NVFP4_QPN2_SHARED_SCALES: bool = False
+    VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT: bool = True
+    VLLM_SM70_NVFP4_QPN2_SHARED_SCALES: bool = True
     VLLM_SM70_NVFP4_QPN2_M16_NATIVE: bool = True
     VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY: str | None = None
@@ -405,6 +405,7 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS: bool = False
     VLLM_SM70_DECODE_TILE_PROFILE: bool = False
     VLLM_FLASH_V100_ROUTE_SUMMARY: bool = False
+    VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS: bool = True
     VLLM_FLASH_V100_FP8_PREFILL_BRIDGE: bool = True
     VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN: int = 16384
     VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16: bool = False
@@ -1911,13 +1912,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # QPN2 is an explicit opt-in for compatible NVFP4 small-M shapes; larger M
     # stays on the existing TurboMind path.
     "VLLM_SM70_NVFP4_QPN2": lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2", "0"))),
-    # Share TurboMind B/Pack1 codes with QPN2, preserving both scale formats.
-    # Opt in until same-contract GPU correctness and performance gates pass.
+    # Share TurboMind B/Pack1 codes with compatible QPN2 projections. Compact
+    # scales additionally require native support for reusable graph scratch.
     "VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", "0"))
+        int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_WEIGHT", "1"))
     ),
     "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES": lambda: bool(
-        int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "0"))
+        int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "1"))
     ),
     # Reuse each packed NVFP4 tile across two eight-row verifier groups in one
     # CTA. This is a default-off Qwen3.8 DFlash2 B2 operator candidate.
@@ -2310,10 +2311,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS", "0"))
     ),
-    # Experimental fixed 8192/16-warp reduction for the FP16 no-residual and
+    # Fixed 8192/16-warp reduction for the FP16 no-residual and
     # FP16-residual Gemma norms not covered by the existing FP32-residual path.
-    # Prevents per-rank/startup autotune from changing reduction order. Keep
-    # disabled until fixed-prefix, natural-output and full-round gates pass.
+    # Prevents per-rank/startup autotune from changing reduction order. Enabled
+    # by the SM70 DFlash2 profile; explicit zero retains the rollback path.
     "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS", "0"))
     ),
@@ -2920,6 +2921,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FLASH_V100_ROUTE_SUMMARY": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "0"))
+    ),
+    # Mixed chunked-prefill batches send resident decode and short verification
+    # rows through the partitioned paged-decode kernels. This prevents a q=1
+    # row from walking a long prefix serially in the paged-prefill kernel.
+    "VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS": lambda: bool(
+        int(os.getenv("VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS", "1"))
     ),
     "VLLM_FLASH_V100_FP8_PREFILL_BRIDGE": lambda: bool(
         int(os.getenv("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1"))

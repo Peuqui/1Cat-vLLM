@@ -1249,18 +1249,23 @@ if _is_hip():
 if _is_cuda():
     if _cuda_arch_contains(7, 0):
         ext_modules.append(CMakeExtension(name="vllm._sm70_sampler_C"))
-        # The following targets are built WITH_SOABI but without USE_SABI in
-        # CMakeLists.txt, so each module carries the full SOABI suffix, not
-        # .abi3.so. Declared limited-API, an editable install copies a file
-        # name that was never built and aborts.
-        for soabi_module in (
-            "vllm._sm70_exact_reduce_C",
-            "vllm._h3_w8a16_C",
-            "vllm._h3_flashinfer_C",
-            "vllm._h3_flashattn_C",
-            "vllm._sm70_sparse_attention_C",
-        ):
-            ext_modules.append(CMakeExtension(name=soabi_module, py_limited_api=False))
+        # These extensions use pybind11/libtorch_python and therefore require
+        # the interpreter-specific CPython ABI suffix emitted by CMake.
+        ext_modules.append(
+            CMakeExtension(name="vllm._sm70_exact_reduce_C", py_limited_api=False)
+        )
+        ext_modules.append(
+            CMakeExtension(name="vllm._h3_w8a16_C", py_limited_api=False)
+        )
+        ext_modules.append(
+            CMakeExtension(name="vllm._h3_flashinfer_C", py_limited_api=False)
+        )
+        ext_modules.append(
+            CMakeExtension(name="vllm._h3_flashattn_C", py_limited_api=False)
+        )
+        ext_modules.append(
+            CMakeExtension(name="vllm._sm70_sparse_attention_C", py_limited_api=False)
+        )
     build_sm70_fa2 = _cuda_arch_contains(7, 0) and not _cuda_arch_at_least(8, 0)
     if _cuda_arch_at_least(8, 0) or build_sm70_fa2:
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
