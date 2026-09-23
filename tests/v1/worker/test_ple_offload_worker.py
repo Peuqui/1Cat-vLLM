@@ -686,6 +686,67 @@ def test_delayed_ple_spawn_uses_pre_load_config_snapshot(
     assert worker._ple_offload_spawn_config is None
 
 
+def test_ple_store_tier_collects_every_stage_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = Worker.__new__(Worker)
+    worker._ple_offload_enabled = True
+    worker._ple_offload_worker_handle = handle = object()
+    worker.device = torch.device("cuda", 0)
+    worker.peak_activation_memory = 100
+    memory = {"allocated": 1000, "reserved": 900}
+    monkeypatch.setattr(
+        torch.accelerator, "memory_allocated", lambda device: memory["allocated"]
+    )
+    monkeypatch.setattr(
+        torch.accelerator, "memory_reserved", lambda device: memory["reserved"]
+    )
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "get_world_group",
+        lambda: SimpleNamespace(world_size=4, cpu_group="world"),
+    )
+    sent: list[object] = []
+
+    def fake_all_gather_object(claims: list, claim: object, group: object) -> None:
+        sent.append(claim)
+        assert group == "world"
+        # Two ranks share card 2, the stage on card 1 was never profiled.
+        claims[:] = [claim, (2, 7), (1, None), (2, 3)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_object)
+    placed: list[tuple[object, dict[int, int | None]]] = []
+    monkeypatch.setattr(
+        ple_offload_worker.PleOffloadWorker,
+        "place_store_tier",
+        lambda handle, claims: placed.append((handle, claims)),
+    )
+
+    # The capture released the activations: they come back on top of the
+    # reserved pool once a prefill runs.
+    worker._place_ple_store_tier()
+    assert sent == [(0, 200)]
+    assert placed == [(handle, {0: 200, 2: 10, 1: None})]
+
+    # Activations the allocator still keeps reserved claim nothing new.
+    memory["reserved"] = 1500
+    assert worker._ple_store_stage_claim_bytes() == 0
+    # Without the profiling the peak is unknown.
+    del worker.peak_activation_memory
+    assert worker._ple_store_stage_claim_bytes() is None
+
+    # Every rank takes part in the gather, only the spawning rank sends.
+    placed.clear()
+    worker._ple_offload_worker_handle = None
+    worker._place_ple_store_tier()
+    assert len(sent) == 2 and placed == []
+    # Without PLE offload there is nothing to place and nobody gathers.
+    worker._ple_offload_enabled = False
+    worker._place_ple_store_tier()
+    assert len(sent) == 2
+
+
 def test_offload_distributed_sets_config_only_for_model_parallel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -771,6 +832,7 @@ def test_ple_offload_runner_groups_registrations_by_dp_rank(
     runner = ple_offload_worker.PleOffloadRunner.__new__(
         ple_offload_worker.PleOffloadRunner
     )
+    runner._tiered_layers = []
     runner.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             data_parallel_size=2,
@@ -946,25 +1008,40 @@ def test_ple_offload_runner_routes_requests_layer_first(
     )
 
 
-def test_wait_for_ready_closes_pipe() -> None:
+def test_control_pipe_carries_ready_and_the_store_tier() -> None:
     context = ple_offload_worker.get_mp_context()
-    ready_reader, ready_writer = context.Pipe(duplex=False)
-    ready_writer.send(
+    parent, child = context.Pipe(duplex=True)
+    handle = ple_offload_worker.PleOffloadWorkerHandle(
+        proc=SimpleNamespace(is_alive=lambda: False),
+        death_writer=None,
+        control_pipe=parent,
+    )
+    child.send(
         {
             "status": ple_offload_worker.PleOffloadWorker.READY_STR,
             "layer_names": ["layers.0.ple.ple_embedding"],
         }
     )
-    ready_writer.close()
-    handle = ple_offload_worker.PleOffloadWorkerHandle(
-        proc=None,
-        death_writer=None,
-        ready_pipe_reader=ready_reader,
-    )
-
     ple_offload_worker.PleOffloadWorker.wait_for_ready(handle)
+    # READY leaves the pipe open for the store-tier command.
+    assert handle.control_pipe is parent
 
-    assert handle.ready_pipe_reader is None
+    child.send({"status": ple_offload_worker.PleOffloadWorker.STORE_PLACED_STR})
+    ple_offload_worker.PleOffloadWorker.place_store_tier(handle, {1: 5, 2: None})
+    assert child.recv() == {
+        "command": "place_store_tier",
+        "stage_claims": {1: 5, 2: None},
+    }
+
+    child.send({"status": "FAILURE", "error": "RuntimeError('no room')"})
+    with pytest.raises(RuntimeError, match="store-tier placement: .*no room"):
+        ple_offload_worker.PleOffloadWorker.place_store_tier(handle, {})
+
+    child.close()
+    with pytest.raises(RuntimeError, match="exited during store-tier placement"):
+        ple_offload_worker.PleOffloadWorker.place_store_tier(handle, {})
+    handle.close()
+    assert handle.control_pipe is None
 
 
 class _LocalTablesPleLayer(_WeightLoadingPleLayer):
@@ -1003,6 +1080,7 @@ def test_ple_layer_keeping_local_tables_initializes_and_merges_itself(
 
 def test_ple_offload_runner_binds_remote_placements_per_layer() -> None:
     bound: dict[str, list[object]] = {}
+    placed: dict[str, dict[int, int | None]] = {}
 
     class FakeLayer:
         def __init__(self, name: str) -> None:
@@ -1011,10 +1089,14 @@ def test_ple_offload_runner_binds_remote_placements_per_layer() -> None:
         def bind_remote_placements(self, placements: list[object]) -> None:
             bound[self.name] = placements
 
+        def place_store_tier(self, stage_claims: dict[int, int | None]) -> None:
+            placed[self.name] = stage_claims
+
     runner = ple_offload_worker.PleOffloadRunner.__new__(
         ple_offload_worker.PleOffloadRunner
     )
     runner._layers = {"tiered": FakeLayer("tiered"), "whole": FakeLayer("whole")}
+    runner._tiered_layers = []
 
     def registration(dp_rank: int, tp_rank: int, placements: dict[str, object]):
         return ple_offload_worker.PleOffloadRegistration(
@@ -1036,6 +1118,23 @@ def test_ple_offload_runner_binds_remote_placements_per_layer() -> None:
     ]
     runner._bind_remote_placements(registrations, dp_size=2, tp_size=2)
     assert bound == {"tiered": ["tp0", "tp1"]}
+
+    # The parent's store-tier command reaches only the tiered layer, then the
+    # worker acknowledges it on the same pipe.
+    context = ple_offload_worker.get_mp_context()
+    parent, child = context.Pipe(duplex=True)
+    parent.send({"command": "place_store_tier", "stage_claims": {1: 7}})
+    assert runner._handle_control(child)
+    assert placed == {"tiered": {1: 7}}
+    assert parent.recv() == {
+        "status": ple_offload_worker.PleOffloadWorker.STORE_PLACED_STR
+    }
+    parent.send({"command": "reload"})
+    with pytest.raises(RuntimeError, match="Unexpected PLE offload control"):
+        runner._handle_control(child)
+    # The parent closing the pipe is a regular shutdown, not a failure.
+    parent.close()
+    assert not runner._handle_control(child)
 
     bound.clear()
     with pytest.raises(RuntimeError, match="every rank must register"):

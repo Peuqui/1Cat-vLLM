@@ -43,6 +43,7 @@ from vllm.distributed.parallel_state import (
     Handle,
     get_pp_group,
     get_tp_group,
+    get_world_group,
 )
 from vllm.distributed.weight_transfer import (
     WeightTransferEngine,
@@ -293,6 +294,57 @@ class Worker(WorkerBase):
         # The offload process historically received the pre-load config, so
         # retain that exact contract while delaying only process creation.
         self._ple_offload_spawn_config = deepcopy(self.vllm_config)
+
+    def _ple_store_stage_claim_bytes(self) -> int | None:
+        """Bytes this stage still allocates beyond what it holds right now.
+
+        The capture released the allocator cache, so a prefill's activations
+        have to be allocated again: the peak the profiling measured, less
+        what the allocator already keeps reserved beyond its live tensors.
+        None without that profiling (a fixed --kv-cache-memory), where the
+        peak was never measured.
+        """
+        peak_activation = getattr(self, "peak_activation_memory", None)
+        if peak_activation is None:
+            return None
+        allocated = torch.accelerator.memory_allocated(self.device)
+        reserved = torch.accelerator.memory_reserved(self.device)
+        return max(0, allocated + peak_activation - reserved)
+
+    def _place_ple_store_tier(self) -> None:
+        """Let the PLE offload worker fill its store cards, all stages set up.
+
+        Every rank of the replica reports what its stage still claims on its
+        card; the rank that spawned the worker hands the claims over and
+        waits until the store tier is loaded.
+        """
+        if not self._ple_offload_enabled:
+            return
+        claim = (
+            torch.accelerator.current_device_index(),
+            self._ple_store_stage_claim_bytes(),
+        )
+        world = get_world_group()
+        claims: list[tuple[int, int | None] | None] = [None] * world.world_size
+        torch.distributed.all_gather_object(claims, claim, group=world.cpu_group)
+        if self._ple_offload_worker_handle is None:
+            return
+
+        from vllm.v1.ple_offload.worker import PleOffloadWorker
+
+        stage_claims: dict[int, int | None] = {}
+        for gathered in claims:
+            assert gathered is not None
+            device, device_claim = gathered
+            # Ranks sharing a card add up; one unmeasured claim leaves the
+            # card's claim unknown.
+            previous = stage_claims.get(device, 0)
+            stage_claims[device] = (
+                None
+                if previous is None or device_claim is None
+                else previous + device_claim
+            )
+        PleOffloadWorker.place_store_tier(self._ple_offload_worker_handle, stage_claims)
 
     def wait_ple_offload_ready(self) -> None:
         if self._ple_offload_worker_handle is None:
@@ -806,6 +858,11 @@ class Worker(WorkerBase):
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
+
+        # Every stage now holds its KV cache and its graph pools, and nothing
+        # has asked the PLE offload worker for rows yet: the kernel warm-up
+        # below is the first step that does.
+        self._place_ple_store_tier()
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (
