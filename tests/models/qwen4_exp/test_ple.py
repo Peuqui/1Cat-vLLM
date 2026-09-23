@@ -1940,15 +1940,17 @@ def _mapped_rss_kib(path: str) -> int:
     return total
 
 
-def test_disk_gather_unmaps_the_pages_it_read(monkeypatch, tmp_path) -> None:
-    # A mapped page is one the kernel keeps; the disk tier must not collect
-    # them. The rows stay readable from the file afterwards.
+def _map_worker_shards_from_file(
+    layer: Qwen4ExpNGramEmbedding, monkeypatch, tmp_path, shard_size: int = 20_000
+) -> tuple[torch.Tensor, str]:
+    """Give the worker file-backed shards, as the loader does, and the raw table.
+
+    Shards large enough that scattered rows touch pages the open did not.
+    """
     from safetensors import safe_open
     from safetensors.torch import save_file
 
-    layer = _make_cascade_worker_embedding(monkeypatch, store_devices=None, disk=True)
-    # Shards large enough that scattered rows touch pages the open did not.
-    shards, shard_size, dim = len(layer._disk_shards), 20_000, layer.head_dim
+    shards, dim = len(layer._disk_shards), layer.head_dim
     rows = shards * shard_size
     monkeypatch.setattr(layer.ngram_embedding, "org_vocab_size", rows)
     layer._disk_shard_size = shard_size
@@ -1971,14 +1973,55 @@ def test_disk_gather_unmaps_the_pages_it_read(monkeypatch, tmp_path) -> None:
             checkpoint.get_tensor(f"shard_{index}") for index in range(shards)
         ]
     layer._disk_mapped_paths.add(path)
+    return raw, path
+
+
+def test_disk_gather_unmaps_the_pages_it_read(monkeypatch, tmp_path) -> None:
+    # A mapped page is one the kernel keeps; the disk tier must not collect
+    # them. The rows stay readable from the file afterwards.
+    layer = _make_cascade_worker_embedding(monkeypatch, store_devices=None, disk=True)
+    raw, path = _map_worker_shards_from_file(layer, monkeypatch, tmp_path)
     # Opening the checkpoint may touch its header pages; only the gather counts.
     resident_before = _mapped_rss_kib(path)
 
-    ids = torch.randint(0, rows, (512,)).numpy()
+    ids = torch.randint(0, raw.shape[0], (512,)).numpy()
     assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
     assert _mapped_rss_kib(path) <= resident_before
     # Unmapped, not lost: the second read maps the pages back in.
     assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA store card")
+def test_store_load_unmaps_the_pages_it_copied(monkeypatch, tmp_path) -> None:
+    # Loading a store tier reads a large part of the checkpoint in one pass;
+    # the worker must not keep those pages mapped once the table is on the card.
+    layer = _make_cascade_worker_embedding(
+        monkeypatch, store_devices="0", disk=True, reserves="0"
+    )
+    # The store copies half the table: several MiB of pages the open never
+    # touched, so a kept mapping shows.
+    raw, path = _map_worker_shards_from_file(
+        layer, monkeypatch, tmp_path, shard_size=200_000
+    )
+    rows, dim, heads = raw.shape[0], layer.head_dim, layer.ngram_heads
+    resident, store_rows = rows // 4, rows // 2
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info", lambda device: (store_rows * dim, 2**40)
+    )
+    layer.bind_remote_placements(
+        [PLERemotePlacement(tp_start=0, tp_end=rows, local_rows=resident)]
+    )
+    resident_before = _mapped_rss_kib(path)
+    layer.place_store_tier({})
+    assert layer._store_tables[0].shape == (store_rows, dim)
+    assert _mapped_rss_kib(path) <= resident_before
+
+    ids = torch.randint(0, rows, (32, heads))
+    output = torch.full((32, layer.embedding_dim), 0x7F, dtype=torch.uint8)
+    layer._remote_lookup(ids, output.view(torch.float8_e4m3fn))
+    flat = ids.reshape(-1)
+    remote = flat >= resident
+    assert torch.equal(output.view(-1, dim)[remote], raw[flat][remote])
 
 
 def test_cascade_worker_reads_the_disk_tier_from_the_mapped_shards(

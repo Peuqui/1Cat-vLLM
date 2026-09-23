@@ -1375,6 +1375,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 f"onto store device {device}"
             )
         torch.accelerator.synchronize(table.device)
+        for shard in self._disk_shards:
+            assert shard is not None
+            self._release_mapped_pages(shard)
         logger.info(
             "Qwen4Exp PLE cascade worker: loaded %d store rows (%s) onto store "
             "device %d in %.1f s.",
@@ -1584,6 +1587,24 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             id_blocks.append(ids[request_indices, adjusted_columns])
         return torch.cat(id_blocks, dim=-1)
 
+    def _release_mapped_pages(self, shard: torch.Tensor) -> None:
+        """Unmap the pages of a file-backed shard this process has read.
+
+        They stay in the page cache, so reading them again is a cheap minor
+        fault, but a mapped page is one the kernel keeps: with them mapped the
+        offload worker held 1.9 GiB of the checkpoint after twelve disk-tier
+        requests, and 11.2 GiB after loading a 25.8 GiB store tier, while the
+        kernel swapped other processes out (2026-09-23). The shards are
+        private file mappings nobody writes, so the file still holds every
+        byte.
+
+        Only file-backed shards may be released: on anonymous memory
+        MADV_DONTNEED discards the contents. Loading records the mapped file
+        of every shard it accepts (_advise_random_file_access refuses others).
+        """
+        if self._disk_mapped_paths:
+            _madvise_mapped_tensor(shard, _MADV_DONTNEED)
+
     def _gather_mapped_rows(self, flat_ids: np.ndarray) -> np.ndarray:
         """Read the given PLE rows from the mapped checkpoint shards.
 
@@ -1612,26 +1633,13 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             if start != end
         ]
 
-        # Only file-backed shards may be released: on anonymous memory
-        # MADV_DONTNEED discards the contents. Loading records the mapped file
-        # of every shard it accepts (_advise_random_file_access refuses others).
-        release_pages = bool(self._disk_mapped_paths)
-
         def gather_shard(task: tuple[int, int, int]) -> None:
             shard_index, start, end = task
             shard = self._disk_shards[shard_index]
             assert shard is not None
             local_ids = sorted_ids[start:end] - shard_index * self._disk_shard_size
             sorted_output[start:end] = shard.view(torch.uint8).numpy()[local_ids]
-            if release_pages:
-                # Unmap the pages just read. They stay in the page cache, so
-                # the next read of the same row is a cheap minor fault, but a
-                # mapped page is one the kernel keeps: with them mapped the
-                # worker held 1.9 GiB of the checkpoint after twelve requests
-                # while the kernel swapped other processes out (2026-09-23).
-                # The shards are private file mappings nobody writes, so the
-                # file still holds every byte.
-                _madvise_mapped_tensor(shard, _MADV_DONTNEED)
+            self._release_mapped_pages(shard)
 
         executor = getattr(self, "_disk_executor", None)
         if executor is None or len(tasks) == 1:
