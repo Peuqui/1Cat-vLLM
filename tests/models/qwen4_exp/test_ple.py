@@ -523,15 +523,18 @@ def test_plan_ple_placement_cascades_beyond_device_and_host() -> None:
 def test_shard_copy_to_the_device_keeps_no_staging_memory() -> None:
     # A store card is filled up to its reserve; a cached staging copy of the
     # shard slice would take memory the pipeline stage on that card needs.
-    table = torch.empty(4096, 160, dtype=torch.uint8, device="cuda")
-    shard = torch.randint(0, 255, (4096, 160), dtype=torch.uint8)
+    # 10 MiB: smaller slices share a 2 MiB allocator block with the table, and
+    # the old staging copy would pass unnoticed.
+    rows = 65536
+    table = torch.empty(rows, 160, dtype=torch.uint8, device="cuda")
+    shard = torch.randint(0, 255, (rows, 160), dtype=torch.uint8)
     torch.accelerator.synchronize()
     reserved = torch.cuda.memory_reserved()
     copied = copy_ple_embedding_shard_(
-        table, shard, checkpoint_start=0, tp_start=0, tp_end=4096
+        table, shard, checkpoint_start=0, tp_start=0, tp_end=rows
     )
     torch.accelerator.synchronize()
-    assert copied == 4096
+    assert copied == rows
     assert torch.equal(table.cpu(), shard)
     assert torch.cuda.memory_reserved() == reserved
 
