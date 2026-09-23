@@ -105,6 +105,7 @@ _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
 _MADV_RANDOM = 1
 _MADV_SEQUENTIAL = 2
+_MADV_DONTNEED = 4
 
 logger = init_logger(__name__)
 
@@ -1611,12 +1612,26 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             if start != end
         ]
 
+        # Only file-backed shards may be released: on anonymous memory
+        # MADV_DONTNEED discards the contents. Loading records the mapped file
+        # of every shard it accepts (_advise_random_file_access refuses others).
+        release_pages = bool(self._disk_mapped_paths)
+
         def gather_shard(task: tuple[int, int, int]) -> None:
             shard_index, start, end = task
             shard = self._disk_shards[shard_index]
             assert shard is not None
             local_ids = sorted_ids[start:end] - shard_index * self._disk_shard_size
             sorted_output[start:end] = shard.view(torch.uint8).numpy()[local_ids]
+            if release_pages:
+                # Unmap the pages just read. They stay in the page cache, so
+                # the next read of the same row is a cheap minor fault, but a
+                # mapped page is one the kernel keeps: with them mapped the
+                # worker held 1.9 GiB of the checkpoint after twelve requests
+                # while the kernel swapped other processes out (2026-09-23).
+                # The shards are private file mappings nobody writes, so the
+                # file still holds every byte.
+                _madvise_mapped_tensor(shard, _MADV_DONTNEED)
 
         executor = getattr(self, "_disk_executor", None)
         if executor is None or len(tasks) == 1:

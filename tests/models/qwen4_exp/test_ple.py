@@ -4,6 +4,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import regex as re
 import torch
@@ -999,19 +1000,29 @@ def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
     assert module.get_offload_output_dtype(torch.bfloat16) == torch.uint8
 
 
-def test_ngram_embedding_retains_and_gathers_disk_shards(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_ngram_embedding_retains_and_gathers_disk_shards(tmp_path) -> None:
+    # Real file-backed shards, as the loader hands them over: the disk lane
+    # refuses anything else, and the gather releases the mapped pages, which
+    # would destroy anonymous memory.
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
     module = _make_disk_ngram_embedding_for_load_test()
-    shard_0 = torch.arange(8, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
-    shard_1 = (
-        torch.arange(8, 16, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
+    path = str(tmp_path / "ple.safetensors")
+    save_file(
+        {
+            "shard_0": torch.arange(8, dtype=torch.float32)
+            .reshape(4, 2)
+            .to(torch.float8_e4m3fn),
+            "shard_1": torch.arange(8, 16, dtype=torch.float32)
+            .reshape(4, 2)
+            .to(torch.float8_e4m3fn),
+        },
+        path,
     )
-    monkeypatch.setattr(
-        ple_module,
-        "_advise_random_file_access",
-        lambda _: "/tmp/test-ple.safetensors",
-    )
+    with safe_open(path, framework="pt") as checkpoint:
+        shard_0 = checkpoint.get_tensor("shard_0")
+        shard_1 = checkpoint.get_tensor("shard_1")
 
     loaded = module.load_weights(
         [
@@ -1913,6 +1924,61 @@ def _fill_worker_shards(layer: Qwen4ExpNGramEmbedding) -> torch.Tensor:
         for index in range(len(layer._disk_shards))
     ]
     return raw
+
+
+def _mapped_rss_kib(path: str) -> int:
+    """Resident pages of every mapping of one file in this process."""
+    total = 0
+    in_file = False
+    with open("/proc/self/smaps") as smaps:
+        for line in smaps:
+            fields = line.split()
+            if "-" in fields[0] and len(fields) >= 5:
+                in_file = fields[-1] == path
+            elif in_file and fields[0] == "Rss:":
+                total += int(fields[1])
+    return total
+
+
+def test_disk_gather_unmaps_the_pages_it_read(monkeypatch, tmp_path) -> None:
+    # A mapped page is one the kernel keeps; the disk tier must not collect
+    # them. The rows stay readable from the file afterwards.
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    layer = _make_cascade_worker_embedding(monkeypatch, store_devices=None, disk=True)
+    # Shards large enough that scattered rows touch pages the open did not.
+    shards, shard_size, dim = len(layer._disk_shards), 20_000, layer.head_dim
+    rows = shards * shard_size
+    monkeypatch.setattr(layer.ngram_embedding, "org_vocab_size", rows)
+    layer._disk_shard_size = shard_size
+    layer._disk_shard_boundaries = (
+        torch.arange(1, shards, dtype=torch.int64) * shard_size
+    )
+    raw = torch.randint(0, 255, (rows, dim), dtype=torch.uint8)
+    path = str(tmp_path / "ple.safetensors")
+    save_file(
+        {
+            f"shard_{index}": raw[index * shard_size : (index + 1) * shard_size]
+            .clone()
+            .contiguous()
+            for index in range(shards)
+        },
+        path,
+    )
+    with safe_open(path, framework="pt") as checkpoint:
+        layer._disk_shards = [
+            checkpoint.get_tensor(f"shard_{index}") for index in range(shards)
+        ]
+    layer._disk_mapped_paths.add(path)
+    # Opening the checkpoint may touch its header pages; only the gather counts.
+    resident_before = _mapped_rss_kib(path)
+
+    ids = torch.randint(0, rows, (512,)).numpy()
+    assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+    assert _mapped_rss_kib(path) <= resident_before
+    # Unmapped, not lost: the second read maps the pages back in.
+    assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
 
 
 def test_cascade_worker_reads_the_disk_tier_from_the_mapped_shards(
