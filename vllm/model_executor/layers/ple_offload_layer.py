@@ -274,6 +274,18 @@ class PleOffloadLayer(nn.Module, ABC):
             f"{type(self).__name__} does not serve tiered PLE placements"
         )
 
+    def place_store_tier(self, stage_claims: dict[int, int | None]) -> None:
+        """Load the rows bound by :meth:`bind_remote_placements` onto store cards.
+
+        Called once every pipeline stage has allocated its KV cache and
+        captured its graphs. ``stage_claims`` maps a visible CUDA index to the
+        bytes the stage on that card still allocates beyond what it holds,
+        None where the stage ran without memory profiling.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not serve tiered PLE placements"
+        )
+
     def wait_offloaded_output(
         self, hidden_states: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:

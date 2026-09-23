@@ -308,13 +308,15 @@ class PleOffloadWorkerHandle:
 
     proc: Any
     death_writer: Connection | None
-    ready_pipe_reader: Connection | None
+    # Duplex: READY and the store-tier acknowledgement arrive here, the
+    # store-tier command leaves through it.
+    control_pipe: Connection | None
 
     def close(self) -> None:
         """Release all process resources. Safe to call more than once."""
-        if self.ready_pipe_reader is not None:
-            self.ready_pipe_reader.close()
-            self.ready_pipe_reader = None
+        if self.control_pipe is not None:
+            self.control_pipe.close()
+            self.control_pipe = None
         if self.death_writer is not None:
             self.death_writer.close()
             self.death_writer = None
@@ -386,6 +388,7 @@ class PleOffloadWorker:
     """Manage process creation, READY handshake, and the child entry point."""
 
     READY_STR = "READY"
+    STORE_PLACED_STR = "STORE_PLACED"
 
     @staticmethod
     def make_process(
@@ -395,7 +398,7 @@ class PleOffloadWorker:
     ) -> PleOffloadWorkerHandle:
         """Spawn one CPU offload process for all local DP and TP workers."""
         context = get_mp_context()
-        ready_reader, ready_writer = context.Pipe(duplex=False)
+        control_parent, control_child = context.Pipe(duplex=True)
         death_reader, death_writer = context.Pipe(duplex=False)
         proc = context.Process(
             target=PleOffloadWorker.proc_main,
@@ -403,7 +406,7 @@ class PleOffloadWorker:
                 "vllm_config": vllm_config,
                 "num_workers": num_workers,
                 "ipc_addr": ipc_addr,
-                "ready_pipe": (ready_reader, ready_writer),
+                "control_pipe": (control_parent, control_child),
                 "death_pipe": death_reader,
             },
             name="PleOffloadWorker",
@@ -420,36 +423,43 @@ class PleOffloadWorker:
             proc.start()
         finally:
             parent._config["daemon"] = saved_daemon
-        ready_writer.close()
+        control_child.close()
         return PleOffloadWorkerHandle(
             proc=proc,
             death_writer=death_writer,
-            ready_pipe_reader=ready_reader,
+            control_pipe=control_parent,
         )
+
+    @staticmethod
+    def _receive_status(
+        handle: PleOffloadWorkerHandle, expected: str, step: str
+    ) -> dict[str, Any]:
+        """Wait for the worker's answer on the control pipe and check it."""
+        pipe = handle.control_pipe
+        if pipe is None:
+            raise RuntimeError("PLE offload worker control pipe is closed")
+        if not pipe.poll(envs.VLLM_PLE_OFFLOAD_READY_TIMEOUT):
+            raise TimeoutError(
+                f"PLE offload worker did not finish {step} within "
+                f"{envs.VLLM_PLE_OFFLOAD_READY_TIMEOUT}s."
+            )
+        try:
+            message = pipe.recv()
+        except EOFError as error:
+            raise RuntimeError(f"PLE offload worker exited during {step}") from error
+        if message.get("status") != expected:
+            raise RuntimeError(
+                f"PLE offload worker failed during {step}: "
+                f"{message.get('error', 'unknown error')}"
+            )
+        return message
 
     @staticmethod
     def wait_for_ready(handle: PleOffloadWorkerHandle) -> None:
         """Wait until weights and all GPU registrations are ready to serve."""
-        reader = handle.ready_pipe_reader
-        if reader is None:
-            return
-        if not reader.poll(envs.VLLM_PLE_OFFLOAD_READY_TIMEOUT):
-            raise TimeoutError(
-                "PLE offload worker did not become ready within "
-                f"{envs.VLLM_PLE_OFFLOAD_READY_TIMEOUT}s."
-            )
-        try:
-            message = reader.recv()
-        except EOFError as error:
-            raise RuntimeError("PLE offload worker exited during startup") from error
-        finally:
-            reader.close()
-            handle.ready_pipe_reader = None
-        if message.get("status") != PleOffloadWorker.READY_STR:
-            raise RuntimeError(
-                "PLE offload worker failed during startup: "
-                f"{message.get('error', 'unknown error')}"
-            )
+        message = PleOffloadWorker._receive_status(
+            handle, PleOffloadWorker.READY_STR, "startup"
+        )
         layer_names = message["layer_names"]
         logger.info(
             "Worker ready - %d PleOffloadLayer(s): %s",
@@ -458,18 +468,41 @@ class PleOffloadWorker:
         )
 
     @staticmethod
+    def place_store_tier(
+        handle: PleOffloadWorkerHandle, stage_claims: dict[int, int | None]
+    ) -> None:
+        """Let the worker fill its store cards now that every stage is set up.
+
+        ``stage_claims`` maps a visible CUDA index to the bytes the pipeline
+        stage on that card still allocates beyond what it holds, None where
+        the stage ran without memory profiling.
+        """
+        pipe = handle.control_pipe
+        if pipe is None:
+            raise RuntimeError("PLE offload worker control pipe is closed")
+        try:
+            pipe.send({"command": "place_store_tier", "stage_claims": stage_claims})
+        except BrokenPipeError as error:
+            raise RuntimeError(
+                "PLE offload worker exited during store-tier placement"
+            ) from error
+        PleOffloadWorker._receive_status(
+            handle, PleOffloadWorker.STORE_PLACED_STR, "store-tier placement"
+        )
+
+    @staticmethod
     def proc_main(
         vllm_config: VllmConfig,
         num_workers: int,
         ipc_addr: str,
-        ready_pipe: tuple[Connection, Connection],
+        control_pipe: tuple[Connection, Connection],
         death_pipe: Connection,
     ) -> None:
         """Load PLE weights, accept registrations, and run the request loop."""
         decorate_logs("PleOffloadWorker")
         _configure_ple_numa_locality(vllm_config)
-        ready_reader, ready_writer = ready_pipe
-        ready_reader.close()
+        control_parent, control = control_pipe
+        control_parent.close()
         shutdown_event = threading.Event()
 
         def monitor_parent() -> None:
@@ -519,29 +552,26 @@ class PleOffloadWorker:
             # for every DP/TP worker to register before notifying the parent.
             runner.accept_registrations(pull_socket, num_workers)
             _prefault_module_storage(runner._layers.values())
-            ready_writer.send(
+            control.send(
                 {
                     "status": PleOffloadWorker.READY_STR,
                     "layer_names": sorted(runner.layer_names),
                 }
             )
-            ready_writer.close()
-            ready_writer = None  # type: ignore[assignment]
 
-            runner.busy_loop(pull_socket, shutdown_event)
+            runner.busy_loop(pull_socket, control, shutdown_event)
         except Exception as error:
             logger.exception("Unexpected failure in PLE offload worker.")
-            if ready_writer is not None:
-                with contextlib.suppress(Exception):
-                    ready_writer.send({"status": "FAILURE", "error": repr(error)})
+            # The parent may be waiting for READY or for the store tier.
+            with contextlib.suppress(Exception):
+                control.send({"status": "FAILURE", "error": repr(error)})
             raise
         finally:
             if pull_socket is not None:
                 pull_socket.close(linger=0)
             if zmq_context is not None:
                 zmq_context.term()
-            if ready_writer is not None:
-                ready_writer.close()
+            control.close()
             death_pipe.close()
 
 
@@ -563,6 +593,9 @@ class PleOffloadRunner:
         self._pinned_bufs: dict[int, dict[str, torch.Tensor]] = {}
         # Shared-memory inputs are registered once per DP rank by TP rank zero.
         self._input_bufs: dict[int, PleOffloadInputBuffers] = {}
+        # Layers that serve tiered placements; they fill their store cards
+        # when the parent sends the store-tier command.
+        self._tiered_layers: list[PleOffloadLayer] = []
         self._load_weights()
 
     @property
@@ -843,6 +876,7 @@ class PleOffloadRunner:
                         "between data-parallel ranks"
                     )
             layer.bind_remote_placements(placements)
+            self._tiered_layers.append(layer)
             logger.info(
                 "PLE layer %s: remote placements of %d tensor-parallel rank(s): %s",
                 layer_name,
@@ -850,18 +884,45 @@ class PleOffloadRunner:
                 placements,
             )
 
+    def place_store_tier(self, stage_claims: dict[int, int | None]) -> None:
+        """Fill the store cards of every tiered layer, in model order."""
+        for layer in self._tiered_layers:
+            layer.place_store_tier(stage_claims)
+
+    def _handle_control(self, control: Connection) -> bool:
+        """Serve one command from the parent GPU worker.
+
+        Returns False once the parent has closed the pipe, which is how a
+        regular shutdown reaches the worker.
+        """
+        try:
+            message = control.recv()
+        except EOFError:
+            logger.info("Parent closed the control pipe, shutting down.")
+            return False
+        if message.get("command") != "place_store_tier":
+            raise RuntimeError(f"Unexpected PLE offload control message: {message}")
+        self.place_store_tier(message["stage_claims"])
+        control.send({"status": PleOffloadWorker.STORE_PLACED_STR})
+        return True
+
     @torch.inference_mode()
     def busy_loop(
         self,
         pull_socket: zmq.Socket,
+        control: Connection,
         shutdown_event: threading.Event,
     ) -> None:
         """Decode and batch available requests by DP rank until shutdown."""
         logger.info("Busy-loop started.")
         poller = zmq.Poller()
         poller.register(pull_socket, zmq.POLLIN)
+        poller.register(control, zmq.POLLIN)
         while not shutdown_event.is_set():
-            if pull_socket not in dict(poller.poll(timeout=100)):
+            ready = dict(poller.poll(timeout=100))
+            if control.fileno() in ready and not self._handle_control(control):
+                return
+            if pull_socket not in ready:
                 continue
 
             requests = []
