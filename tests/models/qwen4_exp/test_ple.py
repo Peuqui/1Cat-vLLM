@@ -483,14 +483,14 @@ def test_shard_copy_to_the_device_keeps_no_staging_memory() -> None:
     table = torch.empty(rows, 160, dtype=torch.uint8, device="cuda")
     shard = torch.randint(0, 255, (rows, 160), dtype=torch.uint8)
     torch.accelerator.synchronize()
-    reserved = torch.cuda.memory_reserved()
+    reserved = torch.accelerator.memory_reserved()
     copied = copy_ple_embedding_shard_(
         table, shard, checkpoint_start=0, tp_start=0, tp_end=rows
     )
     torch.accelerator.synchronize()
     assert copied == rows
     assert torch.equal(table.cpu(), shard)
-    assert torch.cuda.memory_reserved() == reserved
+    assert torch.accelerator.memory_reserved() == reserved
 
 
 def test_copy_ple_embedding_shard_tiers_matches_the_single_copy() -> None:
