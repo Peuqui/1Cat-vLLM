@@ -41,6 +41,7 @@ is archived on the fork branch `archive/ple-store-cardlist`.
 | `VLLM_QWEN4EXP_PLE_HOST_GIB` | Pinned host share per rank. With the cascade it is used only for rows the device cannot hold; `0` pins nothing. |
 | `VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB` | Device memory the measured budget keeps free (default 8 % of the card, at most 4 GiB). |
 | `VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB` | Host memory the host-share check keeps free (default a quarter of the host). |
+| `VLLM_PLE_DISK_RELEASE_PAGES` | `1` unmaps the checkpoint pages the worker read after every disk gather (disk lane and cascade). Recommended on hosts with little RAM; off (default) keeps them mapped. |
 
 ```bash
 VLLM_QWEN4EXP_PLE_HOST_GIB=0 VLLM_QWEN4EXP_PLE_DISK=1 \
@@ -85,11 +86,14 @@ PLE offload worker (`_remote_lookup`):
   segments are disjoint in the global id space, so each rank takes only its
   own slots,
 - reads the rows with the disk lane's mmap reader (`_gather_mapped_rows`:
-  sorted unique ids per shard, `MADV_RANDOM`, thread pool) and then unmaps the
-  pages it read (`madvise(MADV_DONTNEED)` on the private, file-backed shard
-  mappings). The pages stay in the page cache; unmapped, the kernel can drop
-  them first under pressure. Only shards the loader recorded as file-backed
-  are released, since on anonymous memory `MADV_DONTNEED` discards data.
+  sorted unique ids per shard, `MADV_RANDOM`, thread pool). With
+  `VLLM_PLE_DISK_RELEASE_PAGES=1` it then unmaps the pages it read
+  (`madvise(MADV_DONTNEED)` on the private, file-backed shard mappings). The
+  pages stay in the page cache; unmapped, the kernel can drop them first under
+  pressure instead of swapping other processes out. Without the switch they
+  stay mapped, which saves the re-mapping on repeated reads on a host with RAM
+  to spare. Only shards the loader recorded as file-backed are released, since
+  on anonymous memory `MADV_DONTNEED` discards data.
 
 Greedy outputs are identical to the pre-change path because every row is
 dequantized by the same kernel arithmetic, wherever it was stored.

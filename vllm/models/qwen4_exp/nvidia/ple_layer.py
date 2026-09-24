@@ -1082,6 +1082,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         )
         self._disk_shards: list[torch.Tensor | None] = []
         self._disk_mapped_paths: set[str] = set()
+        self._release_disk_pages = envs.VLLM_PLE_DISK_RELEASE_PAGES
         self._disk_executor: ThreadPoolExecutor | None = None
         if self._file_backed_shards:
             if quant_method is None:
@@ -1407,11 +1408,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     def _release_mapped_pages(self, shard: torch.Tensor) -> None:
         """Unmap the pages of a file-backed shard this process has read.
 
-        They stay in the page cache, so reading them again is a cheap minor
-        fault, but a mapped page is one the kernel keeps: with them mapped the
-        offload worker held 1.9 GiB of the checkpoint after twelve disk-tier
-        requests while the kernel swapped other processes out (2026-09-23).
-        The shards are
+        Only with VLLM_PLE_DISK_RELEASE_PAGES. The pages stay in the page
+        cache, so reading them again is a cheap minor fault, but a mapped page
+        is one the kernel keeps: with them mapped the offload worker held
+        1.9 GiB of the checkpoint after twelve disk-tier requests while the
+        kernel swapped other processes out (2026-09-23). The shards are
         private file mappings nobody writes, so the file still holds every
         byte.
 
@@ -1419,7 +1420,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         MADV_DONTNEED discards the contents. Loading records the mapped file
         of every shard it accepts (_advise_random_file_access refuses others).
         """
-        if self._disk_mapped_paths:
+        if self._release_disk_pages and self._disk_mapped_paths:
             _madvise_mapped_tensor(shard, _MADV_DONTNEED)
 
     def _gather_mapped_rows(self, flat_ids: np.ndarray) -> np.ndarray:

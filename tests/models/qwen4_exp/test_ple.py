@@ -813,6 +813,8 @@ def _make_disk_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     module._file_backed_shards = True
     module._disk_shards = [None, None]
     module._disk_mapped_paths = set()
+    # The disk lane tests read real file-backed shards, so they can release.
+    module._release_disk_pages = True
     module._disk_shard_size = 4
     module._disk_shard_boundaries = torch.tensor([4], dtype=torch.int64)
     module.head_dim = 2
@@ -912,8 +914,8 @@ def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
 
 def test_ngram_embedding_retains_and_gathers_disk_shards(tmp_path) -> None:
     # Real file-backed shards, as the loader hands them over: the disk lane
-    # refuses anything else, and the gather releases the mapped pages, which
-    # would destroy anonymous memory.
+    # refuses anything else, and with VLLM_PLE_DISK_RELEASE_PAGES the gather
+    # releases the mapped pages, which would destroy anonymous memory.
     from safetensors import safe_open
     from safetensors.torch import save_file
 
@@ -1816,8 +1818,9 @@ def _map_worker_shards_from_file(
 
 
 def test_disk_gather_unmaps_the_pages_it_read(monkeypatch, tmp_path) -> None:
-    # A mapped page is one the kernel keeps; the disk tier must not collect
-    # them. The rows stay readable from the file afterwards.
+    # A mapped page is one the kernel keeps; with the release switch the disk
+    # tier must not collect them. The rows stay readable from the file.
+    set_lazy_env(monkeypatch, "VLLM_PLE_DISK_RELEASE_PAGES", "1")
     layer = _make_cascade_worker_embedding(monkeypatch)
     raw, path = _map_worker_shards_from_file(layer, monkeypatch, tmp_path)
     # Opening the checkpoint may touch its header pages; only the gather counts.
@@ -1828,6 +1831,18 @@ def test_disk_gather_unmaps_the_pages_it_read(monkeypatch, tmp_path) -> None:
     assert _mapped_rss_kib(path) <= resident_before
     # Unmapped, not lost: the second read maps the pages back in.
     assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+
+
+def test_disk_gather_keeps_its_pages_mapped_by_default(monkeypatch, tmp_path) -> None:
+    # Without the switch the worker keeps what it read mapped, as before.
+    set_lazy_env(monkeypatch, "VLLM_PLE_DISK_RELEASE_PAGES", None)
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    raw, path = _map_worker_shards_from_file(layer, monkeypatch, tmp_path)
+    resident_before = _mapped_rss_kib(path)
+
+    ids = torch.randint(0, raw.shape[0], (512,)).numpy()
+    assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+    assert _mapped_rss_kib(path) > resident_before
 
 
 def test_cascade_worker_reads_the_disk_tier_from_the_mapped_shards(
