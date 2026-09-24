@@ -475,8 +475,8 @@ def test_plan_ple_placement_cascades_beyond_device_and_host() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_shard_copy_to_the_device_keeps_no_staging_memory() -> None:
-    # A store card is filled up to its reserve; a cached staging copy of the
-    # shard slice would take memory the pipeline stage on that card needs.
+    # The allocator keeps a cached staging copy of the shard slice reserved on
+    # the card that holds the device tier, memory the KV cache would get.
     # 10 MiB: smaller slices share a 2 MiB allocator block with the table, and
     # the old staging copy would pass unnoticed.
     rows = 65536
