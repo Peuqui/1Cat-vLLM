@@ -10,7 +10,7 @@ import tempfile
 import uuid
 import warnings
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
     VLLM_HOST_IP: str = ""
@@ -800,8 +800,6 @@ if TYPE_CHECKING:
     VLLM_QWEN4EXP_PLE_HOST_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float | None = None
-    VLLM_QWEN4EXP_PLE_STORE_DEVICES: list[int] = []
-    VLLM_QWEN4EXP_PLE_STORE_RESERVE_GIB: list[float] = []
     VLLM_QWEN4EXP_PLE_DISK: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -1045,24 +1043,6 @@ def env_list_with_choices(
         return values
 
     return _get_validated_env_list
-
-
-_Number = TypeVar("_Number", int, float)
-
-
-def env_number_list(
-    env_name: str, parse: Callable[[str], _Number]
-) -> Callable[[], list[_Number]]:
-    """Create a lambda that parses a comma-separated list of numbers.
-
-    Unset or empty yields an empty list; every entry must parse with ``parse``.
-    """
-
-    def _get_number_list() -> list[_Number]:
-        value = os.getenv(env_name, "")
-        return [parse(item.strip()) for item in value.split(",") if item.strip()]
-
-    return _get_number_list
 
 
 def env_set_with_choices(
@@ -4760,30 +4740,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if os.getenv("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "").strip() == ""
         else float(os.getenv("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "0"))
     ),
-    # Qwen4Exp PLE overflow cascade: visible CUDA indices of the cards that
-    # store table rows beyond the device and pinned-host tiers, filled in the
-    # given order. Setting it starts the PLE offload worker next to the
-    # resident tables; the compute ranks wait for its rows inside their CUDA
-    # graphs. The worker fills the cards only after every pipeline stage has
-    # allocated its KV cache and captured its graphs, so a card may be one
-    # that runs a stage. Unset: no store tier.
-    "VLLM_QWEN4EXP_PLE_STORE_DEVICES": env_number_list(
-        "VLLM_QWEN4EXP_PLE_STORE_DEVICES", int
-    ),
-    # Qwen4Exp PLE overflow cascade: memory in GiB every store card keeps
-    # free, one value per card in the order of VLLM_QWEN4EXP_PLE_STORE_DEVICES.
-    # The worker takes the rest of what a card has free once its pipeline
-    # stage is set up and what the stage still claims is set aside. Raise it
-    # for a card that other tenants share (a vision or speech model). Unset:
-    # 0.5 GiB per card, for what only the first real requests allocate (NCCL
-    # stage buffers, JIT modules).
-    "VLLM_QWEN4EXP_PLE_STORE_RESERVE_GIB": env_number_list(
-        "VLLM_QWEN4EXP_PLE_STORE_RESERVE_GIB", float
-    ),
-    # Qwen4Exp PLE overflow cascade: let the rows beyond every other tier be
-    # read from the mapped checkpoint on disk. Without it such a remainder
-    # fails the startup. The disk tier needs no budget (the checkpoint is
-    # already there) but is the slowest tier by far.
+    # Qwen4Exp PLE overflow cascade: let the rows beyond the device and
+    # pinned-host tiers be read from the mapped checkpoint on disk. Setting it
+    # starts the PLE offload worker next to the resident tables; the compute
+    # ranks wait for its rows inside their CUDA graphs. Without it such a
+    # remainder fails the startup. The disk tier needs no budget: it reads the
+    # checkpoint in place, nothing is copied.
     "VLLM_QWEN4EXP_PLE_DISK": lambda: (
         os.getenv("VLLM_QWEN4EXP_PLE_DISK", "False").lower() in ("true", "1")
     ),

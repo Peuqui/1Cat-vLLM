@@ -338,48 +338,21 @@ def _apply_sm70_qwen38_hybrid_ple_defaults(
     parallel_config.ensure_ple_offload_ipc_path()
 
 
-def _qwen4exp_ple_cascade_requested(
-    model_config: ModelConfig, parallel_config: ParallelConfig
-) -> bool:
+def _qwen4exp_ple_cascade_requested(model_config: ModelConfig) -> bool:
     """Whether the PLE overflow cascade is configured, checking its contract.
 
-    ``VLLM_QWEN4EXP_PLE_STORE_DEVICES`` names the cards that store table rows
-    beyond the device and pinned-host tiers, ``VLLM_QWEN4EXP_PLE_DISK`` allows
-    the rest to be read from the mapped checkpoint; either one starts the
-    cascade. The PLE offload worker then serves those rows next to the
-    resident tables, which is a different contract from the whole-table
-    offload and from the hybrid lane.
+    ``VLLM_QWEN4EXP_PLE_DISK`` lets the rows beyond the device and pinned-host
+    tiers be read from the mapped checkpoint and starts the cascade. The PLE
+    offload worker then serves those rows next to the resident tables, which
+    is a different contract from the whole-table offload and from the hybrid
+    lane.
 
     Only a config that carries a model is checked: helper configs without one,
     such as the PLE offload worker's isolated single-rank world, inherit the
     variable but have no table to place.
     """
-    from vllm.models.qwen4_exp.common.ple import (
-        ple_store_devices,
-        ple_store_reserves_bytes,
-    )
-
-    store_devices = ple_store_devices()
-    if not store_devices:
-        if envs.VLLM_QWEN4EXP_PLE_STORE_RESERVE_GIB:
-            raise ValueError(
-                "VLLM_QWEN4EXP_PLE_STORE_RESERVE_GIB is set without "
-                "VLLM_QWEN4EXP_PLE_STORE_DEVICES"
-            )
-        if not envs.VLLM_QWEN4EXP_PLE_DISK:
-            return False
-    else:
-        # Refuses a reserve list that does not match the cards before any
-        # rank loads.
-        ple_store_reserves_bytes()
-        if parallel_config.data_parallel_size > 1:
-            # The stages report what they still claim on their cards within
-            # one data-parallel replica; the cards of another replica would
-            # be filled blind.
-            raise ValueError(
-                "VLLM_QWEN4EXP_PLE_STORE_DEVICES requires data_parallel_size 1, "
-                f"got {parallel_config.data_parallel_size}"
-            )
+    if not envs.VLLM_QWEN4EXP_PLE_DISK:
+        return False
     if not getattr(model_config.hf_text_config, "ple_layer_ids", None):
         raise ValueError(
             "The Qwen4Exp PLE cascade is configured, but the model has no PLE layers"
@@ -1940,15 +1913,12 @@ class VllmConfig:
             )
 
         if self.model_config is not None and _qwen4exp_ple_cascade_requested(
-            self.model_config, self.parallel_config
+            self.model_config
         ):
             _apply_qwen4exp_ple_cascade_defaults(self.parallel_config)
             logger.info_once(
-                "Qwen4Exp PLE overflow cascade: store devices %s, disk tier %s; "
-                "the PLE offload worker serves the rows beyond the resident tiers.",
-                # info_once caches its arguments, so they have to be hashable.
-                tuple(envs.VLLM_QWEN4EXP_PLE_STORE_DEVICES) or "none",
-                "allowed" if envs.VLLM_QWEN4EXP_PLE_DISK else "off",
+                "Qwen4Exp PLE overflow cascade: the PLE offload worker reads the "
+                "rows beyond the resident tiers from the mapped checkpoint."
             )
 
         attention_backend = self.attention_config.backend

@@ -24,7 +24,6 @@ from vllm.models.qwen4_exp.common.ple import (
     PLEPlacement,
     PLERemotePlacement,
     PLEShardOverlap,
-    PLEStoreSegment,
     auto_ple_host_budget_bytes,
     available_host_bytes,
     cap_host_budget_bytes,
@@ -32,11 +31,9 @@ from vllm.models.qwen4_exp.common.ple import (
     compute_ple_shard_overlap,
     copy_ple_embedding_shard_,
     copy_ple_embedding_shard_tiers_,
+    plan_ple_disk_segments,
     plan_ple_placement,
-    plan_ple_worker_segments,
-    ple_segment_mask,
-    ple_store_card_bytes,
-    ple_store_indices,
+    ple_disk_mask,
     total_host_bytes,
 )
 from vllm.models.qwen4_exp.nvidia.ple_layer import (
@@ -261,66 +258,22 @@ def test_ple_budget_rejects_invalid_values(monkeypatch, kind, value):
             ple_common.ple_vram_reserve_bytes(32 * 1024**3)
 
 
-def test_ple_store_devices_keep_their_reserves_in_card_order(monkeypatch) -> None:
-    gib = 1024**3
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICES", None)
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_RESERVE_GIB", None)
-    assert ple_common.ple_store_devices() == []
-    assert ple_common.ple_store_reserves_bytes() == []
-
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICES", "2, 1,3")
-    assert ple_common.ple_store_devices() == [2, 1, 3]
-    # Unset: every card keeps the small default free.
-    assert ple_common.ple_store_reserves_bytes() == [gib // 2] * 3
-    # One value per card, in card order.
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_RESERVE_GIB", "0.5,0,8")
-    assert ple_common.ple_store_reserves_bytes() == [gib // 2, 0, 8 * gib]
-
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_RESERVE_GIB", "1,2")
-    with pytest.raises(ValueError, match="one value per card"):
-        ple_common.ple_store_reserves_bytes()
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_RESERVE_GIB", "1,-1,2")
-    with pytest.raises(ValueError, match="finite and non-negative"):
-        ple_common.ple_store_reserves_bytes()
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICES", "1,1")
-    with pytest.raises(ValueError, match="names a card twice"):
-        ple_common.ple_store_devices()
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICES", "-1")
-    with pytest.raises(ValueError, match="must be non-negative"):
-        ple_common.ple_store_devices()
-
-
-def test_ple_store_card_takes_what_the_stage_and_the_reserve_leave() -> None:
-    # 10 free, the stage still claims 3, 1 stays free: 6 for the store tier.
-    assert (
-        ple_store_card_bytes(free_bytes=10, stage_claim_bytes=3, reserve_bytes=1) == 6
-    )
-    # A card that runs no stage keeps only its reserve.
-    assert (
-        ple_store_card_bytes(free_bytes=10, stage_claim_bytes=0, reserve_bytes=8) == 2
-    )
-    # Never negative: a full card takes nothing.
-    assert ple_store_card_bytes(free_bytes=2, stage_claim_bytes=3, reserve_bytes=1) == 0
-    with pytest.raises(ValueError, match="non-negative"):
-        ple_store_card_bytes(free_bytes=10, stage_claim_bytes=-1, reserve_bytes=0)
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
-def test_cascade_rank_leaves_the_overflow_to_the_worker(
+def test_cascade_rank_leaves_the_overflow_to_the_disk_tier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_tp(monkeypatch, rank=0, world_size=1)
     _patch_cascade(monkeypatch, host_bytes=3 * 8)
     layer = _pinned_layer(num_embeddings=16)
     # 10.6 rows do not fit on the device: the partial row stays there as it
-    # does without the cascade, the host takes its 3 rows, the worker the rest.
+    # does without the cascade, the host takes its 3 rows, the disk the rest.
     _patch_device_spill(monkeypatch, layer, 10 * 8 + 5)
     layer.materialize_tables()
 
     assert layer.ple_device_table is not None and layer.ple_host_storage is not None
     assert layer.ple_device_table.shape == (6, 8)
     assert layer.ple_host_storage.shape == (3, 8)
-    assert (layer._device_rows, layer._host_rows, layer._remote_rows) == (6, 3, 7)
+    assert (layer._device_rows, layer._host_rows, layer._disk_rows) == (6, 3, 7)
     assert layer.local_rows == 9
 
     raw = torch.arange(16 * 8, dtype=torch.uint8).view(16, 8)
@@ -331,7 +284,7 @@ def test_cascade_rank_leaves_the_overflow_to_the_worker(
     assert torch.equal(layer.ple_device_table.view(torch.uint8).cpu(), raw[:6])
     assert torch.equal(layer.ple_host_storage.view(torch.uint8), raw[6:9])
 
-    with pytest.raises(RuntimeError, match="got no rows from it"):
+    with pytest.raises(RuntimeError, match="no rows from the PLE offload worker"):
         layer.embedding_lookup(torch.zeros(2, dtype=torch.int64, device="cuda"))
 
 
@@ -388,11 +341,11 @@ def test_configured_host_share_is_used_as_given_by_the_rank(
     monkeypatch.setattr(ple_module, "available_host_bytes", lambda: 0)
     layer = _pinned_layer(num_embeddings=16)
     layer.materialize_tables()
-    assert (layer._device_rows, layer._host_rows, layer._remote_rows) == (12, 4, 0)
+    assert (layer._device_rows, layer._host_rows, layer._disk_rows) == (12, 4, 0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
-def test_derived_host_share_cut_by_the_host_goes_to_the_worker(
+def test_derived_host_share_cut_by_the_host_goes_to_the_disk_tier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_tp(monkeypatch, rank=0, world_size=1)
@@ -403,7 +356,7 @@ def test_derived_host_share_cut_by_the_host_goes_to_the_worker(
     layer = _pinned_layer(num_embeddings=16)
     _patch_device_spill(monkeypatch, layer, 10 * 8)
     layer.materialize_tables()
-    assert (layer._device_rows, layer._host_rows, layer._remote_rows) == (6, 3, 7)
+    assert (layer._device_rows, layer._host_rows, layer._disk_rows) == (6, 3, 7)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -465,14 +418,14 @@ def _plan(
     total_rows: int,
     host_rows: int,
     vram_rows: int | None,
-    remote_allowed: bool = True,
+    disk_allowed: bool = True,
 ):
     return plan_ple_placement(
         total_rows=total_rows,
         row_bytes=8,
         host_budget_bytes=host_rows * 8,
         vram_budget_bytes=None if vram_rows is None else vram_rows * 8,
-        remote_allowed=remote_allowed,
+        disk_allowed=disk_allowed,
     )
 
 
@@ -483,12 +436,12 @@ def test_plan_ple_placement_spills_only_what_the_budget_holds() -> None:
     placement = plan_ple_placement(
         total_rows=10, row_bytes=8, host_budget_bytes=3 * 8 + 7, vram_budget_bytes=None
     )
-    assert placement == PLEPlacement(vram_rows=7, host_rows=3, remote_rows=0)
+    assert placement == PLEPlacement(vram_rows=7, host_rows=3, disk_rows=0)
     # A budget beyond the table never inflates the host part.
     big = plan_ple_placement(
         total_rows=10, row_bytes=8, host_budget_bytes=10**9, vram_budget_bytes=None
     )
-    assert big == PLEPlacement(vram_rows=0, host_rows=10, remote_rows=0)
+    assert big == PLEPlacement(vram_rows=0, host_rows=10, disk_rows=0)
     with pytest.raises(ValueError):
         plan_ple_placement(
             total_rows=10, row_bytes=8, host_budget_bytes=-1, vram_budget_bytes=None
@@ -496,26 +449,26 @@ def test_plan_ple_placement_spills_only_what_the_budget_holds() -> None:
 
 
 def test_plan_ple_placement_cascades_beyond_device_and_host() -> None:
-    # The device takes its measured budget, the host its share, the worker the rest.
+    # The device takes its measured budget, the host its share, the disk the rest.
     placement = _plan(total_rows=20, host_rows=5, vram_rows=9)
-    assert placement == PLEPlacement(vram_rows=9, host_rows=5, remote_rows=6)
+    assert placement == PLEPlacement(vram_rows=9, host_rows=5, disk_rows=6)
     assert (placement.local_rows, placement.total_rows) == (14, 20)
     # Fastest tier first: a device that holds the whole table leaves the host
     # share unused, so a fitting table pins no host memory.
     assert _plan(total_rows=20, host_rows=5, vram_rows=99) == (
-        PLEPlacement(vram_rows=20, host_rows=0, remote_rows=0)
+        PLEPlacement(vram_rows=20, host_rows=0, disk_rows=0)
     )
     # The host takes only what the device could not hold.
     assert _plan(total_rows=20, host_rows=5, vram_rows=18) == (
-        PLEPlacement(vram_rows=18, host_rows=2, remote_rows=0)
+        PLEPlacement(vram_rows=18, host_rows=2, disk_rows=0)
     )
     # Without a cascade the configured host share comes first, as before.
     assert _plan(total_rows=20, host_rows=5, vram_rows=None) == PLEPlacement(
-        vram_rows=15, host_rows=5, remote_rows=0
+        vram_rows=15, host_rows=5, disk_rows=0
     )
-    # Rows are never dropped: a remainder with no worker to serve it is refused.
+    # Rows are never dropped: without the disk tier a remainder is refused.
     with pytest.raises(ValueError, match="does not fit"):
-        _plan(total_rows=20, host_rows=5, vram_rows=9, remote_allowed=False)
+        _plan(total_rows=20, host_rows=5, vram_rows=9, disk_allowed=False)
     with pytest.raises(ValueError, match="device budget"):
         _plan(total_rows=20, host_rows=0, vram_rows=-1)
 
@@ -591,73 +544,30 @@ def test_tier_copy_accepts_tp_padding(host_rows: int) -> None:
     assert torch.all(result[10:] == -1)
 
 
-def test_worker_segments_fill_the_store_cards_in_order_then_the_disk() -> None:
+def test_disk_segments_cover_each_ranks_remote_rows() -> None:
     placements = [
         PLERemotePlacement(tp_start=0, tp_end=100, local_rows=60),
         PLERemotePlacement(tp_start=100, tp_end=200, local_rows=90),
+        PLERemotePlacement(tp_start=200, tp_end=300, local_rows=128),
     ]
-    # 50 remote rows: card 2 takes 25, card 0 takes 15, the disk the last 10.
-    # The first rank's range is split at the card boundary.
-    store, disk = plan_ple_worker_segments(placements, [(2, 25), (0, 15)])
-    assert store == [
-        PLEStoreSegment(start=60, end=85, offset=0, device=2),
-        PLEStoreSegment(start=85, end=100, offset=0, device=0),
+    disk = plan_ple_disk_segments(placements)
+    # A rank that holds all of its rows leaves no segment.
+    assert disk == [
+        PLEDiskSegment(start=60, end=100),
+        PLEDiskSegment(start=190, end=200),
     ]
-    assert disk == [PLEDiskSegment(start=190, end=200)]
-
-    # A card that fills up between two ranks hands the next rank to the next card.
-    store, disk = plan_ple_worker_segments(placements, [(2, 40), (0, 99)])
-    assert store == [
-        PLEStoreSegment(start=60, end=100, offset=0, device=2),
-        PLEStoreSegment(start=190, end=200, offset=0, device=0),
-    ]
-    assert disk == []
-
-    # Without cards, or with empty ones, everything is read from the disk.
-    for cards in ([], [(1, 0), (3, 0)]):
-        store, disk = plan_ple_worker_segments(placements, cards)
-        assert store == []
-        assert disk == [
-            PLEDiskSegment(start=60, end=100),
-            PLEDiskSegment(start=190, end=200),
-        ]
-
-    ids = torch.tensor([[59, 60, 99], [100, 189, 190], [199, 0, 150]])
+    ids = torch.tensor([[59, 60, 99], [100, 189, 190], [199, 0, 250]])
     expected = torch.tensor(
         [[False, True, True], [False, False, True], [True, False, False]]
     )
-    assert torch.equal(ple_segment_mask(ids, disk), expected)
-    assert not ple_segment_mask(ids, []).any()
-
-    with pytest.raises(ValueError, match="repeat"):
-        plan_ple_worker_segments(placements, [(1, 5), (1, 5)])
-    with pytest.raises(ValueError, match="non-negative"):
-        plan_ple_worker_segments(placements, [(1, -1)])
-
-
-def test_store_segments_lay_one_cards_rows_end_to_end() -> None:
-    placements = [
-        PLERemotePlacement(tp_start=0, tp_end=100, local_rows=60),
-        PLERemotePlacement(tp_start=100, tp_end=200, local_rows=128),
-        PLERemotePlacement(tp_start=200, tp_end=300, local_rows=30),
-    ]
-    segments, disk = plan_ple_worker_segments(placements, [(4, 110)])
-    assert disk == []
-    assert segments == [
-        PLEStoreSegment(start=60, end=100, offset=0, device=4),
-        PLEStoreSegment(start=230, end=300, offset=40, device=4),
-    ]
-    ids = torch.tensor([[59, 61, 99], [100, 229, 230], [299, 0, 150]])
-    expected = torch.tensor([[0, 1, 39], [0, 0, 40], [109, 0, 0]])
-    assert torch.equal(ple_store_indices(ids, segments), expected)
-    assert torch.equal(ple_store_indices(ids, []), torch.zeros_like(ids))
+    assert torch.equal(ple_disk_mask(ids, disk), expected)
+    assert not ple_disk_mask(ids, []).any()
     with pytest.raises(ValueError, match="overlap"):
-        plan_ple_worker_segments(
+        plan_ple_disk_segments(
             [
                 PLERemotePlacement(tp_start=0, tp_end=100, local_rows=0),
                 PLERemotePlacement(tp_start=90, tp_end=200, local_rows=0),
-            ],
-            [(4, 210)],
+            ]
         )
 
 
@@ -1613,9 +1523,6 @@ def test_pinned_host_ple_merges_the_workers_rows_bit_identically(
 
 def _make_cascade_worker_embedding(
     monkeypatch: pytest.MonkeyPatch,
-    store_devices: str | None = "3",
-    disk: bool = False,
-    reserves: str | None = None,
 ) -> Qwen4ExpNGramEmbedding:
     monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -1626,9 +1533,7 @@ def _make_cascade_worker_embedding(
         parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
     )
     set_lazy_env(monkeypatch, "VLLM_PLE_DISK_OFFLOAD", None)
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICES", store_devices)
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_RESERVE_GIB", reserves)
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_DISK", "1" if disk else None)
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_DISK", "1")
     monkeypatch.setattr(ple_module, "is_offload_process", lambda: True)
     config = SimpleNamespace(
         ngram_size=3,
@@ -1662,37 +1567,29 @@ def test_ngram_embedding_cascade_worker_keeps_shards_file_backed(
     assert Qwen4ExpNGramEmbedding.offload_keeps_local_tables()
     assert layer._file_backed_shards
     assert not layer._disk_offload
-    assert layer._disk_executor is None
+    # The disk tier is the worker's only outer tier: its reader always runs.
+    assert layer._disk_executor is not None
     assert len(layer._disk_shards) == 2
     assert layer.ngram_embedding.weight.is_meta
     assert layer.get_offload_output_dtype(torch.float16) == torch.uint8
 
 
-def test_cascade_worker_places_its_store_tier_only_when_told(
+def test_cascade_worker_binds_resident_placements_and_serves_no_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    layer = _make_cascade_worker_embedding(monkeypatch, store_devices="3")
-    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 4)
-    monkeypatch.setattr(
-        torch.cuda, "mem_get_info", lambda device: (5 * 2**30, 8 * 2**30)
-    )
+    layer = _make_cascade_worker_embedding(monkeypatch)
     output = torch.full((8, 256), 7, dtype=torch.uint8)
 
     with pytest.raises(RuntimeError, match="before the ranks registered"):
-        layer.place_store_tier({})
+        layer._remote_lookup(
+            torch.zeros(8, 16, dtype=torch.int64), output.view(torch.float8_e4m3fn)
+        )
     with pytest.raises(TypeError, match="PLERemotePlacement"):
         layer.bind_remote_placements([object()])
 
     resident = PLERemotePlacement(tp_start=0, tp_end=100, local_rows=128)
     layer.bind_remote_placements([resident])
     assert layer._remote_placements == [resident]
-    # Binding loads nothing: the store cards may still be setting up stages.
-    with pytest.raises(RuntimeError, match="before its store tier was placed"):
-        layer._remote_lookup(
-            torch.zeros(8, 16, dtype=torch.int64), output.view(torch.float8_e4m3fn)
-        )
-    layer.place_store_tier({3: 0})
-    assert layer._store_tables == {}
     assert layer._disk_segments == []
 
     input_ids = torch.tensor([5, 6, 7, 8, 9], dtype=torch.int32)
@@ -1702,51 +1599,18 @@ def test_cascade_worker_places_its_store_tier_only_when_told(
         input_ids, input_ids, query_start_loc, ngram_context, output_buffer=output
     )
     assert result.shape == (5, 256)
-    # Every id is resident: the worker writes none of the slots.
-    assert output.eq(7).all()
-
-    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 3)
-    with pytest.raises(ValueError, match="not a visible CUDA device"):
-        layer.place_store_tier({})
-    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 4)
-    with pytest.raises(RuntimeError, match="never measured"):
-        layer.place_store_tier({3: None})
-
-    # 40 remote rows of 16 bytes: a card with room for 39 leaves one row, and
-    # without the disk tier that fails before anything is loaded.
-    on_store = PLERemotePlacement(tp_start=0, tp_end=100, local_rows=60)
-    layer.bind_remote_placements([on_store])
-    reserve = 2**30 // 2
-    monkeypatch.setattr(
-        torch.cuda, "mem_get_info", lambda device: (reserve + 39 * 16, 8 * 2**30)
-    )
-    with pytest.raises(RuntimeError, match="hold only part of the remote rows"):
-        layer.place_store_tier({})
-    # What the stage on the card still claims is set aside as well.
-    monkeypatch.setattr(
-        torch.cuda, "mem_get_info", lambda device: (reserve + 40 * 16, 8 * 2**30)
-    )
-    with pytest.raises(RuntimeError, match="hold only part of the remote rows"):
-        layer.place_store_tier({3: 16})
+    assert not output[:5].any()
+    assert output[5:].eq(7).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
-@pytest.mark.parametrize("two_cards", [False, True])
 def test_one_worker_buffer_merges_into_every_rank_bit_identically(
-    monkeypatch: pytest.MonkeyPatch, two_cards: bool
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The worker gathers the remote rows of both ranks into one buffer. Each
-    # rank merges the slots of its own segments and masks the ids of the
-    # other rank, so the reduced output equals a lookup in the complete table.
-    # With two cards the first holds only part of the rows, so a rank's range
-    # is split across both tables.
-    if two_cards and torch.accelerator.device_count() < 2:
-        pytest.skip("requires two CUDA devices")
-    worker = _make_cascade_worker_embedding(
-        monkeypatch,
-        store_devices="0,1" if two_cards else "0",
-        reserves="0,0" if two_cards else None,
-    )
+    # The worker reads the disk rows of both ranks into one buffer. Each rank
+    # merges the slots of its own disk segment and masks the ids of the other
+    # rank, so the reduced output equals a lookup in the complete table.
+    worker = _make_cascade_worker_embedding(monkeypatch)
     rows, dim = worker.ngram_embedding.org_vocab_size, worker.head_dim
     shard_size = worker._disk_shard_size
     raw = torch.randint(0, 255, (rows, dim), dtype=torch.uint8)
@@ -1778,24 +1642,10 @@ def test_one_worker_buffer_merges_into_every_rank_bit_identically(
             )
         layer.weight_scale = nn.Parameter(scale.clone(), requires_grad=False)
         layer.prepare_accelerator_weight()
-        assert layer._device_rows == rows // 4 and layer._remote_rows > 0
+        assert layer._device_rows == rows // 4 and layer._disk_rows > 0
         ranks.append(layer)
     _expose_to_gather_op(monkeypatch, *ranks)
 
-    remote_rows = sum(layer._remote_rows for layer in ranks)
-    if two_cards:
-        # The first card takes the first rank's rows and a few of the second's.
-        first_card_rows = ranks[0]._remote_rows + 3
-        real_mem_get_info = torch.cuda.mem_get_info
-        monkeypatch.setattr(
-            torch.cuda,
-            "mem_get_info",
-            lambda device: (
-                (first_card_rows * dim, 2**40)
-                if device == 0
-                else real_mem_get_info(device)
-            ),
-        )
     worker.bind_remote_placements(
         [
             PLERemotePlacement(
@@ -1806,18 +1656,9 @@ def test_one_worker_buffer_merges_into_every_rank_bit_identically(
             for layer in ranks
         ]
     )
-    worker.place_store_tier({})
-    assert worker._disk_segments == []
-    if two_cards:
-        assert {d: t.shape for d, t in worker._store_tables.items()} == {
-            0: (first_card_rows, dim),
-            1: (remote_rows - first_card_rows, dim),
-        }
-        assert worker._store_tables[1].device == torch.device("cuda", 1)
-    else:
-        assert {d: t.shape for d, t in worker._store_tables.items()} == {
-            0: (remote_rows, dim)
-        }
+    assert sum(segment.end - segment.start for segment in worker._disk_segments) == (
+        sum(r._disk_rows for r in ranks)
+    )
 
     table = (raw.view(torch.float8_e4m3fn).float() * scale.float().cpu()).to(
         torch.float16
@@ -1853,12 +1694,10 @@ def test_cascade_rank_reports_its_resident_rows(
     embedding = _pinned_layer(num_embeddings=8)
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
-    module._store_devices = []
     module._cascade = False
     module.ngram_embedding = embedding
     assert module.remote_placement() is None
 
-    module._store_devices = [4]
     module._cascade = True
     assert module.remote_placement() == PLERemotePlacement(
         tp_start=0, tp_end=8, local_rows=8
@@ -1979,7 +1818,7 @@ def _map_worker_shards_from_file(
 def test_disk_gather_unmaps_the_pages_it_read(monkeypatch, tmp_path) -> None:
     # A mapped page is one the kernel keeps; the disk tier must not collect
     # them. The rows stay readable from the file afterwards.
-    layer = _make_cascade_worker_embedding(monkeypatch, store_devices=None, disk=True)
+    layer = _make_cascade_worker_embedding(monkeypatch)
     raw, path = _map_worker_shards_from_file(layer, monkeypatch, tmp_path)
     # Opening the checkpoint may touch its header pages; only the gather counts.
     resident_before = _mapped_rss_kib(path)
@@ -1991,45 +1830,11 @@ def test_disk_gather_unmaps_the_pages_it_read(monkeypatch, tmp_path) -> None:
     assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA store card")
-def test_store_load_unmaps_the_pages_it_copied(monkeypatch, tmp_path) -> None:
-    # Loading a store tier reads a large part of the checkpoint in one pass;
-    # the worker must not keep those pages mapped once the table is on the card.
-    layer = _make_cascade_worker_embedding(
-        monkeypatch, store_devices="0", disk=True, reserves="0"
-    )
-    # The store copies half the table: several MiB of pages the open never
-    # touched, so a kept mapping shows.
-    raw, path = _map_worker_shards_from_file(
-        layer, monkeypatch, tmp_path, shard_size=200_000
-    )
-    rows, dim, heads = raw.shape[0], layer.head_dim, layer.ngram_heads
-    resident, store_rows = rows // 4, rows // 2
-    monkeypatch.setattr(
-        torch.cuda, "mem_get_info", lambda device: (store_rows * dim, 2**40)
-    )
-    layer.bind_remote_placements(
-        [PLERemotePlacement(tp_start=0, tp_end=rows, local_rows=resident)]
-    )
-    resident_before = _mapped_rss_kib(path)
-    layer.place_store_tier({})
-    assert layer._store_tables[0].shape == (store_rows, dim)
-    assert _mapped_rss_kib(path) <= resident_before
-
-    ids = torch.randint(0, rows, (32, heads))
-    output = torch.full((32, layer.embedding_dim), 0x7F, dtype=torch.uint8)
-    layer._remote_lookup(ids, output.view(torch.float8_e4m3fn))
-    flat = ids.reshape(-1)
-    remote = flat >= resident
-    assert torch.equal(output.view(-1, dim)[remote], raw[flat][remote])
-
-
 def test_cascade_worker_reads_the_disk_tier_from_the_mapped_shards(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A host without a spare card: everything beyond the resident tiers is
-    # read from the checkpoint, and no store card is opened at all.
-    layer = _make_cascade_worker_embedding(monkeypatch, store_devices=None, disk=True)
+    # Everything beyond the resident tiers is read from the checkpoint.
+    layer = _make_cascade_worker_embedding(monkeypatch)
     raw = _fill_worker_shards(layer)
     rows, dim, heads = raw.shape[0], layer.head_dim, layer.ngram_heads
     resident = rows // 2
@@ -2037,9 +1842,6 @@ def test_cascade_worker_reads_the_disk_tier_from_the_mapped_shards(
     layer.bind_remote_placements(
         [PLERemotePlacement(tp_start=0, tp_end=rows, local_rows=resident)]
     )
-    layer.place_store_tier({})
-    assert layer._store_tables == {}
-    assert layer._store_segments == {}
     assert layer._disk_segments == [PLEDiskSegment(start=resident, end=rows)]
 
     tokens = 9
@@ -2052,40 +1854,3 @@ def test_cascade_worker_reads_the_disk_tier_from_the_mapped_shards(
     assert torch.equal(served[on_disk], raw[ids.reshape(-1)][on_disk])
     # Rows the ranks hold themselves are not read, and not written either.
     assert served[~on_disk].eq(0x7F).all()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA store card")
-def test_cascade_worker_serves_store_card_and_disk_in_one_buffer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    layer = _make_cascade_worker_embedding(
-        monkeypatch, store_devices="0", disk=True, reserves="0"
-    )
-    raw = _fill_worker_shards(layer)
-    rows, dim, heads = raw.shape[0], layer.head_dim, layer.ngram_heads
-    resident, store_rows = rows // 2, rows // 4
-    # The card has room for exactly a quarter of the table.
-    monkeypatch.setattr(
-        torch.cuda, "mem_get_info", lambda device: (store_rows * dim, 2**40)
-    )
-
-    layer.bind_remote_placements(
-        [PLERemotePlacement(tp_start=0, tp_end=rows, local_rows=resident)]
-    )
-    layer.place_store_tier({})
-    assert layer._store_tables[0].shape == (store_rows, dim)
-    assert layer._disk_segments == [
-        PLEDiskSegment(start=resident + store_rows, end=rows)
-    ]
-
-    ids = torch.randint(0, rows, (11, heads))
-    output = torch.full((11, layer.embedding_dim), 0x7F, dtype=torch.uint8)
-    layer._remote_lookup(ids, output.view(torch.float8_e4m3fn))
-
-    flat = ids.reshape(-1)
-    served = output.view(-1, dim)
-    remote = flat >= resident
-    # Both outer tiers land in the same buffer, each row from its own tier.
-    assert torch.equal(served[remote], raw[flat][remote])
-    # Rows the ranks hold themselves are not written.
-    assert served[~remote].eq(0x7F).all()

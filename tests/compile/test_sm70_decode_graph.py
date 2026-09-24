@@ -290,53 +290,27 @@ def test_qwen4exp_ple_cascade_starts_the_offload_worker(monkeypatch) -> None:
         "VLLM_PLE_CPU_OFFLOAD",
         "VLLM_PLE_DISK_OFFLOAD",
         "VLLM_SM70_QWEN38_HYBRID_PLE",
-        "VLLM_QWEN4EXP_PLE_STORE_DEVICES",
-        "VLLM_QWEN4EXP_PLE_STORE_RESERVE_GIB",
         "VLLM_QWEN4EXP_PLE_DISK",
     ):
         set_lazy_env(monkeypatch, name, None)
     model_config = SimpleNamespace(hf_text_config=SimpleNamespace(ple_layer_ids=[1]))
-    one_replica = SimpleNamespace(data_parallel_size=1)
 
-    def requested(config=model_config, parallel=one_replica) -> bool:
-        return _qwen4exp_ple_cascade_requested(config, parallel)
-
-    assert not requested()
-    # Reserves belong to store cards.
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_RESERVE_GIB", "8")
-    with pytest.raises(ValueError, match="without VLLM_QWEN4EXP_PLE_STORE_DEVICES"):
-        requested()
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICES", "1,2")
-    with pytest.raises(ValueError, match="one value per card"):
-        requested()
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_RESERVE_GIB", None)
-    assert requested()
-    # The stages report their claims within one data-parallel replica only.
-    with pytest.raises(ValueError, match="data_parallel_size 1"):
-        requested(parallel=SimpleNamespace(data_parallel_size=2))
-
-    # The disk tier alone also starts the cascade: a host with no spare card.
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICES", None)
-    assert not requested()
+    assert not _qwen4exp_ple_cascade_requested(model_config)
+    # The disk tier starts the cascade.
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_DISK", "1")
-    assert requested()
-    # Without store cards the replica count does not matter.
-    assert requested(parallel=SimpleNamespace(data_parallel_size=2))
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_DISK", None)
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICES", "4")
+    assert _qwen4exp_ple_cascade_requested(model_config)
     with pytest.raises(ValueError, match="no PLE layers"):
-        requested(SimpleNamespace(hf_text_config=SimpleNamespace(ple_layer_ids=[])))
+        _qwen4exp_ple_cascade_requested(
+            SimpleNamespace(hf_text_config=SimpleNamespace(ple_layer_ids=[]))
+        )
     # Regression (first cascade boot, 2026-09-15): the PLE offload worker
     # builds a model-less VllmConfig for its isolated world while the variable
     # is inherited; that config must not be refused.
     VllmConfig()
     set_lazy_env(monkeypatch, "VLLM_PLE_DISK_OFFLOAD", "1")
     with pytest.raises(ValueError, match="cannot be combined"):
-        requested()
+        _qwen4exp_ple_cascade_requested(model_config)
     set_lazy_env(monkeypatch, "VLLM_PLE_DISK_OFFLOAD", None)
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_STORE_DEVICES", "-1")
-    with pytest.raises(ValueError, match="non-negative"):
-        requested()
 
     parallel_config = ParallelConfig()
     assert parallel_config._ple_offload_ipc_path == ""

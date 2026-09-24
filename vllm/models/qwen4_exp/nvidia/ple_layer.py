@@ -9,7 +9,7 @@ import resource
 import time
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -76,24 +76,18 @@ from ..common.ple import (
     PLEDiskSegment,
     PLEPlacement,
     PLERemotePlacement,
-    PLEStoreSegment,
     auto_ple_host_budget_bytes,
     available_host_bytes,
     cap_host_budget_bytes,
     copy_ple_embedding_shard_,
     copy_ple_embedding_shard_tiers_,
     kv_cache_bytes_for_max_model_len,
+    plan_ple_disk_segments,
     plan_ple_placement,
-    plan_ple_worker_segments,
     ple_cascade_configured,
-    ple_disk_tier_allowed,
+    ple_disk_mask,
     ple_host_budget_bytes,
     ple_host_reserve_bytes,
-    ple_segment_mask,
-    ple_store_card_bytes,
-    ple_store_devices,
-    ple_store_indices,
-    ple_store_reserves_bytes,
     ple_vram_reserve_bytes,
     total_host_bytes,
 )
@@ -104,7 +98,6 @@ _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
 _MADV_RANDOM = 1
-_MADV_SEQUENTIAL = 2
 _MADV_DONTNEED = 4
 
 logger = init_logger(__name__)
@@ -149,29 +142,6 @@ def _madvise_mapped_tensor(tensor: torch.Tensor, advice: int) -> None:
     ):
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
-
-
-@contextmanager
-def _sequential_shard_reads(shards: Iterable[torch.Tensor | None]):
-    """Give the shard mappings readahead back for one bulk pass over them.
-
-    The gather path wants MADV_RANDOM: it reads scattered rows, and read-around
-    would fetch pages it never touches. Copying a contiguous range wants the
-    opposite, and the difference is not small. Measured on this rig, reading the
-    PLE checkpoint through one mapping: 56 MiB/s under MADV_RANDOM against
-    856 MiB/s under MADV_SEQUENTIAL, so the store tier's 26 GiB took nine
-    minutes instead of half a minute. MADV_WILLNEED does not help here; it
-    prefetches once but leaves the mapping random, so the faults that follow
-    still arrive one page at a time.
-    """
-    touched = [shard for shard in shards if shard is not None]
-    for shard in touched:
-        _madvise_mapped_tensor(shard, _MADV_SEQUENTIAL)
-    try:
-        yield
-    finally:
-        for shard in touched:
-            _madvise_mapped_tensor(shard, _MADV_RANDOM)
 
 
 @triton.jit
@@ -670,7 +640,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self._output_dtype = self.weight_scale.dtype
         self._device_rows = 0
         self._host_rows = 0
-        self._remote_rows = 0
+        self._disk_rows = 0
         self._device_table_ptr = 0
         self.ple_device_table: torch.Tensor | None = None
         self.ple_host_storage: torch.Tensor | None = None
@@ -715,7 +685,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         """Bound a derived host budget by this rank's share of the host memory.
 
         What no longer spills to the host stays on the device or goes to the
-        store tier. A configured budget is checked once before the ranks start
+        disk tier. A configured budget is checked once before the ranks start
         (check_ple_host_share) and used as given.
         """
         host_available = available_host_bytes()
@@ -737,7 +707,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         logger.warning(
             "Qwen4Exp PLE host budget cut from %s to %s: %s host memory "
             "available, %s kept in reserve, shared by %d tensor-parallel ranks. "
-            "The rest of the table stays on the device or goes to the store "
+            "The rest of the table stays on the device or goes to the disk "
             "tier; if the requested context no longer fits, the KV allocator "
             "reports the reachable max_model_len.",
             format_gib(budget),
@@ -749,13 +719,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         return capped
 
     def _plan_placement(self, device: torch.device) -> PLEPlacement:
-        """Place the rows of this rank across the four tiers of the cascade.
+        """Place the rows of this rank across the three tiers of the cascade.
 
         Without the cascade a configured host share leaves the device the rest
         unmeasured, as before. With the cascade the device tier is measured, so
-        the rows beyond device and host are left to the PLE offload worker,
-        which places them on its store cards and the mapped checkpoint once
-        every pipeline stage is set up -- instead of overcommitting the device.
+        the rows beyond device and host are read from the mapped checkpoint on
+        disk -- instead of overcommitting the device.
         """
         row_bytes = self.embedding_dim
         total_rows = self._meta_weight_shape[0]
@@ -781,9 +750,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             row_bytes=row_bytes,
             host_budget_bytes=host_budget,
             vram_budget_bytes=vram_budget,
-            remote_allowed=cascade,
+            disk_allowed=cascade,
         )
-        if placement.remote_rows and not placement.local_rows:
+        if placement.disk_rows and not placement.local_rows:
             # The gathers of both resident tiers always run and read row 0.
             raise RuntimeError(
                 "Qwen4Exp PLE cascade needs at least one resident row per rank; "
@@ -814,21 +783,21 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.ple_host_storage = host_storage
         self._device_rows = placement.vram_rows
         self._host_rows = placement.host_rows
-        self._remote_rows = placement.remote_rows
+        self._disk_rows = placement.disk_rows
         # Cached as a plain int: torch.compile cannot trace data_ptr() inside
         # the forward, the same reason the host pointer is cached below.
         self._device_table_ptr = self.ple_device_table.data_ptr()
         logger.info(
             "Qwen4Exp PLE table placement: %d of %d rows in device memory "
-            "(%s), %d rows in pinned host memory (%s), %d rows left to the "
-            "PLE offload worker (%s)",
+            "(%s), %d rows in pinned host memory (%s), %d rows on the disk "
+            "tier (%s)",
             placement.vram_rows,
             placement.total_rows,
             format_gib(placement.vram_rows * self.embedding_dim),
             placement.host_rows,
             format_gib(placement.host_rows * self.embedding_dim),
-            placement.remote_rows,
-            format_gib(placement.remote_rows * self.embedding_dim),
+            placement.disk_rows,
+            format_gib(placement.disk_rows * self.embedding_dim),
         )
 
     def load_shard(
@@ -843,12 +812,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.materialize_tables()
         assert self.ple_device_table is not None
         assert self.ple_host_storage is not None
-        # The remote rows are loaded by the PLE offload worker.
+        # The disk tier's rows stay in the checkpoint; the PLE offload worker
+        # reads them in place.
         copied = copy_ple_embedding_shard_tiers_(
             [
                 (self._device_rows, self.ple_device_table),
                 (self._host_rows, self.ple_host_storage),
-                (self._remote_rows, None),
+                (self._disk_rows, None),
             ],
             loaded_weight,
             checkpoint_start=checkpoint_start,
@@ -950,11 +920,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         if host_ptr is None:
             self.get_accelerator_weight(input_.device)
             host_ptr = self._accelerator_weight_ptrs[device_index]
-        if remote_rows is None and self._remote_rows:
-            # Ids on an outer tier would read past the resident tables.
+        if remote_rows is None and self._disk_rows:
+            # Ids on the disk tier would read past the resident tables.
             raise RuntimeError(
-                "Qwen4Exp PLE rows are served by the PLE offload worker, but "
-                "the lookup got no rows from it"
+                "Qwen4Exp PLE rows live on the disk tier, but the lookup got "
+                "no rows from the PLE offload worker"
             )
         flat_ids = input_.reshape(-1)
         on_remote = None
@@ -1100,15 +1070,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             embedding_prefix,
             force_fp8_storage=ple_storage_dtype == "float8_e4m3fn",
         )
-        self._store_devices = ple_store_devices()
         self._cascade = ple_cascade_configured()
         self._remote_placements: list[PLERemotePlacement] = []
-        # Worker only, set by place_store_tier once every pipeline stage is
-        # set up: the store segments per card, the card's rows end to end in
-        # one table, and the rest on the disk tier.
-        self._store_tier_placed = False
-        self._store_segments: dict[int, list[PLEStoreSegment]] = {}
-        self._store_tables: dict[int, torch.Tensor] = {}
         self._disk_segments: list[PLEDiskSegment] = []
         self._disk_offload = bool(envs.VLLM_PLE_DISK_OFFLOAD and is_offload_process())
         # The cascade worker keeps the checkpoint shards file-backed like the
@@ -1149,32 +1112,23 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             )
             # The mmap reader is shared, so its thread pool serves the disk
             # lane and the cascade's disk tier alike.
-            if self._disk_offload or ple_disk_tier_allowed():
-                num_threads = envs.VLLM_PLE_DISK_OFFLOAD_NUM_THREADS
-                if num_threads < 0:
-                    raise ValueError(
-                        "VLLM_PLE_DISK_OFFLOAD_NUM_THREADS must be non-negative"
-                    )
-                if num_threads == 0:
-                    num_threads = min(32, os.cpu_count() or 1)
-                self._disk_executor = ThreadPoolExecutor(
-                    max_workers=num_threads,
-                    thread_name_prefix="ple-mmap",
+            num_threads = envs.VLLM_PLE_DISK_OFFLOAD_NUM_THREADS
+            if num_threads < 0:
+                raise ValueError(
+                    "VLLM_PLE_DISK_OFFLOAD_NUM_THREADS must be non-negative"
                 )
-                logger.info(
-                    "Qwen4Exp PLE disk mmap enabled "
-                    "(shards=%d, mmap workers=%d, access=random).",
-                    self.split_ngram_parts,
-                    num_threads,
-                )
-            else:
-                logger.info(
-                    "Qwen4Exp PLE cascade worker: %d checkpoint shards stay "
-                    "file-backed, store devices %s, disk tier %s.",
-                    self.split_ngram_parts,
-                    self._store_devices or "none",
-                    "allowed" if ple_disk_tier_allowed() else "off",
-                )
+            if num_threads == 0:
+                num_threads = min(32, os.cpu_count() or 1)
+            self._disk_executor = ThreadPoolExecutor(
+                max_workers=num_threads,
+                thread_name_prefix="ple-mmap",
+            )
+            logger.info(
+                "Qwen4Exp PLE disk mmap enabled "
+                "(shards=%d, mmap workers=%d, access=random).",
+                self.split_ngram_parts,
+                num_threads,
+            )
         elif _should_use_pinned_host_ple(config):
             if quant_method is None:
                 raise NotImplementedError(
@@ -1233,12 +1187,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         )
 
     def bind_remote_placements(self, placements: list[object]) -> None:
-        """Take the ranks' row geometry inside the cascade worker.
-
-        Nothing is loaded yet: the store cards may run pipeline stages that
-        have not allocated their KV cache, so place_store_tier fills them
-        once every stage is set up.
-        """
+        """Take the ranks' row geometry inside the cascade worker."""
         if not self._cascade or not is_offload_process():
             raise RuntimeError(
                 "remote PLE placements belong to the cascade offload worker"
@@ -1251,175 +1200,43 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     f"{type(placement).__name__} instead of PLERemotePlacement"
                 )
             bound.append(placement)
-        remote_rows = sum(placement.remote_rows for placement in bound)
+        disk_segments = plan_ple_disk_segments(bound)
+        disk_rows = sum(placement.remote_rows for placement in bound)
         logger.info(
             "Qwen4Exp PLE cascade worker: the ranks leave %d rows (%s) to the "
-            "worker; store devices %s are filled once the stages are set up.",
-            remote_rows,
-            format_gib(remote_rows * self.head_dim),
-            self._store_devices or "none",
-        )
-        self._remote_placements = bound
-
-    def place_store_tier(self, stage_claims: dict[int, int | None]) -> None:
-        """Fill the store cards with the remote rows, the disk tier with the rest.
-
-        ``stage_claims`` maps a visible CUDA index to the bytes the pipeline
-        stage on that card still allocates beyond what it holds now, None
-        where the stage ran without memory profiling. Every stage has
-        allocated its KV cache and captured its graphs, so what a card reports
-        free minus that claim and its reserve is the worker's.
-        """
-        if not self._remote_placements:
-            raise RuntimeError(
-                "PLE store tier requested before the ranks registered their placements"
-            )
-        device_count = torch.accelerator.device_count()
-        cards: list[tuple[int, int]] = []
-        for device, reserve in zip(self._store_devices, ple_store_reserves_bytes()):
-            if device >= device_count:
-                raise ValueError(
-                    f"VLLM_QWEN4EXP_PLE_STORE_DEVICES names {device}, which is "
-                    f"not a visible CUDA device ({device_count} visible)"
-                )
-            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-            claim = stage_claims.get(device, 0)
-            if claim is None:
-                raise RuntimeError(
-                    f"Qwen4Exp PLE store device {device} runs a pipeline stage "
-                    "whose activation peak was never measured (fixed "
-                    "--kv-cache-memory); drop that option or that store device."
-                )
-            card_bytes = ple_store_card_bytes(
-                free_bytes=free_bytes,
-                stage_claim_bytes=claim,
-                reserve_bytes=reserve,
-            )
-            logger.info(
-                "Qwen4Exp PLE cascade worker: store device %d has %s of %s "
-                "free, its stage still claims %s, %s stay free -> %s for "
-                "the store tier.",
-                device,
-                format_gib(free_bytes),
-                format_gib(total_bytes),
-                format_gib(claim),
-                format_gib(reserve),
-                format_gib(card_bytes),
-            )
-            cards.append((device, card_bytes // self.head_dim))
-        store_segments, disk_segments = plan_ple_worker_segments(
-            self._remote_placements, cards
-        )
-        disk_rows = sum(segment.end - segment.start for segment in disk_segments)
-        if disk_rows and not ple_disk_tier_allowed():
-            raise RuntimeError(
-                f"Qwen4Exp PLE store cards {self._store_devices} hold only "
-                f"part of the remote rows; {disk_rows} rows "
-                f"({format_gib(disk_rows * self.head_dim)}) remain. Name more "
-                "cards in VLLM_QWEN4EXP_PLE_STORE_DEVICES, lower "
-                "VLLM_QWEN4EXP_PLE_STORE_RESERVE_GIB, or set "
-                "VLLM_QWEN4EXP_PLE_DISK=1 to read them from the checkpoint."
-            )
-        by_device: dict[int, list[PLEStoreSegment]] = {}
-        for segment in store_segments:
-            by_device.setdefault(segment.device, []).append(segment)
-        self._store_tables = {
-            device: self._load_store_table(device, segments)
-            for device, segments in by_device.items()
-        }
-        self._store_segments = by_device
-        self._disk_segments = disk_segments
-        self._store_tier_placed = True
-        logger.info(
-            "Qwen4Exp PLE cascade worker: store tier %s, %d rows (%s) on the "
             "disk tier %s.",
-            {
-                device: format_gib(table.numel())
-                for device, table in self._store_tables.items()
-            },
             disk_rows,
             format_gib(disk_rows * self.head_dim),
             disk_segments,
         )
-
-    def _load_store_table(
-        self, device: int, segments: list[PLEStoreSegment]
-    ) -> torch.Tensor:
-        """Copy one card's store segments from the mapped checkpoint to it."""
-        store_rows = sum(segment.end - segment.start for segment in segments)
-        table = torch.empty(
-            (store_rows, self.head_dim),
-            dtype=torch.uint8,
-            device=torch.device("cuda", device),
-        )
-        started = time.perf_counter()
-        copied = 0
-        with _sequential_shard_reads(self._disk_shards):
-            for segment in segments:
-                destination = table.narrow(
-                    0, segment.offset, segment.end - segment.start
-                )
-                for shard_index, shard in enumerate(self._disk_shards):
-                    assert shard is not None
-                    # Raw bytes: the store card only gathers, the ranks dequantize.
-                    copied += copy_ple_embedding_shard_(
-                        destination,
-                        shard.view(torch.uint8),
-                        checkpoint_start=shard_index * self._disk_shard_size,
-                        tp_start=segment.start,
-                        tp_end=segment.end,
-                    )
-        if copied != store_rows:
-            raise RuntimeError(
-                f"Qwen4Exp PLE store tier loaded {copied} of {store_rows} rows "
-                f"onto store device {device}"
-            )
-        torch.accelerator.synchronize(table.device)
-        for shard in self._disk_shards:
-            assert shard is not None
-            self._release_mapped_pages(shard)
-        logger.info(
-            "Qwen4Exp PLE cascade worker: loaded %d store rows (%s) onto store "
-            "device %d in %.1f s.",
-            store_rows,
-            format_gib(store_rows * self.head_dim),
-            device,
-            time.perf_counter() - started,
-        )
-        return table
+        self._disk_segments = disk_segments
+        self._remote_placements = bound
 
     def _remote_lookup(self, ngram_ids: torch.Tensor, output: torch.Tensor) -> None:
         """Fill the worker's output with the rows the ranks left to it.
 
         One buffer serves every tensor-parallel rank: all segments are
         disjoint, and each rank merges only the slots of ids in its own
-        segments. Each tier writes only the slots of its own ids; the other
-        slots keep whatever the buffer held.
+        segments. The other slots carry whatever the buffer held.
         """
-        if not self._store_tier_placed:
+        if not self._remote_placements:
             raise RuntimeError(
-                "PLE cascade worker received a request before its store tier was placed"
+                "PLE cascade worker received a request before the ranks "
+                "registered their placements"
             )
         output_rows = output.view(torch.uint8).reshape(-1, self.head_dim)
         flat_ids = ngram_ids.reshape(-1)
-        for device, table in self._store_tables.items():
-            segments = self._store_segments[device]
-            on_card = ple_segment_mask(flat_ids, segments)
-            card_ids = flat_ids[on_card]
-            if card_ids.numel() == 0:
-                continue
-            indices = ple_store_indices(card_ids, segments).to(table.device)
-            # Blocking device-to-host copy: the runner starts the asynchronous
-            # copies to the ranks from this pinned buffer right afterwards.
-            output_rows[on_card] = table.index_select(0, indices).cpu()
         if not self._disk_segments:
+            # Every rank holds all of its rows, so the buffer carries none; the
+            # copy and the signal still run so the ranks' waits are exercised.
+            output_rows.zero_()
             return
-        on_disk = ple_segment_mask(flat_ids, self._disk_segments).numpy()
+        on_disk = ple_disk_mask(flat_ids, self._disk_segments).numpy()
         disk_ids = flat_ids.numpy()[on_disk]
         if disk_ids.size == 0:
             return
-        # The slowest tier, read from the mapped checkpoint; only the ids that
-        # belong to it are touched.
+        # Read from the mapped checkpoint; only the ids that belong to the
+        # disk tier are touched.
         output_rows.numpy()[on_disk] = self._gather_mapped_rows(disk_ids)
 
     @staticmethod
@@ -1593,8 +1410,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         They stay in the page cache, so reading them again is a cheap minor
         fault, but a mapped page is one the kernel keeps: with them mapped the
         offload worker held 1.9 GiB of the checkpoint after twelve disk-tier
-        requests, and 11.2 GiB after loading a 25.8 GiB store tier, while the
-        kernel swapped other processes out (2026-09-23). The shards are
+        requests while the kernel swapped other processes out (2026-09-23).
+        The shards are
         private file mappings nobody writes, so the file still holds every
         byte.
 
