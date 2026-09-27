@@ -555,7 +555,6 @@ class FP8QPN8LinearState:
         split_k: int,
         accumulator_chains: int,
         prefetch_codes: bool,
-        dense_weight_ptr: int,
     ) -> None:
         self.codes = codes
         self.group_scales = group_scales
@@ -563,7 +562,6 @@ class FP8QPN8LinearState:
         self.split_k = split_k
         self.accumulator_chains = accumulator_chains
         self.prefetch_codes = prefetch_codes
-        self.dense_weight_ptr = dense_weight_ptr
 
 
 def fp8_qpn8_launch_config(k: int) -> tuple[int, int, bool]:
@@ -615,7 +613,7 @@ def prepare_fp8_qpn8_dense_linear(
         weight.contiguous(), channel_scales
     )
     split_k, accumulator_chains, prefetch_codes = fp8_qpn8_launch_config(k)
-    workspace = get_fp8_qpn8_dense_workspace(k, n, weight.device)
+    register_layer_workspace(layer, get_fp8_qpn8_dense_workspace(k, n, weight.device))
     setattr(
         layer,
         FP8_QPN8_STATE_ATTR,
@@ -626,7 +624,6 @@ def prepare_fp8_qpn8_dense_linear(
             split_k,
             accumulator_chains,
             prefetch_codes,
-            workspace.data_ptr(),
         ),
     )
 
@@ -651,11 +648,9 @@ def apply_prepared_fp8_qpn8_linear(
     out = torch.empty(
         (reshaped_x.shape[0], state.output_size), dtype=x.dtype, device=x.device
     )
-    from vllm import _sm70_ops as sm70_ops
-
-    sm70_ops.fp8_qpn8_dispatch_sm70_out(
+    torch.ops.vllm.sm70_fp8_qpn8_dispatch(
         out,
-        state.dense_weight_ptr,
+        layer.prefix,
         reshaped_x,
         state.codes,
         state.group_scales,
