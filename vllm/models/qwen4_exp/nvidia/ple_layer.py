@@ -1081,6 +1081,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             self._cascade and is_offload_process()
         )
         self._disk_shards: list[torch.Tensor | None] = []
+        self._disk_shard_arrays: list[np.ndarray] = []
+        self._disk_shard_pointers: list[int] = []
         self._disk_mapped_paths: set[str] = set()
         self._release_disk_pages = envs.VLLM_PLE_DISK_RELEASE_PAGES
         self._disk_executor: ThreadPoolExecutor | None = None
@@ -1275,6 +1277,56 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
+    def _compute_ngram_ids_cpu_small(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> torch.Tensor:
+        """Avoid many tiny Torch ops for CPU-offloaded speculative steps."""
+        tokens = input_ids.tolist()
+        starts = query_start_loc.tolist()
+        context = ngram_context.tolist()
+        num_tokens = len(tokens)
+        num_reqs = len(starts) - 1
+        max_seq_len = max(1, max(b - a for a, b in zip(starts, starts[1:])))
+        num_valid_tokens = min(starts[-1], num_tokens)
+        eos = self.eos_token_id
+        packed = [[eos] * (max_seq_len + 2) for _ in range(num_reqs)]
+        for req in range(num_reqs):
+            packed[req][:2] = context[req]
+            begin = min(starts[req], num_valid_tokens)
+            end = min(starts[req + 1], num_valid_tokens)
+            packed[req][2 : 2 + end - begin] = tokens[begin:end]
+
+        multipliers = self.layer_multipliers.tolist()
+        sizes = self.ngram_heads_vocab_sizes.tolist()
+        offsets = self.ngram_heads_offsets.tolist()
+        mask = (1 << 64) - 1
+        sign = 1 << 63
+        full = 1 << 64
+        output: list[int] = []
+        req = 0
+        for pos in range(num_tokens):
+            while req + 1 < num_reqs and pos >= starts[req + 1]:
+                req += 1
+            col = min(max(pos - starts[req], 0), max_seq_len - 1)
+            seq = packed[req]
+            current, previous = seq[col + 2], seq[col + 1]
+            # A preceding EOS resets the history used by the trigram head.
+            previous2 = eos if previous == eos else seq[col]
+            mixed2 = ((current * multipliers[0]) & mask) ^ (
+                (previous * multipliers[1]) & mask
+            )
+            mixed3 = mixed2 ^ ((previous2 * multipliers[2]) & mask)
+            if mixed2 >= sign:
+                mixed2 -= full
+            if mixed3 >= sign:
+                mixed3 -= full
+            output.extend(mixed2 % sizes[h] + offsets[h] for h in range(8))
+            output.extend(mixed3 % sizes[h] + offsets[h] for h in range(8, 16))
+        return torch.tensor(output, dtype=torch.long).reshape(num_tokens, 16)
+
     def compute_ngram_ids(
         self,
         input_ids: torch.Tensor,
@@ -1336,6 +1388,32 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             )
             logger.info_once("SM70 Qwen3.8 fused M=1 PLE ngram-ID path enabled.")
             return output
+
+        if (
+            is_offload_process()
+            and num_tokens <= 16
+            and self.ngram_size == 3
+            and self.heads_per_ngram == 8
+            and self.ngram_heads == 16
+            and self.layer_multipliers.numel() == 3
+            and self.ngram_heads_vocab_sizes.numel() == 16
+            and self.ngram_heads_offsets.numel() == 16
+            and input_ids.device.type == "cpu"
+            and query_start_loc.device.type == "cpu"
+            and ngram_context.device.type == "cpu"
+            and input_ids.dtype in (torch.int32, torch.int64)
+            and query_start_loc.dtype in (torch.int32, torch.int64)
+            and ngram_context.dtype in (torch.int32, torch.int64)
+            and ngram_context.ndim == 2
+            and ngram_context.shape[0] >= num_reqs
+            and ngram_context.shape[1] == 2
+            and self.layer_multipliers.device.type == "cpu"
+            and self.ngram_heads_vocab_sizes.device.type == "cpu"
+            and self.ngram_heads_offsets.device.type == "cpu"
+        ):
+            return self._compute_ngram_ids_cpu_small(
+                input_ids, query_start_loc, ngram_context
+            )
 
         input_ids = input_ids.long()
         query_start_loc = query_start_loc.long()
@@ -1426,12 +1504,46 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     def _gather_mapped_rows(self, flat_ids: np.ndarray) -> np.ndarray:
         """Read the given PLE rows from the mapped checkpoint shards.
 
-        Sorted unique ids per shard keep the mmap reads local, and the shards
-        are read in parallel where a thread pool is configured. Shared by the
-        whole-table disk lane and by the cascade's disk tier.
+        Short requests copy their rows straight from the retained mappings;
+        longer ones read sorted unique ids per shard, which keeps the mmap
+        reads local, and read the shards in parallel where a thread pool is
+        configured. Shared by the whole-table disk lane and by the cascade's
+        disk tier.
         """
         if any(shard is None for shard in self._disk_shards):
             raise RuntimeError("PLE disk lookup started before every shard was loaded")
+        shard_size = self._disk_shard_size
+
+        # Decode moves only a few dozen rows. Per-shard NumPy dispatch and the
+        # thread pool cost more than copying these FP8 rows from their retained
+        # file mappings. Keep the deduplicated, parallel route for prefill.
+        if flat_ids.size <= 128:
+            min_id = int(flat_ids.min())
+            max_id = int(flat_ids.max())
+            if min_id < 0 or max_id >= self.ngram_embedding.org_vocab_size:
+                raise IndexError(
+                    "PLE disk row id out of range: "
+                    f"[{min_id}, {max_id}] for "
+                    f"{self.ngram_embedding.org_vocab_size} rows"
+                )
+            rows = np.empty((flat_ids.size, self.head_dim), dtype=np.uint8)
+            row_bytes = self.head_dim
+            rows_ptr = rows.ctypes.data
+            touched_shards: set[int] = set()
+            for output_row, row_id in enumerate(flat_ids.tolist()):
+                shard_index, local_row = divmod(row_id, shard_size)
+                ctypes.memmove(
+                    rows_ptr + output_row * row_bytes,
+                    self._disk_shard_pointers[shard_index] + local_row * row_bytes,
+                    row_bytes,
+                )
+                touched_shards.add(shard_index)
+            for shard_index in touched_shards:
+                shard = self._disk_shards[shard_index]
+                assert shard is not None
+                self._release_mapped_pages(shard)
+            return rows
+
         sorted_ids, inverse = np.unique(flat_ids, return_inverse=True)
         if sorted_ids[0] < 0 or sorted_ids[-1] >= self.ngram_embedding.org_vocab_size:
             raise IndexError(
@@ -1455,8 +1567,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             shard_index, start, end = task
             shard = self._disk_shards[shard_index]
             assert shard is not None
-            local_ids = sorted_ids[start:end] - shard_index * self._disk_shard_size
-            sorted_output[start:end] = shard.view(torch.uint8).numpy()[local_ids]
+            local_ids = sorted_ids[start:end] - shard_index * shard_size
+            sorted_output[start:end] = self._disk_shard_arrays[shard_index][local_ids]
             self._release_mapped_pages(shard)
 
         executor = getattr(self, "_disk_executor", None)
@@ -1694,6 +1806,14 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 raise RuntimeError(
                     f"PLE disk offload did not load shards: {missing_shards}"
                 )
+            self._disk_shard_arrays = [
+                shard.view(torch.uint8).numpy()
+                for shard in self._disk_shards
+                if shard is not None
+            ]
+            self._disk_shard_pointers = [
+                array.ctypes.data for array in self._disk_shard_arrays
+            ]
             mapped_gib = (
                 sum(
                     shard.numel() * shard.element_size()

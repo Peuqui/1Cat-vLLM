@@ -813,8 +813,9 @@ def _make_disk_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     module._file_backed_shards = True
     module._disk_shards = [None, None]
     module._disk_mapped_paths = set()
-    # The disk lane tests read real file-backed shards, so they can release.
-    module._release_disk_pages = True
+    # Off unless a test maps real file-backed shards: releasing the pages of
+    # anonymous memory would destroy it.
+    module._release_disk_pages = False
     module._disk_shard_size = 4
     module._disk_shard_boundaries = torch.tensor([4], dtype=torch.int64)
     module.head_dim = 2
@@ -920,6 +921,7 @@ def test_ngram_embedding_retains_and_gathers_disk_shards(tmp_path) -> None:
     from safetensors.torch import save_file
 
     module = _make_disk_ngram_embedding_for_load_test()
+    module._release_disk_pages = True
     path = str(tmp_path / "ple.safetensors")
     save_file(
         {
@@ -954,6 +956,60 @@ def test_ngram_embedding_retains_and_gathers_disk_shards(tmp_path) -> None:
     assert module._disk_shards[1] is shard_1
     expected = torch.cat((shard_0, shard_1))[ngram_ids.reshape(-1)]
     assert torch.equal(output, expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("num_rows", [0, 1, 80, 128, 129, 256])
+def test_ngram_embedding_disk_decode_short_gather_matches_prefill(
+    monkeypatch: pytest.MonkeyPatch, num_rows: int
+) -> None:
+    module = _make_disk_ngram_embedding_for_load_test()
+    shard_0 = torch.arange(8, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
+    shard_1 = (
+        torch.arange(8, 16, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
+    )
+    monkeypatch.setattr(
+        ple_module,
+        "_advise_random_file_access",
+        lambda _: "/tmp/test-ple.safetensors",
+    )
+    module.load_weights(
+        [
+            ("ngram_embedding.shard_0.weight", shard_0),
+            ("ngram_embedding.shard_1.weight", shard_1),
+        ]
+    )
+    ngram_ids = (torch.arange(num_rows, dtype=torch.long) * 5 % 8).reshape(-1, 1)
+    output = torch.empty(num_rows, 2, dtype=torch.uint8)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        module._disk_executor = executor
+        module._disk_embedding_lookup(ngram_ids, output)
+    expected = torch.cat((shard_0, shard_1))[ngram_ids.reshape(-1)]
+    assert torch.equal(output, expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("num_rows,bad_id", [(1, -1), (80, 8), (129, 8)])
+def test_ngram_embedding_disk_gather_rejects_invalid_ids(
+    monkeypatch: pytest.MonkeyPatch, num_rows: int, bad_id: int
+) -> None:
+    module = _make_disk_ngram_embedding_for_load_test()
+    shard = torch.zeros(4, 2).to(torch.float8_e4m3fn)
+    monkeypatch.setattr(
+        ple_module,
+        "_advise_random_file_access",
+        lambda _: "/tmp/test-ple.safetensors",
+    )
+    module.load_weights(
+        [
+            ("ngram_embedding.shard_0.weight", shard),
+            ("ngram_embedding.shard_1.weight", shard),
+        ]
+    )
+    ngram_ids = torch.zeros(num_rows, 1, dtype=torch.long)
+    ngram_ids[-1] = bad_id
+    with pytest.raises(IndexError, match="PLE disk row id out of range"):
+        module._disk_embedding_lookup(
+            ngram_ids, torch.empty(num_rows, 2, dtype=torch.uint8)
+        )
 
 
 def test_ngram_embedding_disk_offload_rejects_missing_shard(
@@ -1264,6 +1320,65 @@ def test_ngram_cpu_offload_padding_does_not_overwrite_real_tokens(
     )
 
     torch.testing.assert_close(actual[:2], expected)
+
+
+@pytest.mark.parametrize(
+    ("starts", "num_tokens"),
+    [
+        ([0, 1], 1),
+        ([0, 5], 5),
+        ([0, 3], 5),
+        ([0, 2, 5], 5),
+        ([0, 2, 2, 4], 7),
+        ([0, 16], 16),
+        ([0, 16], 17),
+    ],
+)
+def test_ngram_cpu_small_ids_match_torch_with_eos_and_padding(
+    monkeypatch: pytest.MonkeyPatch,
+    starts: list[int],
+    num_tokens: int,
+) -> None:
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module.ngram_size = 3
+    module.heads_per_ngram = 8
+    module.ngram_heads = 16
+    module.eos_token_id = 248044
+    module.register_buffer("positions_buffer", torch.arange(64))
+    module.register_buffer("padded_buffer", torch.empty(4, 64, dtype=torch.long))
+    module.register_buffer(
+        "layer_multipliers",
+        torch.tensor([3229177723303, 2164907095717, 1840338581269]),
+    )
+    module.register_buffer(
+        "ngram_heads_vocab_sizes",
+        torch.tensor([20000003 + 14 * i for i in range(16)]),
+    )
+    module.register_buffer(
+        "ngram_heads_offsets",
+        torch.tensor([20000003 * i for i in range(16)]),
+    )
+    monkeypatch.setattr(ple_module, "is_offload_process", lambda: True)
+    generator = torch.Generator().manual_seed(20260924)
+    for _ in range(32):
+        input_ids = torch.randint(
+            0, 248050, (num_tokens,), generator=generator, dtype=torch.int32
+        )
+        context = torch.randint(
+            0, 248050, (len(starts) - 1, 2), generator=generator, dtype=torch.int32
+        )
+        input_ids[input_ids % 7 == 0] = module.eos_token_id
+        context[context % 5 == 0] = module.eos_token_id
+        # int16 query offsets exercise the original Torch implementation;
+        # int32 offsets select the short CPU path on otherwise identical data.
+        reference = module.compute_ngram_ids(
+            input_ids, torch.tensor(starts, dtype=torch.int16), context
+        )
+        actual = module.compute_ngram_ids(
+            input_ids, torch.tensor(starts, dtype=torch.int32), context
+        )
+        assert torch.equal(actual, reference)
 
 
 def test_ngram_fp8_cpu_offload_preserves_quantized_output(
@@ -1621,6 +1736,7 @@ def test_one_worker_buffer_merges_into_every_rank_bit_identically(
         raw[index * shard_size : (index + 1) * shard_size].view(torch.float8_e4m3fn)
         for index in range(len(worker._disk_shards))
     ]
+    _retain_shard_views(worker)
 
     scale = torch.tensor([0.0371], dtype=torch.float16, device="cuda")
     monkeypatch.setattr(ple_module, "tensor_model_parallel_all_reduce", lambda t: t)
@@ -1754,6 +1870,16 @@ def test_pinned_host_ple_merge_stays_bit_identical_under_inductor(
         assert torch.equal(compiled(ids, remote), table[ids])
 
 
+def _retain_shard_views(layer: Qwen4ExpNGramEmbedding) -> None:
+    """Keep the shard views load_weights retains for the gathers."""
+    layer._disk_shard_arrays = [
+        shard.view(torch.uint8).numpy() for shard in layer._disk_shards
+    ]
+    layer._disk_shard_pointers = [
+        array.ctypes.data for array in layer._disk_shard_arrays
+    ]
+
+
 def _fill_worker_shards(layer: Qwen4ExpNGramEmbedding) -> torch.Tensor:
     """Give the worker mapped-looking shards and return the whole raw table."""
     rows, dim = layer.ngram_embedding.org_vocab_size, layer.head_dim
@@ -1764,6 +1890,7 @@ def _fill_worker_shards(layer: Qwen4ExpNGramEmbedding) -> torch.Tensor:
         raw[index * shard_size : (index + 1) * shard_size].view(torch.float8_e4m3fn)
         for index in range(len(layer._disk_shards))
     ]
+    _retain_shard_views(layer)
     return raw
 
 
@@ -1813,6 +1940,7 @@ def _map_worker_shards_from_file(
         layer._disk_shards = [
             checkpoint.get_tensor(f"shard_{index}") for index in range(shards)
         ]
+    _retain_shard_views(layer)
     layer._disk_mapped_paths.add(path)
     return raw, path
 

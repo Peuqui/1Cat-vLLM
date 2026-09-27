@@ -36,6 +36,7 @@ class SM70TurboMindLinearState:
     global_scale: float = 0.0
     use_scale_code: bool = False
     padded_output_size: int = 0
+    prescaled_scales: bool = False
     # QPN2 launch configuration (split-K, independent accumulator chains).
     split_k: int = 0
     accumulator_chains: int = 0
@@ -62,6 +63,17 @@ def quant_backend() -> SM70QuantBackend:
 
 def use_turbomind(default_enabled: bool) -> bool:
     return envs.use_sm70_turbomind(default_enabled)
+
+
+def use_batched_gemm_layouts() -> bool:
+    """Prepare compatible batch GEMM layouts once on SM70.
+
+    Format-specific callers validate their own local weights and operators.
+    Model name, quantization label, speculative method/width and max_num_seqs
+    do not restrict this shared policy. Small-M kernels retain their existing
+    packed layouts; larger batches consume prepared TurboMind weights/scales.
+    """
+    return envs.VLLM_SM70_BATCH_GEMM_LAYOUTS and is_exact_sm70_cuda_platform()
 
 
 def forces_marlin() -> bool:
@@ -234,6 +246,7 @@ def _store_state(
     global_scale: float = 0.0,
     use_scale_code: bool = False,
     padded_output_size: int = 0,
+    prescaled_scales: bool = False,
     split_k: int = 0,
     accumulator_chains: int = 0,
 ) -> None:
@@ -250,6 +263,7 @@ def _store_state(
         global_scale=global_scale,
         use_scale_code=use_scale_code,
         padded_output_size=padded_output_size,
+        prescaled_scales=prescaled_scales,
         split_k=split_k,
         accumulator_chains=accumulator_chains,
     )
@@ -358,9 +372,18 @@ def prepare_mxfp4_linear(
     )
 
 
+def _prescale_nvfp4_batch_scales(scales: torch.Tensor) -> bool:
+    """Fold the exact FP4 conversion factor into the existing scale allocation."""
+    if not float(scales.abs().amax()) <= 65504.0 / 16384.0:
+        return False
+    scales.mul_(16384.0)
+    return True
+
+
 def prepare_nvfp4_linear(
     layer: torch.nn.Module,
     interleave_gated_silu: bool = False,
+    prescale_for_batch: bool = False,
 ) -> None:
     if not hasattr(torch.ops._C, "nvfp4_sm70_prepare"):
         raise RuntimeError(
@@ -404,6 +427,13 @@ def prepare_nvfp4_linear(
     tm_weight, tm_scales, meta = sm70_ops.nvfp4_sm70_prepare(
         qweight, scales, NVFP4_GROUP_SIZE, interleave_gated_silu
     )
+    # QPN2 retains its independent compressed scales for M<=32. Larger decode
+    # and prefill use the same scaled TM buffer, without a second allocation.
+    prescaled_scales = bool(
+        prescale_for_batch
+        and hasattr(torch.ops._C, "nvfp4_gemm_sm70_prescaled_out")
+        and _prescale_nvfp4_batch_scales(tm_scales)
+    )
     _store_state(
         layer,
         tm_weight,
@@ -414,6 +444,7 @@ def prepare_nvfp4_linear(
         "nvfp4",
         interleave_gated_silu,
         padded_output_size=padded_output_size,
+        prescaled_scales=prescaled_scales,
     )
 
 
@@ -750,7 +781,12 @@ def apply_prepared_linear(
             state.q_ld,
         )
     elif state.op_kind == "nvfp4":
-        sm70_ops.nvfp4_gemm_sm70_out(
+        op = (
+            sm70_ops.nvfp4_gemm_sm70_prescaled_out
+            if state.prescaled_scales
+            else sm70_ops.nvfp4_gemm_sm70_out
+        )
+        op(
             out,
             reshaped_x,
             state.weight,
@@ -857,7 +893,12 @@ def apply_prepared_fused_silu_and_mul(
             True,
         )
     else:
-        sm70_ops.nvfp4_gemm_sm70_out(
+        op = (
+            sm70_ops.nvfp4_gemm_sm70_prescaled_out
+            if state.prescaled_scales
+            else sm70_ops.nvfp4_gemm_sm70_out
+        )
+        op(
             out,
             reshaped_x,
             state.weight,

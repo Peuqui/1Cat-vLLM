@@ -59,14 +59,14 @@ def _use_sm70_bf16_emulation(config) -> bool:
     enabled = enabled in ("1", "true", "yes", "on")
     if not (enabled and is_bf16 and current_platform.is_cuda()):
         return False
-    # Native BF16 arithmetic arrives with SM80. Volta and Turing both execute
-    # their dense GEMMs in FP16, so both need the range-preserving path -- the
-    # criterion is the missing capability, not one architecture number.
-    # has_device_capability defaults to device 0, which is the wrong question
-    # when architectures are mixed in one box, so ask the device this worker
-    # actually runs on. Measured on Turing: acceptance 1.015 -> 3.353.
-    device_id = torch.cuda.current_device()
-    return not current_platform.has_device_capability(80, device_id=device_id)
+    # Native BF16 arithmetic arrives with SM80. Volta and Turing both run the
+    # draft in FP16, so both need the range-preserving path: the criterion is
+    # the missing capability, not one architecture number. Ask the device this
+    # worker builds on; device 0 of the visibility list may be another card on
+    # a node that mixes architectures.
+    return not current_platform.has_device_capability(
+        80, device_id=torch.accelerator.current_device_index()
+    )
 
 
 @cache
@@ -78,7 +78,12 @@ def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | Non
     """
     if not current_platform.is_cuda():
         return None
-    if not current_platform.has_device_capability(80):
+    # Same rule as _use_sm70_bf16_emulation: ask the worker's own device, not
+    # device 0 of the visibility list; the cache is per process, i.e. per
+    # worker.
+    if not current_platform.has_device_capability(
+        80, device_id=torch.accelerator.current_device_index()
+    ):
         logger.info_once(
             "DFlash2 disables FlashInfer top-k below SM80; using torch.topk."
         )

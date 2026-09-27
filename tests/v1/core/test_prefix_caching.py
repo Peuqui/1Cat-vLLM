@@ -275,9 +275,8 @@ def test_prefill(hash_fn):
     # All blocks should be available.
     assert free_block_queue.num_free_blocks == 10
     # The order should be
+    # [uncached unique_req1 (5), unique_req0 (4)]
     # [unallocated (6, 7, 8, 9, 10)]
-    # [unique_req0 (4)]
-    # [unique_req1 (5)]
     # [common (3, 2, 1)]
     assert [
         b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
@@ -295,7 +294,7 @@ def test_prefill(hash_fn):
     blocks = manager.allocate_slots(
         req2, num_new_tokens, len(computed_blocks.blocks[0]) * 16, computed_blocks
     )
-    assert blocks is not None and blocks.get_block_ids() == ([5],)  # reuse partial [5]
+    assert blocks is not None and blocks.get_block_ids() == ([5],)
 
     # Although we only have 6 free blocks, we have 8 blocks in
     # the free block queue due to lazy removal.
@@ -1180,9 +1179,8 @@ def test_prefill_plp():
     # All blocks should be available.
     assert manager.block_pool.free_block_queue.num_free_blocks == 10
     # The order should be
+    # [uncached unique_req1 (5), unique_req0 (4)]
     # [unallocated (6, 7, 8, 9, 10)]
-    # [unique_req0 (4)]
-    # [unique_req1 (5)]
     # [common (3, 2, 1)]
     assert [
         b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
@@ -3145,6 +3143,86 @@ def test_can_fit_full_sequence_full_attention_still_gates_oversized():
     assert manager.allocate_slots(req, block_size, full_sequence_must_fit=True) is None
 
 
+@pytest.mark.parametrize("hash_size", [4, 8])
+@pytest.mark.parametrize("start", [0, 2])
+@pytest.mark.parametrize("null_indices", [set(), {1, 3}])
+@pytest.mark.parametrize(
+    "mask", [None, [False] * 6, [True, False, True, True, False, True]]
+)
+def test_sparse_store_events_preserve_logical_ranges(
+    hash_size, start, null_indices, mask
+):
+    block_size = 8
+    pool = BlockPool(20, True, hash_size, enable_kv_cache_events=True)
+    lora = LoRARequest("adapter", 7, "/unused")
+    req = make_request(
+        "sparse_events",
+        list(range(48)),
+        hash_size,
+        sha256,
+        mm_positions=[
+            PlaceholderRange(offset=9, length=4),
+            PlaceholderRange(offset=23, length=12),
+        ],
+        mm_hashes=["first-image", "second-image"],
+        cache_salt="event-salt",
+        lora_request=lora,
+    )
+    blocks = [
+        pool.null_block if i in null_indices else pool.get_new_blocks(1)[0]
+        for i in range(6)
+    ]
+    pool.cache_full_blocks(
+        req,
+        blocks,
+        start,
+        6,
+        block_size,
+        3,
+        block_mask=None if mask is None else mask[start:],
+    )
+    events = pool.take_events()
+    expected_indices = [
+        i
+        for i in range(start, 6)
+        if i not in null_indices and (mask is None or mask[i])
+    ]
+    logical_hashes = kv_cache_utils.BlockHashListWithBlockSize(
+        req.block_hashes, hash_size, block_size
+    )
+    actual_indices = []
+    for event in events:
+        assert isinstance(event, BlockStored)
+        assert event.block_hashes
+        assert len(event.token_ids) == block_size * len(event.block_hashes)
+        first = event.token_ids[0] // block_size
+        indices = list(range(first, first + len(event.block_hashes)))
+        actual_indices.extend(indices)
+        assert (
+            event.token_ids
+            == req.all_token_ids[first * block_size : (indices[-1] + 1) * block_size]
+        )
+        assert event.block_hashes == [
+            kv_cache_utils.maybe_convert_block_hash(logical_hashes[i]) for i in indices
+        ]
+        assert event.parent_block_hash == (
+            kv_cache_utils.maybe_convert_block_hash(logical_hashes[first - 1])
+            if first
+            else None
+        )
+        assert event.extra_keys == [
+            kv_cache_utils.generate_block_hash_extra_keys(
+                req, i * block_size, (i + 1) * block_size, 0
+            )[0]
+            for i in indices
+        ]
+        assert event.group_idx == 3
+        assert event.lora_id == 7 and event.lora_name == "adapter"
+    assert actual_indices == expected_indices
+    # Dense runs remain batched; only logical gaps create new events.
+    assert len(events) == sum(i - 1 not in expected_indices for i in expected_indices)
+
+
 def test_free_blocks_reuses_uncached_blocks_before_cached_ones():
     """Uncached blocks must be handed out again before cached ones.
 
@@ -3167,4 +3245,27 @@ def test_free_blocks_reuses_uncached_blocks_before_cached_ones():
     assert [b.block_id for b in handed_out] == [b.block_id for b in uncached]
     assert all(b.block_hash is not None for b in cached), (
         "the cached prefix must still be intact after the allocation"
+    )
+
+
+def test_free_blocks_reuse_first_hands_out_dead_cached_blocks_first():
+    """Cached blocks a sliding window has moved past go out before others.
+
+    Their hash is still set, but no future hit at an alignment boundary the
+    window covers can read them. Freed with ``reuse_first`` they must be
+    handed out before another request's cached prefix.
+    """
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=16)
+
+    prefix = pool.get_new_blocks(2)  # another request's cached prefix
+    dead = pool.get_new_blocks(2)  # cached, but behind the window
+    for blk in prefix + dead:
+        blk.block_hash = make_block_hash_with_group_id(BlockHash(b"x"), 0)
+    pool.free_blocks(prefix)
+    pool.free_blocks(dead, reuse_first=True)
+
+    handed_out = pool.get_new_blocks(2)
+    assert [b.block_id for b in handed_out] == [b.block_id for b in dead]
+    assert all(b.block_hash is not None for b in prefix), (
+        "the other request's prefix must still be intact after the allocation"
     )

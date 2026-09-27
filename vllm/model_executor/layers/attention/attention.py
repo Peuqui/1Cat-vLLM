@@ -15,7 +15,7 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, get_current_vllm_config
-from vllm.config.vllm import VllmConfig
+from vllm.config.vllm import VllmConfig, checkpoint_kv_quant_allowed
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
@@ -280,21 +280,20 @@ class Attention(nn.Module, AttentionLayerBase):
         # The "auto" case is normally resolved upstream in
         # resolve_kv_cache_dtype_string, but we re-apply here defensively in
         # case anything bypassed that path.
+        # The same pre-Ampere policy as VllmConfig applies here, so a
+        # compressed-tensors checkpoint cannot quantize the cache on a device
+        # where the resolve path just refused to.
         kv_cache_scheme = getattr(quant_config, "kv_cache_scheme", None)
-        if kv_cache_scheme is not None and kv_cache_dtype == "auto":
-            # ...and only where a quantized KV cache is actually a win. Below
-            # SM80 there is no FP8 hardware, so honouring a checkpoint's KV
-            # directive costs far more than the weights it ships with; the
-            # same policy gates the resolve path in
-            # vllm.utils.torch_utils.resolve_kv_cache_dtype_string.
-            from vllm.utils.torch_utils import checkpoint_kv_quant_allowed
-
-            if checkpoint_kv_quant_allowed():
-                kv_cache_dtype = "fp8"
-                calculate_kv_scales = False
-                if cache_config is not None:
-                    cache_config.cache_dtype = "fp8"
-                    cache_config.calculate_kv_scales = False
+        if (
+            kv_cache_scheme is not None
+            and kv_cache_dtype == "auto"
+            and checkpoint_kv_quant_allowed(vllm_config)
+        ):
+            kv_cache_dtype = "fp8"
+            calculate_kv_scales = False
+            if cache_config is not None:
+                cache_config.cache_dtype = "fp8"
+                cache_config.calculate_kv_scales = False
 
         # Check if per-head quant scales are required based on kv_cache_scheme
         use_per_head_quant_scales = (

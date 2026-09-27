@@ -1959,9 +1959,9 @@ class GPUModelRunner(
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
-        # Non-last PP rank + spec decode: this step's scheduler_output,
-        # needed for the hybrid-state update after receiving the accepted
-        # tokens from the last rank in sample_tokens().
+        # Non-last PP rank under speculative decoding: this step's
+        # scheduler_output, kept until the sampled matrix arrives from the
+        # last rank in sample_tokens() (hybrid-state update).
         self._pp_nonlast_scheduler_output: SchedulerOutput | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
@@ -9767,18 +9767,16 @@ class GPUModelRunner(
         # and will be discarded, no need to broadcast.
         if self._is_all_reqs_chunked_prefill():
             return
-        # Fork fix (v100-skinny): both branches below size the payload from
-        # sampled_token_ids while the receiver sizes it from its own
-        # input_batch.num_reqs. Same-shaped today because both come from one
-        # scheduler output -- pin it, so a divergence raises here instead of
-        # deadlocking every rank in an unmatched collective.
+        # The receiver sizes its buffer from its own input_batch.num_reqs.
+        # Both come from the same scheduler output; a divergence has to raise
+        # here instead of hanging every rank in an unmatched collective.
         assert sampled_token_ids.shape[0] == self.input_batch.num_reqs
         if self.num_spec_tokens:
-            # Spec decode: non-last ranks derive next-token ids, accepted
-            # counts and the hybrid-state update from the full sampled
-            # matrix. The wire shape must be [num_reqs, num_spec_tokens + 1]
-            # every step (the sampler emits fewer columns in rounds with
-            # fewer/no scheduled drafts), so pad with the rejection
+            # Speculative decoding: the non-last ranks derive the next token
+            # ids, the accepted counts and the hybrid-state update from the
+            # full sampled matrix. The sampler emits fewer columns in rounds
+            # with fewer or no scheduled drafts, so pad to the static wire
+            # shape [num_reqs, num_spec_tokens + 1] with the rejection
             # sampler's -1 placeholder.
             payload = torch.full(
                 (sampled_token_ids.shape[0], self.num_spec_tokens + 1),
@@ -9814,9 +9812,10 @@ class GPUModelRunner(
     def _pp_broadcast_draft_token_ids(self) -> None:
         """Broadcast this step's draft token ids from the last PP stage.
 
-        In async scheduling the scheduler only carries placeholder draft
-        slots, so the real draft values must reach the non-last ranks for
-        their input_ids scatter in the next step."""
+        Under async scheduling the scheduler only carries placeholder draft
+        slots; the non-last ranks need the real draft ids for their
+        input_ids scatter in the next step.
+        """
         pp = get_pp_group()
         assert pp.is_last_rank
         if self._is_all_reqs_chunked_prefill():
@@ -9826,9 +9825,9 @@ class GPUModelRunner(
         if isinstance(drafts, torch.Tensor) and drafts.shape[0] >= num_reqs:
             payload = drafts[:num_reqs].to(dtype=torch.int32).contiguous()
         else:
-            # Drafter skipped or produced list-form drafts: the scheduler
-            # will not schedule GPU-resident spec slots from these, so the
-            # zeros are never read on the receiving rank.
+            # Drafter skipped, or list-form drafts (ngram): the scheduler
+            # schedules no GPU-resident spec slots from these, so the zeros
+            # are never read on the receiving rank.
             payload = torch.zeros(
                 (num_reqs, self.num_spec_tokens),
                 dtype=torch.int32,
@@ -9978,8 +9977,7 @@ class GPUModelRunner(
         if self.num_spec_tokens and not self._is_all_reqs_chunked_prefill():
             self._pp_receive_spec_decode_state(num_reqs)
         else:
-            # `prev_sampled_token_ids` is expected to have shape
-            # [num_reqs, 1].
+            # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
             recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
             # skip for chunked prefill.
             if not self._is_all_reqs_chunked_prefill():

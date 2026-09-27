@@ -282,6 +282,45 @@ def test_nvfp4_warmup_uses_converter_padded_output_size(monkeypatch, compact):
     assert [tuple(call[1].shape) for call in calls] == [(1, 32), (4, 32)]
 
 
+@pytest.mark.parametrize("gated_silu", [False, True])
+def test_nvfp4_warmup_preserves_batch_scale_format(monkeypatch, gated_silu):
+    state = SimpleNamespace(
+        weight=torch.empty((32, 4), dtype=torch.int32),
+        scales=torch.empty((2, 32), dtype=torch.float16),
+        group_size=16,
+        k_ld=32,
+        q_ld=32,
+        output_size=24,
+        padded_output_size=32,
+        op_kind="nvfp4",
+        gated_silu=gated_silu,
+        use_scale_code=False,
+        prescaled_scales=True,
+    )
+    calls = []
+    monkeypatch.setattr(torch.ops._C, "nvfp4_gemm_sm70_out", object(), raising=False)
+
+    def wrong_format(*args):
+        pytest.fail("Shifted scales must use the prescaled batch transform")
+
+    monkeypatch.setattr(warmup.sm70_ops, "nvfp4_gemm_sm70_out", wrong_format)
+    monkeypatch.setattr(
+        warmup.sm70_ops,
+        "nvfp4_gemm_sm70_prescaled_out",
+        lambda *args: calls.append(args),
+    )
+    count = warmup._warmup_fp4_dense_layers([state], [1, 8, 16, 32, 33, 64])
+
+    assert count == 2
+    assert [tuple(call[1].shape) for call in calls] == [(33, 32), (64, 32)]
+    assert [tuple(call[0].shape) for call in calls] == [
+        (33, 32),
+        (64, 32),
+    ]
+    assert all(call[3] is state.scales for call in calls)
+    assert all(call[-1] is False for call in calls)
+
+
 def _nvfp4_moe_layer() -> nn.Module:
     layer = nn.Module()
     layer.sm70_nvfp4_moe = True
@@ -474,6 +513,7 @@ def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):
 
     calls = []
     broadcasts = []
+    imports = []
     barriers = []
 
     def broadcast_object(payload, src):
@@ -500,11 +540,12 @@ def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):
         warmup_layers,
     )
     monkeypatch.setattr(warmup, "_export_lut_bytes", lambda device: (b"lut", 7))
-    monkeypatch.setattr(
-        warmup,
-        "_import_lut_bytes",
-        lambda device, payload: (_ for _ in ()).throw(AssertionError()),
-    )
+
+    def import_lut(device, payload):
+        imports.append((device, payload))
+        return 7
+
+    monkeypatch.setattr(warmup, "_import_lut_bytes", import_lut)
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda device: None)
 
     layers = [(nn.Module(), False)]
@@ -517,6 +558,7 @@ def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):
     assert count == 5
     assert calls == [(layers, [1, 4]), (layers, [1, 4])]
     assert broadcasts == [(b"lut", 0)]
+    assert imports == [(torch.device("cuda:0"), b"lut")]
     assert barriers == [True]
 
 
