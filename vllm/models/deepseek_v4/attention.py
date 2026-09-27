@@ -418,6 +418,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         if not has_deep_gemm():
             # fork: pre-Hopper reference O path -- wo_a.weight is the
             # fp16-dequantized [N, K] matrix (QPN8-blk is_bmm route).
+            if not getattr(self.wo_a, "_qpn8_dequant16", False):
+                raise RuntimeError(
+                    "DeepSeek-V4 O projection without DeepGEMM needs the "
+                    "fp16-dequantized wo_a of the QPN8 block-FP8 route "
+                    "(VLLM_SM70_QPN8_BLK=1); this stage has the FP8 weight."
+                )
             from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
                 _apply_inv_rope_ref,
             )
