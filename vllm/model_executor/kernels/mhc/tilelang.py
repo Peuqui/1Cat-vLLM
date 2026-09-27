@@ -8,33 +8,6 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
-# fork (v100-skinny): torch reference for hc_head under float16. The four
-# streams of an attention-sink row add up past the float16 range; the TileLang
-# hc_head kernel then writes inf, this reference saturates to the float16 max.
-
-
-def saturating_cast(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Cast that stores a value beyond float16 as the largest finite float16
-    instead of inf. The model was trained in bfloat16; its attention-sink rows
-    pass 65504 in the last layers, and an inf there turns the next norm or
-    attention into NaN. See FP16_MAX in tilelang_kernels.py."""
-    if dtype == torch.float16 and tensor.dtype != torch.float16:
-        fp16_max = torch.finfo(torch.float16).max
-        tensor = tensor.clamp(-fp16_max, fp16_max)
-    return tensor.to(dtype)
-
-
-def _hc_head_torch_generic(hs_flat, fn, hc_scale, hc_base, rms_eps, hc_eps):
-    t, hc, hidden = hs_flat.shape
-    x = hs_flat.reshape(t, hc * hidden).to(torch.float32)
-    mixes = x @ fn.t()
-    r = torch.rsqrt(x.square().sum(-1, keepdim=True) / (hc * hidden) + rms_eps)
-    pre = torch.sigmoid(mixes * r * hc_scale[0] + hc_base) + hc_eps
-    out = torch.einsum("tm,tmh->th", pre, hs_flat.to(torch.float32))
-    # Four streams of a sink row add up past float16 before the final norm.
-    return saturating_cast(out, hs_flat.dtype)
-
-
 logger = init_logger(__name__)
 
 
@@ -1145,15 +1118,6 @@ def hc_head_fused_kernel_tilelang(
 ) -> torch.Tensor:
     """Apply the fused hc_head kernel and preserve the activation dtype."""
     activation_dtype = _require_mhc_activation_dtype(hs_flat)
-    if (
-        activation_dtype == torch.float16
-        and current_platform.is_cuda()
-        and not current_platform.has_device_capability(80)
-    ):
-        # fork (v100-skinny): an attention-sink row overflows float16 in the
-        # TileLang kernel (inf); the reference saturates. hc_head runs once per
-        # forward on the last PP stage only.
-        return _hc_head_torch_generic(hs_flat, fn, hc_scale, hc_base, rms_eps, hc_eps)
     num_tokens, hc_mult, hidden_size = hs_flat.shape
     out = torch.empty(
         num_tokens, hidden_size, dtype=activation_dtype, device=hs_flat.device
