@@ -209,18 +209,7 @@ class DSparkDeepseekV4Model(nn.Module):
         return self.embed_tokens(input_ids)
 
     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
-        # Fork fix (v100-skinny): saturate non-finite aux values. The BOS
-        # row is an attention sink whose aux magnitudes exceed the FP16
-        # range under --dtype half (the bf16 DSpark reference has no such
-        # limit); its inf/NaN then poisons EVERY drafter logit through the
-        # softmax over the context KV, collapsing acceptance to ~5 %.
-        # Saturating to the FP16 max mirrors a saturating bf16->fp16 cast:
-        # the sink row stays "very large", nothing turns NaN.
-        # The aux stream arrives in fp32 (mhc_post_fp32); the power-of-two
-        # scale is applied there and the cast to the kernel dtype happens
-        # only afterwards, so the BOS row fits fp16 without saturation.
-        scaled = aux_hidden_states.to(torch.float32) * self.main_proj_input_scale
-        projected = self.main_proj(scaled.to(self.main_norm.weight.dtype))
+        projected = self.main_proj(aux_hidden_states * self.main_proj_input_scale)
         return self.main_norm(projected)
 
     @torch.inference_mode()

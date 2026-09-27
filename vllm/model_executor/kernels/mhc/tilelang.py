@@ -8,72 +8,9 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
-# ---------------------------------------------------------------------------
-# fork (v100-skinny): torch reference implementations of the mHC block.
-# Historic role: fp16 execution path while the TileLang kernels were believed
-# to be bf16-only. Since the 1.3.0 rebase the TileLang kernels are dtype-
-# parameterized (use_fp16) and upstream added the SM70 Triton decode route
-# (backported in kernels/mhc/triton.py), so the public entries below dispatch
-# fp16 into the fast kernels again. These references remain for
-#   (a) mhc_post_fp32 -- the DSpark aux-hidden-state extraction reads the
-#       post reconstruction WITHOUT the final fp16 cast (BOS attention-sink
-#       row exceeds 65504 and poisoned every draft logit), and
-#   (b) numerics debugging against the kernel paths.
-# Math mirrors kernels/mhc/torch.py, fp32 internally.
-# ---------------------------------------------------------------------------
-
-
-def _mhc_pre_torch_generic(
-    residual,
-    fn,
-    hc_scale,
-    hc_base,
-    rms_eps,
-    hc_pre_eps,
-    hc_sinkhorn_eps,
-    hc_post_mult_value,
-    sinkhorn_repeat,
-    norm_weight=None,
-    norm_eps=1e-6,
-):
-    hc_mult, hidden = residual.shape[-2], residual.shape[-1]
-    outer = residual.shape[:-2]
-    rf = residual.reshape(-1, hc_mult, hidden)
-    t = rf.shape[0]
-    x = rf.reshape(t, hc_mult * hidden).to(torch.float32)
-    mixes = x @ fn.t()
-    sqrsum = x.square().sum(-1, keepdim=True)
-    mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden) + rms_eps)
-    pre = (
-        torch.sigmoid(mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + hc_pre_eps
-    )
-    post = (
-        torch.sigmoid(
-            mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1]
-            + hc_base[hc_mult : 2 * hc_mult]
-        )
-        * hc_post_mult_value
-    )
-    comb = mixes[:, 2 * hc_mult :].view(t, hc_mult, hc_mult) * hc_scale[2] + hc_base[
-        2 * hc_mult :
-    ].view(1, hc_mult, hc_mult)
-    comb = torch.softmax(comb, -1) + hc_sinkhorn_eps
-    comb = comb / (comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
-    for _ in range(sinkhorn_repeat - 1):
-        comb = comb / (comb.sum(-1, keepdim=True) + hc_sinkhorn_eps)
-        comb = comb / (comb.sum(-2, keepdim=True) + hc_sinkhorn_eps)
-    li = torch.sum(pre.unsqueeze(-1) * rf.to(torch.float32), dim=1)
-    if norm_weight is not None:
-        # vLLM RMSNorm semantics: fp32 normalize, cast, then weight.
-        li = li * torch.rsqrt(li.square().mean(-1, keepdim=True) + norm_eps)
-        li = li.to(residual.dtype) * norm_weight.to(residual.dtype)
-    else:
-        li = li.to(residual.dtype)
-    return (
-        post.view(*outer, hc_mult, 1),
-        comb.view(*outer, hc_mult, hc_mult),
-        li.view(*outer, hidden),
-    )
+# fork (v100-skinny): torch reference for hc_head under float16. The four
+# streams of an attention-sink row add up past the float16 range; the TileLang
+# hc_head kernel then writes inf, this reference saturates to the float16 max.
 
 
 def saturating_cast(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -85,26 +22,6 @@ def saturating_cast(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         fp16_max = torch.finfo(torch.float16).max
         tensor = tensor.clamp(-fp16_max, fp16_max)
     return tensor.to(dtype)
-
-
-def _mhc_post_torch_generic(x, residual, post_layer_mix, comb_res_mix, out_dtype=None):
-    mixed = torch.einsum(
-        "...ij,...ih->...jh", comb_res_mix.to(torch.float32), residual.to(torch.float32)
-    )
-    post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
-    return saturating_cast(mixed + post_term, out_dtype or residual.dtype)
-
-
-def mhc_post_fp32(x, residual, post_layer_mix, comb_res_mix):
-    """Fork addition (v100-skinny): the mHC post reconstruction WITHOUT
-    the final cast to the activation dtype. The DSpark aux-hidden-state
-    extraction reads it: under fp16 the BOS row (attention sink) exceeds
-    65504 at that cast and poisoned every draft logit through the
-    drafter's context KV. The target itself never needs the BOS row of
-    its last layers, so it was unaffected. Same math as the fp16 path."""
-    return _mhc_post_torch_generic(
-        x, residual, post_layer_mix, comb_res_mix, out_dtype=torch.float32
-    )
 
 
 def _hc_head_torch_generic(hs_flat, fn, hc_scale, hc_base, rms_eps, hc_eps):
@@ -1231,14 +1148,11 @@ def hc_head_fused_kernel_tilelang(
     if (
         activation_dtype == torch.float16
         and current_platform.is_cuda()
-        and torch.cuda.get_device_capability(torch.accelerator.current_device_index())
-        < (8, 0)
+        and not current_platform.has_device_capability(80)
     ):
-        # fork (v100-skinny): the hc_head TileLang codegen crashes on
-        # pre-Ampere targets (verified on SM70 AND SM75: tvm-ffi raises
-        # during BuildTileLangCUDA and the exception path segfaults).
-        # hc_head runs once per forward on the last PP stage only, so the
-        # proven torch reference -- the production path to date -- stays.
+        # fork (v100-skinny): an attention-sink row overflows float16 in the
+        # TileLang kernel (inf); the reference saturates. hc_head runs once per
+        # forward on the last PP stage only.
         return _hc_head_torch_generic(hs_flat, fn, hc_scale, hc_base, rms_eps, hc_eps)
     num_tokens, hc_mult, hidden_size = hs_flat.shape
     out = torch.empty(

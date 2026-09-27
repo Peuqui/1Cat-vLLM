@@ -1,11 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-#
-# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.2.2
-# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
-# Changes: adds a chain-MTP fast metadata build
-# (VLLM_SM70_GDN_CHAIN_SPEC_FAST_BUILD, -1.4 ms/step, byte-identical
-# output).
 """Backend for GatedDeltaNet attention."""
 
 import json
@@ -1592,14 +1586,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
             non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
             num_zero_len = (non_spec_query_lens_cpu == 0).sum().item()
-            # Chain-MTP reuses the ddtree all-spec fast build (identical
-            # construction for linear chains; skips the nonzero/mask storm
-            # in build_gdn_spec_decode_state_contract). Env-gated for A/B.
-            chain_fast = envs.VLLM_SM70_GDN_CHAIN_SPEC_FAST_BUILD and bool(
-                torch.all(spec_sequence_masks_cpu).item()
-            )
             pure_ddtree_spec_fast_path_candidate = (
-                (ddtree_parent_ids is not None or chain_fast)
+                ddtree_parent_ids is not None
                 and num_spec_decodes > 0
                 and non_spec_query_lens_cpu.size(0) == num_zero_len
             )

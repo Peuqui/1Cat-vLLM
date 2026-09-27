@@ -18,11 +18,9 @@ from vllm.distributed import (
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_fused_post_pre_tilelang,
-    mhc_post_fp32,
     mhc_post_tilelang,
     mhc_pre_broadcast_tilelang,
     mhc_pre_tilelang,
-    saturating_cast,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -1135,16 +1133,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 residual,
             )
             if layer_idx + 1 in self.aux_hidden_state_layers:
-                # Fork fix (v100-skinny): reconstruct in fp32 for the aux
-                # stream (see mhc_post_fp32); the stage output keeps the
-                # activation dtype as before.
-                reconstruction32 = mhc_post_fp32(
+                reconstruction = mhc_post_tilelang(
                     hidden_states, residual, post_mix, res_mix
                 )
-                aux_hidden_states.append(reconstruction32.mean(dim=1))
-                final_aux_reconstruction = saturating_cast(
-                    reconstruction32, hidden_states.dtype
-                )
+                aux_hidden_states.append(reconstruction.mean(dim=1))
+                final_aux_reconstruction = reconstruction
         if layer is not None:
             if self.end_layer in self.aux_hidden_state_layers:
                 assert final_aux_reconstruction is not None

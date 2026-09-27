@@ -223,7 +223,6 @@ if TYPE_CHECKING:
     VLLM_SM70_QPN8_TWOOP: bool = False
     VLLM_SM70_QPN8_CHUNK_MAX: int = 96
     VLLM_SM70_QPN8_MT2: bool = True
-    VLLM_SM70_GDN_CHAIN_SPEC_FAST_BUILD: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY: str | None = None
     VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M: int = 1024
@@ -2006,10 +2005,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_SM70_QPN8_CHUNK_MAX", "96")
     ),
     "VLLM_SM70_QPN8_MT2": lambda: os.getenv("VLLM_SM70_QPN8_MT2", "1") == "1",
-    "VLLM_SM70_GDN_CHAIN_SPEC_FAST_BUILD": lambda: os.getenv(
-        "VLLM_SM70_GDN_CHAIN_SPEC_FAST_BUILD", "0"
-    )
-    == "1",
     # Reuse the already resident QPN2 code/scale layout for bounded-workspace
     # FP16 large-M prefill. M<=8 decode and speculative verification remain on
     # QPN2. This stays opt-in until full-model speed and quality gates pass.

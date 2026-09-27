@@ -9829,50 +9829,7 @@ class GPUModelRunner(
                 "PP speculative decoding: this non-last rank has no stashed "
                 "scheduler_output for the hybrid-state update."
             )
-        if current_platform.is_device_capability((7, 5)):
-            # SM75 stage: the upstream GDN layers roll their speculative
-            # states forward inside their own forward, driven by the
-            # num_accepted_tokens metadata — only the buffers feeding that
-            # metadata must be filled here. The fork's align postprocess
-            # would shuffle states it does not own.
-            num_r = self.input_batch.num_reqs
-            self.num_accepted_tokens.gpu[:num_r] = valid_counts
-            self.spec_state_slot_selectors.gpu[:num_r] = valid_counts
-            self.input_batch.num_accepted_tokens_cpu_tensor[:num_r].copy_(
-                valid_counts, non_blocking=True
-            )
-            self.input_batch.spec_num_accepted_tokens_cpu_tensor[:num_r].copy_(
-                valid_counts, non_blocking=True
-            )
-            # 1.5.0 accepted-count contract (2026-09-05): the next
-            # _prepare_inputs no longer reads the InputBatch tensors above.
-            # _sync_mamba_accepted_token_state rebuilds them from the
-            # runner-owned snapshot (num_accepted_tokens.cpu /
-            # spec_state_slot_selectors.cpu) plus the req-id row map — and
-            # writes 1 for every request it cannot find there. Without the
-            # three lines below, rank 0 of a PP deployment therefore fed
-            # num_accepted_tokens == 1 into every sm75 GDN layer after each
-            # speculative step: the recurrent state resumed from slot 0
-            # (state after the FIRST verifier token) and the conv window was
-            # never rolled, so all accepted draft tokens were missing from
-            # the 38 stage-0 GDN states while the token stream carried them.
-            # Symptom: fluent but corrupted output under MTP with PP only
-            # (fused words, dropped tokens, English fragments); greedy k>0
-            # differed from greedy k=0. Without PP (TP1/TP2 on either card
-            # class) greedy k>0 was byte-identical to k=0. Mirrors the
-            # non-align branch of _update_states_after_model_execute.
-            self.num_accepted_tokens.cpu[:num_r].copy_(valid_counts, non_blocking=True)
-            self.spec_state_slot_selectors.cpu[:num_r].copy_(
-                valid_counts, non_blocking=True
-            )
-            self._mamba_accepted_token_state_rows = {
-                req_id: (i, self.requests[req_id])
-                for i, req_id in enumerate(self.input_batch.req_ids[:num_r])
-            }
-            if self.num_accepted_tokens_event is not None:
-                self.num_accepted_tokens_event.record()
-        else:
-            self._update_states_after_model_execute(sampled, scheduler_output)
+        self._update_states_after_model_execute(sampled, scheduler_output)
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
