@@ -23,10 +23,9 @@ chunk's experts are the local ones, everything else is masked out via
 the per-chunk partial sums are accumulated.
 """
 
-import os
-
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -51,7 +50,7 @@ logger = init_logger(__name__)
 # lookup indices inside break_fp4_bytes (8 bytes per weight element), so a
 # chunk of 4 costs roughly 1.7 GB on DeepSeek-V4-Flash geometry -- small
 # enough to survive next to a KV cache sized at gpu_memory_utilization.
-_EMULATION_CHUNK = int(os.environ.get("VLLM_SM70_NVFP4_EMU_CHUNK", "4"))
+_EMULATION_CHUNK = envs.VLLM_SM70_NVFP4_EMU_CHUNK
 
 
 class Nvfp4QuantizationEmulationTritonExperts(TritonExperts):
@@ -185,12 +184,18 @@ class Nvfp4QuantizationEmulationTritonExperts(TritonExperts):
             chunk_ids = selected_experts[start : start + _EMULATION_CHUNK]
 
             w1_dequant = self._dequantize_experts(
-                w1, self.w1_scale_val, self.quant_config.g1_alphas,
-                chunk_ids, compute_dtype,
+                w1,
+                self.w1_scale_val,
+                self.quant_config.g1_alphas,
+                chunk_ids,
+                compute_dtype,
             )
             w2_dequant = self._dequantize_experts(
-                w2, self.w2_scale_val, self.quant_config.g2_alphas,
-                chunk_ids, compute_dtype,
+                w2,
+                self.w2_scale_val,
+                self.quant_config.g2_alphas,
+                chunk_ids,
+                compute_dtype,
             )
 
             # Chunk-as-expert-parallel-shard: experts outside the chunk map to

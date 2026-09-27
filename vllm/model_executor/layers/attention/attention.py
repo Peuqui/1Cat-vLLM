@@ -1,12 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-#
-# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.2.2
-# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
-# Changes: applies the KV-dtype policy to the compressed-tensors re-apply
-# path -- a checkpoint's kv_cache_scheme describes how its WEIGHTS were
-# made and is no longer treated as permission to quantize the KV cache
-# below SM80 (escape hatch VLLM_SM70_ALLOW_CKPT_KV_QUANT=1).
 
 from typing import TYPE_CHECKING, Any
 

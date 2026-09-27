@@ -196,6 +196,36 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QPN2_SHARED_SCALES: bool = True
     VLLM_SM70_NVFP4_QPN2_M16_NATIVE: bool = True
     VLLM_SM70_NVFP4_QPN2_PACK: str = "auto"
+    # Fork switches (v100-skinny); registered so they enter the compile factors.
+    VLLM_SKINNY_NVFP4: bool = False
+    VLLM_SKINNY_NVFP4_SRC: str | None = None
+    VLLM_SKINNY_MAX_M: int = 64
+    VLLM_SKINNY_QPN: bool = True
+    VLLM_SKINNY_DROP_CT: bool = True
+    VLLM_SKINNY_QPN2: bool = True
+    VLLM_SKINNY_DENSE_PREFILL: bool = True
+    VLLM_SKINNY_ROUTE_COUNT_FILE: str | None = None
+    VLLM_SKINNY_LMHEAD: bool = False
+    VLLM_SKINNY_LMHEAD_NATIVE: str = ""
+    VLLM_SKINNY_QPN_LMHEAD: bool = True
+    VLLM_SKINNY_FUSED_ARGMAX: bool = False
+    VLLM_SKINNY_MXFP4_SCALES: bool = True
+    VLLM_SM70_NVFP4_MOE_SKINNY: bool = True
+    VLLM_SM70_NVFP4_MOE_GROUPED_MAX_TOKENS: int = 512
+    VLLM_SM70_NVFP4_MOE_QPN_CFG: str = "16,1,8,1"
+    VLLM_SM70_NVFP4_EMU_CHUNK: int = 4
+    VLLM_SM70_QPN8_BLK: bool = True
+    VLLM_SM70_QPN8_BLK_CFG: str = "16,3"
+    VLLM_SM70_QPN8_BLK_WMMA_MAX: int = 256
+    VLLM_SM70_MODELOPT: bool = True
+    VLLM_SM70_FP8_REFERENCE: bool = True
+    VLLM_SM70_QPN8: bool = True
+    VLLM_SM70_QPN8_TWOOP: bool = False
+    VLLM_SM70_QPN8_CHUNK_MAX: int = 96
+    VLLM_SM70_QPN8_MT2: bool = True
+    VLLM_SM70_GDN_CHAIN_SPEC_FAST_BUILD: bool = False
+    VLLM_TRITON_3D_SPEC: bool = True
+    VLLM_TRITON_SOFTMAX_SEGMENTS: int = 64
     VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY: str | None = None
     VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M: int = 1024
@@ -1935,6 +1965,57 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "auto" packs from M=7 on Turing and M=8 on Volta, "0" never, "1" always.
     # Bit-identical either way; kept out of the compile factors for that reason.
     "VLLM_SM70_NVFP4_QPN2_PACK": lambda: os.getenv("VLLM_SM70_NVFP4_QPN2_PACK", "auto"),
+    # Fork switches (v100-skinny). Registered so that each one enters the
+    # torch.compile cache key: they change the traced graph, and an
+    # unregistered switch let a cached graph of the other path load.
+    "VLLM_SKINNY_NVFP4": lambda: os.getenv("VLLM_SKINNY_NVFP4", "0") == "1",
+    "VLLM_SKINNY_NVFP4_SRC": lambda: os.getenv("VLLM_SKINNY_NVFP4_SRC"),
+    "VLLM_SKINNY_MAX_M": lambda: int(os.getenv("VLLM_SKINNY_MAX_M", "64")),
+    "VLLM_SKINNY_QPN": lambda: os.getenv("VLLM_SKINNY_QPN", "1") == "1",
+    "VLLM_SKINNY_DROP_CT": lambda: os.getenv("VLLM_SKINNY_DROP_CT", "1") == "1",
+    "VLLM_SKINNY_QPN2": lambda: os.getenv("VLLM_SKINNY_QPN2", "1") == "1",
+    "VLLM_SKINNY_DENSE_PREFILL": lambda: os.getenv("VLLM_SKINNY_DENSE_PREFILL", "1")
+    == "1",
+    "VLLM_SKINNY_ROUTE_COUNT_FILE": lambda: os.getenv("VLLM_SKINNY_ROUTE_COUNT_FILE"),
+    "VLLM_SKINNY_LMHEAD": lambda: os.getenv("VLLM_SKINNY_LMHEAD", "0") == "1",
+    "VLLM_SKINNY_LMHEAD_NATIVE": lambda: os.getenv("VLLM_SKINNY_LMHEAD_NATIVE", ""),
+    "VLLM_SKINNY_QPN_LMHEAD": lambda: os.getenv("VLLM_SKINNY_QPN_LMHEAD", "1") == "1",
+    "VLLM_SKINNY_FUSED_ARGMAX": lambda: os.getenv("VLLM_SKINNY_FUSED_ARGMAX", "0")
+    == "1",
+    "VLLM_SKINNY_MXFP4_SCALES": lambda: os.getenv("VLLM_SKINNY_MXFP4_SCALES", "1")
+    == "1",
+    "VLLM_SM70_NVFP4_MOE_SKINNY": lambda: os.getenv("VLLM_SM70_NVFP4_MOE_SKINNY", "1")
+    == "1",
+    "VLLM_SM70_NVFP4_MOE_GROUPED_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_MAX_TOKENS", "512")
+    ),
+    "VLLM_SM70_NVFP4_MOE_QPN_CFG": lambda: os.getenv(
+        "VLLM_SM70_NVFP4_MOE_QPN_CFG", "16,1,8,1"
+    ),
+    "VLLM_SM70_NVFP4_EMU_CHUNK": lambda: int(
+        os.getenv("VLLM_SM70_NVFP4_EMU_CHUNK", "4")
+    ),
+    "VLLM_SM70_QPN8_BLK": lambda: os.getenv("VLLM_SM70_QPN8_BLK", "1") == "1",
+    "VLLM_SM70_QPN8_BLK_CFG": lambda: os.getenv("VLLM_SM70_QPN8_BLK_CFG", "16,3"),
+    "VLLM_SM70_QPN8_BLK_WMMA_MAX": lambda: int(
+        os.getenv("VLLM_SM70_QPN8_BLK_WMMA_MAX", "256")
+    ),
+    "VLLM_SM70_MODELOPT": lambda: os.getenv("VLLM_SM70_MODELOPT", "1") == "1",
+    "VLLM_SM70_FP8_REFERENCE": lambda: os.getenv("VLLM_SM70_FP8_REFERENCE", "1") == "1",
+    "VLLM_SM70_QPN8": lambda: os.getenv("VLLM_SM70_QPN8", "1") == "1",
+    "VLLM_SM70_QPN8_TWOOP": lambda: os.getenv("VLLM_SM70_QPN8_TWOOP", "0") == "1",
+    "VLLM_SM70_QPN8_CHUNK_MAX": lambda: int(
+        os.getenv("VLLM_SM70_QPN8_CHUNK_MAX", "96")
+    ),
+    "VLLM_SM70_QPN8_MT2": lambda: os.getenv("VLLM_SM70_QPN8_MT2", "1") == "1",
+    "VLLM_SM70_GDN_CHAIN_SPEC_FAST_BUILD": lambda: os.getenv(
+        "VLLM_SM70_GDN_CHAIN_SPEC_FAST_BUILD", "0"
+    )
+    == "1",
+    "VLLM_TRITON_3D_SPEC": lambda: os.getenv("VLLM_TRITON_3D_SPEC", "1") != "0",
+    "VLLM_TRITON_SOFTMAX_SEGMENTS": lambda: int(
+        os.getenv("VLLM_TRITON_SOFTMAX_SEGMENTS", "64")
+    ),
     # Reuse the already resident QPN2 code/scale layout for bounded-workspace
     # FP16 large-M prefill. M<=8 decode and speculative verification remain on
     # QPN2. This stays opt-in until full-model speed and quality gates pass.

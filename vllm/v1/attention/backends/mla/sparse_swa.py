@@ -113,9 +113,7 @@ def _needs_triton_sparse_swa() -> bool:
     """
     if current_platform.is_rocm():
         return True
-    return current_platform.is_cuda() and not current_platform.has_device_capability(
-        90
-    )
+    return current_platform.is_cuda() and not current_platform.has_device_capability(90)
 
 
 class DeepseekSparseSWABackend(AttentionBackend):
@@ -513,9 +511,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             or _needs_triton_sparse_swa()
             or current_platform.is_xpu()
             or (
-                # Fork fix (v100-skinny): worker-local capability.
                 current_platform.is_cuda()
-                and torch.cuda.get_device_capability(torch.cuda.current_device()) == (7, 0)
+                and current_platform.is_device_capability((7, 0))
             )
         ):
             return out

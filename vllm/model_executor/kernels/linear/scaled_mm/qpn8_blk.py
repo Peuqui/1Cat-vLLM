@@ -17,11 +17,10 @@ vllm/model_executor/layers/quantization/modelopt.py (lazy imports: modelopt
 imports this package's __init__, so a top-level import would be circular).
 """
 
-import os as _os
-
 import torch
 from torch.library import custom_op as _custom_op
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel import (
     Fp8BlockScaledMMLinearKernel,
@@ -29,19 +28,18 @@ from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel impo
 
 logger = init_logger(__name__)
 
-_SM70_QPN8_BLK = _os.environ.get("VLLM_SM70_QPN8_BLK", "1") == "1"
+_SM70_QPN8_BLK = envs.VLLM_SM70_QPN8_BLK
 # Same encoding as the per-tensor path: key splitk*10+nacc, +2 on nacc
 # selects the fast decoder. split16/fast is the measured frontier on the
 # production shapes; stash() falls back when K/16 does not divide.
-_SM70_QPN8_BLK_CFG = tuple(
-    int(v) for v in _os.environ.get("VLLM_SM70_QPN8_BLK_CFG", "16,3").split(","))
+_SM70_QPN8_BLK_CFG = tuple(int(v) for v in envs.VLLM_SM70_QPN8_BLK_CFG.split(","))
 # Internal M-band frontier (benchmarks/fp8_blk_backend_bench.py sweep,
 # DeepSeek attention shapes): native <=8, MT2 <=16, WMMA tiles up to this
 # bound, transient dequant + cuBLAS hgemm above it. The wmma/dequant curves
 # cross between M=256 and M=512 on every shape with <20% between them, so
 # the measured-winner boundary 256 is used.
-_SM70_QPN8_BLK_WMMA_MAX = int(
-    _os.environ.get("VLLM_SM70_QPN8_BLK_WMMA_MAX", "256"))
+_SM70_QPN8_BLK_WMMA_MAX = int(envs.VLLM_SM70_QPN8_BLK_WMMA_MAX)
+
 
 def qpn8_blk_enabled() -> bool:
     """Gate shared with Fp8Config.get_min_capability (fork fp8.py patch)."""
@@ -53,21 +51,43 @@ _blk_census_seen: set = set()
 
 
 @_custom_op("sm70_fp8::qpn8_blk_linear", mutates_args=())
-def _qpn8_blk_linear(x: torch.Tensor, codes: torch.Tensor,
-                     bscale: torch.Tensor, n: int, k: int, bn: int, bk: int,
-                     splitk: int, nacc: int) -> torch.Tensor:
+def _qpn8_blk_linear(
+    x: torch.Tensor,
+    codes: torch.Tensor,
+    bscale: torch.Tensor,
+    n: int,
+    k: int,
+    bn: int,
+    bk: int,
+    splitk: int,
+    nacc: int,
+) -> torch.Tensor:
     from vllm.model_executor.kernels.linear.nvfp4.marlin import _get_skinny_ext
+
     ext = _get_skinny_ext()
     m = x.shape[0]
     use_wmma = (k % 128 == 0) and m <= _SM70_QPN8_BLK_WMMA_MAX
     _ck = (int(k), int(n), int(m))
     if _ck not in _blk_census_seen:
         _blk_census_seen.add(_ck)
-        _rt = ("qpn8-blk" if m <= 8 else "qpn8-blk-mt2" if m <= 16
-               else "qpn8-blk-wmma" if use_wmma else "qpn8-blk-dequant")
-        logger.info("QPN8_BLK_CENSUS_RUN K=%d N=%d M=%d route=%s split=%d "
-                    "nacc=%d", int(k), int(n), int(m), _rt, int(splitk),
-                    int(nacc))
+        _rt = (
+            "qpn8-blk"
+            if m <= 8
+            else "qpn8-blk-mt2"
+            if m <= 16
+            else "qpn8-blk-wmma"
+            if use_wmma
+            else "qpn8-blk-dequant"
+        )
+        logger.info(
+            "QPN8_BLK_CENSUS_RUN K=%d N=%d M=%d route=%s split=%d nacc=%d",
+            int(k),
+            int(n),
+            int(m),
+            _rt,
+            int(splitk),
+            int(nacc),
+        )
     if m <= 8:
         return ext.gemm_qpn8_blk(x, codes, bscale, n, bn, bk, splitk, nacc)
     if m <= 16:
@@ -106,9 +126,11 @@ class QPN8Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
         # QPN8 cubin is Volta-only) dequantizes to fp16 at load and runs
         # cuBLAS -- the RTX stages of the heterogeneous grid have the VRAM
         # headroom for that, and every PP stage carries block-FP8 attention.
-        cap = torch.cuda.get_device_capability(torch.cuda.current_device())
-        if cap not in ((7, 0), (7, 5)):
-            return False, f"sm{cap[0]}{cap[1]} is not sm70/sm75"
+        from vllm.platforms import current_platform
+
+        cap = current_platform.get_device_capability()
+        if cap is None or tuple(cap) not in ((7, 0), (7, 5)):
+            return False, f"{cap} is not sm70/sm75"
         return True, None
 
     @classmethod
@@ -128,18 +150,26 @@ class QPN8Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
             _sm70_qpn8_prepack,
             _sm70_qpn8_unpack,
         )
+
         params = self._get_layer_params(layer)
         w8 = params.weight.data
         n, k = w8.shape
         bn, bk = self.weight_group_shape
-        scale = (params.weight_scale
-                 if params.weight_scale_inv is None else params.weight_scale_inv)
+        scale = (
+            params.weight_scale
+            if params.weight_scale_inv is None
+            else params.weight_scale_inv
+        )
+        assert scale is not None, "block-FP8 layer without a weight scale"
         bscale = scale.data.detach().float().contiguous()
-        if bscale.dim() != 2 or bscale.shape != ((n + bn - 1) // bn,
-                                                (k + bk - 1) // bk):
+        if bscale.dim() != 2 or bscale.shape != (
+            (n + bn - 1) // bn,
+            (k + bk - 1) // bk,
+        ):
             raise ValueError(
                 f"QPN8-blk: scale raster {tuple(bscale.shape)} does not match "
-                f"weights {n}x{k} at block [{bn},{bk}]")
+                f"weights {n}x{k} at block [{bn},{bk}]"
+            )
 
         if getattr(layer, "is_bmm", False):
             # is_bmm layers (DeepSeek wo_a): the model consumes layer.weight
@@ -150,14 +180,16 @@ class QPN8Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
             # on the RTX 8000 (m8n8k4 is memory-bound at these M, the
             # Turing-mma concern does not apply; see
             # benchmarks/fp8_blk_sm75_decode_bench.py, 2026-09-03).
-            sc = (bscale.repeat_interleave(bn, 0)[:n]
-                  .repeat_interleave(bk, 1)[:, :k])
+            sc = bscale.repeat_interleave(bn, 0)[:n].repeat_interleave(bk, 1)[:, :k]
             w16 = (w8.view(torch.float8_e4m3fn).to(torch.float32) * sc).half()
             layer.weight = torch.nn.Parameter(w16, requires_grad=False)
             layer._qpn8_dequant16 = True
-            logger.info("QPN8_BLK_CENSUS_LOAD layer=%s K=%d N=%d "
-                        "route=is_bmm-fp16-dequant",
-                        getattr(layer, "prefix", "?"), k, n)
+            logger.info(
+                "QPN8_BLK_CENSUS_LOAD layer=%s K=%d N=%d route=is_bmm-fp16-dequant",
+                getattr(layer, "prefix", "?"),
+                k,
+                n,
+            )
             return
 
         raw = w8.view(torch.uint8) if w8.dtype != torch.uint8 else w8
@@ -168,10 +200,15 @@ class QPN8Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
             assert packed.numel() == n * k, "qpn8-blk packed size"
             _rt = _sm70_qpn8_unpack(packed, n, k)
             assert torch.equal(_rt, raw), (
-                "QPN8-blk prepack is not invertible for n=%d k=%d" % (n, k))
+                f"QPN8-blk prepack is not invertible for n={n} k={k}"
+            )
             _blk_verified_shapes.add((n, k))
-            logger.info("QPN8_BLK prepack INVERTED and byte-identical: %s "
-                        "n=%d k=%d", getattr(layer, "prefix", "?"), n, k)
+            logger.info(
+                "QPN8_BLK prepack INVERTED and byte-identical: %s n=%d k=%d",
+                getattr(layer, "prefix", "?"),
+                n,
+                k,
+            )
 
         layer._qpn8_codes = packed
         layer._qpn8_bscale = bscale
@@ -181,22 +218,33 @@ class QPN8Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
         if (k // 16) % splitk:
             splitk = 8 if (k // 16) % 8 == 0 else 4
         layer._qpn8_cfg = (splitk, nacc)
-        logger.info("QPN8_BLK_CENSUS_LOAD layer=%s K=%d N=%d block=[%d,%d] "
-                    "split=%d nacc=%d", getattr(layer, "prefix", "?"), k, n,
-                    bn, bk, splitk, nacc)
+        logger.info(
+            "QPN8_BLK_CENSUS_LOAD layer=%s K=%d N=%d block=[%d,%d] split=%d nacc=%d",
+            getattr(layer, "prefix", "?"),
+            k,
+            n,
+            bn,
+            bk,
+            splitk,
+            nacc,
+        )
         # The packed buffer is now the only resident copy.
         layer.weight = torch.nn.Parameter(
-            torch.empty(0, dtype=torch.uint8, device=packed.device),
-            requires_grad=False)
+            torch.empty(0, dtype=torch.uint8, device=packed.device), requires_grad=False
+        )
 
     def apply_block_scaled_mm(self, A, B, As, Bs):
         # Satisfies the ABC; apply_weights below bypasses the base-class
         # A/As machinery entirely (weight-only path, fp16 activations).
         raise RuntimeError("unreachable: QPN8-blk overrides apply_weights")
 
-    def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor,
-                      bias: torch.Tensor | None = None,
-                      **kwargs) -> torch.Tensor:
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
         if getattr(layer, "_qpn8_dequant16", False):
             return torch.nn.functional.linear(x, layer.weight, bias)
         n, k = layer._qpn8_shape
@@ -204,8 +252,8 @@ class QPN8Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
         splitk, nacc = layer._qpn8_cfg
         xc = x.reshape(-1, k).contiguous()
         y = torch.ops.sm70_fp8.qpn8_blk_linear(
-            xc, layer._qpn8_codes, layer._qpn8_bscale, n, k, bn, bk,
-            splitk, nacc)
+            xc, layer._qpn8_codes, layer._qpn8_bscale, n, k, bn, bk, splitk, nacc
+        )
         if bias is not None:
             y = y + bias
         return y.reshape(x.shape[:-1] + (n,))

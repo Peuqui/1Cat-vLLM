@@ -130,13 +130,7 @@ def _torch_indexer_q_rope_quant(
 
 
 def _is_exact_sm70_cuda() -> bool:
-    # Fork fix (v100-skinny): decide on the WORKER'S device, not device 0
-    # of the visibility list -- on a heterogeneous pipeline (RTX 8000
-    # first) every rank saw sm75 and the V100 stages silently lost their
-    # SM70 paths (torch-reference indexer, generic projection/insert).
-    return current_platform.is_cuda() and torch.cuda.get_device_capability(
-        torch.accelerator.current_device_index()
-    ) == (7, 0)
+    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
 
 
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":

@@ -2082,27 +2082,22 @@ class GPUModelRunner(
             and current_platform.is_device_capability(70)
         ):
             return False
-        force_spec = os.getenv("VLLM_SM70_STAGED_PREP_SPEC_FORCE", "0") == "1"
-        if not force_spec and (
-            self.speculative_config is not None or self.num_spec_tokens
-        ):
+        if self.speculative_config is not None or self.num_spec_tokens:
             return False
         if (
             self.model_config.is_encoder_decoder
             or scheduler_output.scheduled_encoder_inputs
         ):
             return False
-        if not force_spec and scheduler_output.scheduled_spec_decode_tokens:
+        if scheduler_output.scheduled_spec_decode_tokens:
             return False
-        if scheduler_output.total_num_scheduled_tokens != (
-            self.num_spec_tokens + 1 if force_spec else 1
-        ):
+        if scheduler_output.total_num_scheduled_tokens != 1:
             return False
         if self.input_batch.num_reqs != 1:
             return False
-        if not force_spec and self.input_batch.prev_sampled_token_ids is None:
+        if self.input_batch.prev_sampled_token_ids is None:
             return False
-        return force_spec or self.num_accepted_tokens_event is None
+        return self.num_accepted_tokens_event is None
 
     def _copy_buffer_to_gpu(
         self, buffer: CpuGpuBuffer, n: int | None = None
@@ -5370,7 +5365,6 @@ class GPUModelRunner(
         slot_mappings: dict[int, torch.Tensor] | None = None,
         ddtree_parent_metadata: DDTreeParentMetadata | None = None,
         cudagraph_capture_max_seq_len: int | None = None,
-        only_gids: set | None = None,
         cudagraph_graph_variant: int | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
@@ -5533,20 +5527,6 @@ class GPUModelRunner(
                     if 0 <= block_idx < len(block_ids):
                         state_block_ids.cpu[req_idx, offset] = block_ids[block_idx]
                     else:
-                        import os as _os
-
-                        if _os.getenv("VLLM_SM70_GDN_SLOT_DEBUG") == "1":
-                            logger.warning(
-                                "GDN_SLOT_DEBUG truncation: req=%s gid=%d "
-                                "state_idx=%d slots=%d len(block_ids)=%d "
-                                "filled=%d",
-                                req_id,
-                                kv_cache_gid,
-                                state_block_idx,
-                                self.max_spec_state_slots,
-                                len(block_ids),
-                                offset,
-                            )
                         break
             self._copy_buffer_to_gpu(state_block_ids, num_reqs_padded)
             current_mamba_state_block_ids_by_gid[kv_cache_gid] = state_block_ids.gpu[
@@ -5743,8 +5723,6 @@ class GPUModelRunner(
         dflash_common_attn_metadata_by_gid: dict[int, CommonAttentionMetadata] | None
         dflash_common_attn_metadata_by_gid = None
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
-            if only_gids is not None and kv_cache_gid not in only_gids:
-                continue
             cm = copy(cm_base)  # shallow copy
 
             # Basically only the encoder seq_lens, block_table and slot_mapping change
@@ -9426,33 +9404,7 @@ class GPUModelRunner(
                     | Gemma4Proposer,
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
-                if os.getenv("VLLM_SM70_MTP_THINK_ONLY", "0") == "1":
-                    # Async-safe think-end detection: OR-accumulate a GPU
-                    # flag, mirror it to a pinned scalar non-blocking, and
-                    # read the previous-step value here (no stream sync;
-                    # gating lags ~2 steps). Reset when batch membership
-                    # changes. The global flag is exact for
-                    # max_num_seqs=1 only.
-                    _end_id = int(
-                        os.getenv("VLLM_SM70_MTP_THINK_END_TOKEN_ID", "248069")
-                    )
-                    _rkey = tuple(self.input_batch.req_ids)
-                    if getattr(self, "_sm70_think_rkey", None) != _rkey:
-                        self._sm70_think_rkey = _rkey
-                        self._sm70_think_flag = torch.zeros(
-                            (), dtype=torch.bool, device=sampled_token_ids.device
-                        )
-                        self._sm70_think_flag_cpu = torch.zeros(
-                            (), dtype=torch.bool, pin_memory=True
-                        )
-                    self._sm70_think_suppress = bool(self._sm70_think_flag_cpu)
-                    self._sm70_think_flag |= sampled_token_ids.eq(_end_id).any()
-                    self._sm70_think_flag_cpu.copy_(
-                        self._sm70_think_flag, non_blocking=True
-                    )
-                if input_fits_in_drafter and not getattr(
-                    self, "_sm70_think_suppress", False
-                ):
+                if input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
                 elif self.valid_sampled_token_count_event is not None:
                     assert spec_decode_common_attn_metadata is not None
@@ -9492,27 +9444,20 @@ class GPUModelRunner(
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
-            if not input_fits_in_drafter or getattr(
-                self, "_sm70_think_suppress", False
-            ):
+            if not input_fits_in_drafter:
                 # Do not schedule any new drafts once the drafter cannot cover
-                # the current context (or think-only suppression is active).
-                # Returning zero-filled draft rows would
+                # the current context. Returning zero-filled draft rows would
                 # make token id 0 look like a real speculative token to the
                 # scheduler and verifier.
-                # The block is also entered for think-only suppression, where
-                # the context still fits; only an actual overrun is worth the
-                # context-limit warning.
-                if not input_fits_in_drafter:
-                    logger.warning_once(
-                        "Skipping speculative drafts after reaching the drafter "
-                        "context limit: num_spec_tokens=%s, "
-                        "effective_drafter_max_model_len=%s. Future over-limit "
-                        "batches are suppressed.",
-                        self.num_spec_tokens,
-                        self.effective_drafter_max_model_len,
-                        scope="global",
-                    )
+                logger.warning_once(
+                    "Skipping speculative drafts after reaching the drafter "
+                    "context limit: num_spec_tokens=%s, "
+                    "effective_drafter_max_model_len=%s. Future over-limit "
+                    "batches are suppressed.",
+                    self.num_spec_tokens,
+                    self.effective_drafter_max_model_len,
+                    scope="global",
+                )
                 self._draft_token_ids = [[] for _ in self.input_batch.req_ids]
                 self._draft_probs = None
                 self._draft_prob_req_ids = None
@@ -9561,41 +9506,10 @@ class GPUModelRunner(
                     time.perf_counter() - trace_bookkeeping_t0
                 ) * 1000.0
 
-        if (
-            spec_config is not None
-            and os.getenv("VLLM_SM70_MTP_THINK_ONLY", "0") == "1"
-        ):
-            # Think-only speculation: track the think-end token per request
-            # from the CPU-side sampled ids. MTP proposes drafts BEFORE
-            # bookkeeping (eagle-family GPU branch), so suppression applies
-            # from the NEXT step — one step of lag, negligible.
-            _end_id = int(os.getenv("VLLM_SM70_MTP_THINK_END_TOKEN_ID", "248069"))
-            _done = getattr(self, "_sm70_think_done_reqs", None)
-            if _done is None:
-                _done = set()
-                self._sm70_think_done_reqs = _done
-            _req_ids = self.input_batch.req_ids
-            _done.intersection_update(_req_ids)
-            if valid_sampled_token_ids:
-                # sync-bookkeeping path only; async returns [] and the
-                # GPU-flag path below handles detection instead.
-                for _rid, _toks in zip(_req_ids, valid_sampled_token_ids):
-                    if _rid not in _done and _toks and _end_id in _toks:
-                        _done.add(_rid)
-                self._sm70_think_suppress = bool(_req_ids) and len(_done) == len(
-                    _req_ids
-                )
-
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
-            if getattr(self, "_sm70_think_suppress", False):
-                self._draft_token_ids = [[] for _ in self.input_batch.req_ids]
-                self._draft_probs = None
-                self._draft_prob_req_ids = None
-                self._draft_prob_token_ids = None
-            else:
-                propose_draft_token_ids(valid_sampled_token_ids)
+            propose_draft_token_ids(valid_sampled_token_ids)
 
         if (
             spec_config is not None

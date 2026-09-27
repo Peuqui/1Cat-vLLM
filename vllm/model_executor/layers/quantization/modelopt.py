@@ -7,7 +7,6 @@
 # kernels incl. the MT=2 two-tile variant), lowers the ModelOpt minimum
 # compute capability from SM89 to SM70, and adds route/census logging.
 
-import os as _os
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any
 
@@ -129,7 +128,7 @@ QUANT_ALGOS = [
 KV_CACHE_QUANT_ALGOS = ["FP8", "NVFP4"]
 
 
-_SM70_MODELOPT = _os.environ.get("VLLM_SM70_MODELOPT", "1") == "1"
+_SM70_MODELOPT = envs.VLLM_SM70_MODELOPT
 _SM70_MIN_CAP = 70
 
 
@@ -468,7 +467,7 @@ class ModelOptFp8Config(ModelOptQuantConfigBase):
         )
 
 
-_SM70_FP8_REFERENCE = _os.environ.get("VLLM_SM70_FP8_REFERENCE", "1") == "1"
+_SM70_FP8_REFERENCE = envs.VLLM_SM70_FP8_REFERENCE
 _sm70_fp8_census_seen: set = set()
 
 
@@ -541,11 +540,11 @@ def _sm70_fp8_reference_linear_fake(x, w, scales, widths):
 # behind a flag so the two forms can be A/B'd by a boot flag instead of a
 # revert -- the single-op refactor was adopted on a boot that later proved to
 # be an outlier, so the comparison was never actually made cleanly.
-_SM70_QPN8_TWOOP = _os.environ.get("VLLM_SM70_QPN8_TWOOP", "0") == "1"
+_SM70_QPN8_TWOOP = envs.VLLM_SM70_QPN8_TWOOP
 # Highest M served by chunked native calls before falling back to a transient
 # fp16 reconstruct. Measured crossover is 104-116 per shape; see the dispatch
 # comment in _sm70_qpn8_linear. Set to 16 to restore the old boundary.
-_SM70_QPN8_CHUNK_MAX = int(_os.environ.get("VLLM_SM70_QPN8_CHUNK_MAX", "96"))
+_SM70_QPN8_CHUNK_MAX = envs.VLLM_SM70_QPN8_CHUNK_MAX
 # MT=2 serves M=9..16 with ONE weight pass (two m8n8k4 row-tiles against one B
 # fragment) instead of chunking's two. Measured 1.65x over chunked across the
 # protected set at M=16 (5.182 -> 3.132 ms/round), same 2.75e-4 as native.
@@ -553,7 +552,7 @@ _SM70_QPN8_CHUNK_MAX = int(_os.environ.get("VLLM_SM70_QPN8_CHUNK_MAX", "96"))
 # native table's nacc=2 -- so the table is separate. Key is (N, K); the nacc
 # field carries +2 to select the fast decoder, matching the launcher's
 # splitk*10+nacc encoding.
-_SM70_QPN8_MT2 = _os.environ.get("VLLM_SM70_QPN8_MT2", "1") == "1"
+_SM70_QPN8_MT2 = envs.VLLM_SM70_QPN8_MT2
 # split16 / nacc1 / fast decoder wins on all three shapes once the fast
 # decoder is correct (it had two bugs and had never produced a right answer;
 # see fp8x8_to_half2x4_fast). Every entry here is validated numerically by
@@ -601,7 +600,7 @@ def _sm70_fp8_apply(layer, x, bias):
     return y
 
 
-_SM70_QPN8 = _os.environ.get("VLLM_SM70_QPN8", "1") == "1"
+_SM70_QPN8 = envs.VLLM_SM70_QPN8
 _SM70_QPN8_TABLE = {(4096, 5120): (16, 2), (5120, 1536): (8, 2), (3584, 5120): (16, 2)}
 _sm70_qpn8_verified = [0]
 _sm70_qpn8_verified_shapes: set = set()

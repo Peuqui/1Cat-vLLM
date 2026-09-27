@@ -26,11 +26,11 @@ gemm(w2 slice) -> weighted scatter-add. Prefill M-dispatch: qpn M<=16,
 decode/verify regime never chunks).
 """
 
-import os
 from dataclasses import dataclass
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.logger import init_logger
@@ -46,7 +46,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 
 logger = init_logger(__name__)
 
-_SKINNY_MOE_ENABLED = os.environ.get("VLLM_SM70_NVFP4_MOE_SKINNY", "1") == "1"
+_SKINNY_MOE_ENABLED = envs.VLLM_SM70_NVFP4_MOE_SKINNY
 # Largest batch the grouped kernel serves. It reads an expert's weights once
 # per 8 rows, so it has no structural limit, and on real DeepSeek-V4 layer-5
 # experts (256 experts, top-6) it beats the per-expert loop at every size:
@@ -56,9 +56,7 @@ _SKINNY_MOE_ENABLED = os.environ.get("VLLM_SM70_NVFP4_MOE_SKINNY", "1") == "1"
 # bound is about memory: the grouped path holds slot-major intermediates
 # ([tokens * top_k, N] twice and an fp32 [tokens, top_k, K]) that the loop
 # never builds, 0.3 GiB at 2048 tokens and top-10.
-_GROUPED_MAX_TOKENS = int(
-    os.environ.get("VLLM_SM70_NVFP4_MOE_GROUPED_MAX_TOKENS", "512")
-)
+_GROUPED_MAX_TOKENS = int(envs.VLLM_SM70_NVFP4_MOE_GROUPED_MAX_TOKENS)
 # QPN-prepacked prefill band: qpn (mma.m8n8k4) serves M<=16, chunks above.
 # NOTE gemm_qpn_simt is NOT used here: it disagrees with the current
 # _qpn_prepack order on real expert bytes (latent -- the dense route only
@@ -67,14 +65,12 @@ _QPN_MAX_M = 16
 # Fold an MXFP4-in-NVFP4 scale raster to one E8M0 scale per 32 codes. Saves
 # half the scale memory (8.62 GiB on DeepSeek-V4-Flash) at bit-identical
 # output; set to 0 to keep the shipped one-per-16 raster.
-_MXFP4_SCALES = os.environ.get("VLLM_SKINNY_MXFP4_SCALES", "1") == "1"
+_MXFP4_SCALES = envs.VLLM_SKINNY_MXFP4_SCALES
 
 # moe_qpn launch configs (splitk, nacc) per weight matrix, measured winners
 # on real DeepSeek-V4 layer-5 experts (scripts/nvfp4_skinny_moe_qpn_test.py,
 # identical frontier on V100 and RTX 8000): w13 (16,1), w2 (8,1).
-_MOE_QPN_CFG = tuple(
-    int(v) for v in os.environ.get("VLLM_SM70_NVFP4_MOE_QPN_CFG", "16,1,8,1").split(",")
-)
+_MOE_QPN_CFG = tuple(int(v) for v in envs.VLLM_SM70_NVFP4_MOE_QPN_CFG.split(","))
 
 
 def _expert_gemm(

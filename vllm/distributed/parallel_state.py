@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-#
-# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.5.0
-# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
-# Changes: is_last_pp_first_tp_rank() -- the rank that emits per-step
-# spec-decode reports under pipeline parallelism (PR #512 upstream).
 
 # Copyright 2023 The vLLM team.
 # Adapted from

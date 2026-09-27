@@ -12,12 +12,6 @@ from typing import Any
 import torch
 
 import vllm.envs as envs
-
-# SPEC-DECODE-3D-FIX (v100-skinny/AIfred 2026-08-29): erlaubt dem
-# 3D-Split-KV-Pfad auch Multi-Token-Queries (MTP-Verify, q = k+1).
-# Kill-Switch fuer A/B-Messungen: VLLM_TRITON_3D_SPEC=0 = Altverhalten.
-import os as _os
-_SPEC_3D = _os.environ.get("VLLM_TRITON_3D_SPEC", "1") != "0"
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -37,6 +31,10 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 logger = init_logger(__name__)
+# Fork (v100-skinny, 2026-08-29): the 3D split-KV path also serves
+# multi-token queries (MTP verification, q = k + 1). VLLM_TRITON_3D_SPEC=0
+# restores the previous behaviour for A/B runs.
+_SPEC_3D = envs.VLLM_TRITON_3D_SPEC
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
@@ -1032,23 +1030,25 @@ def unified_attention(
     # 2. The total number of query tokens exceeds the buffer bound, or
     # 3. Batch invariance is enabled
     #
-    # SPEC-DECODE-3D-FIX: Die alte Heuristik (max_seqlen_q > 1 => 2D)
-    # zwang jeden Spekulations-Verify auf den seriellen 2D-Pfad — bei
-    # langem Kontext Laufzeit ~ Kontextlaenge (RTX 8000 @31k Kontext:
-    # 58 -> 2,6 tok/s). Kernel UND reduce_segments indexieren die
-    # Segment-Puffer bereits pro QUERY-TOKEN (segm_output[token, head,
-    # segm, :]), q_len > 1 ist also strukturell abgedeckt. Die korrekte
-    # Schranke ist die GESAMT-Token-Zahl gegen die Pufferzeilen
-    # (seq_threshold_3D) — Prefill-Chunks (~2048 Token) fallen damit
-    # weiterhin automatisch auf den 2D-Pfad.
+    # Fork (v100-skinny): the previous rule (max_seqlen_q > 1 => 2D) sent
+    # every speculative verification to the serial 2D path, whose runtime
+    # grows with the context (RTX 8000 at 31k context: 58 -> 2.6 tok/s).
+    # The kernel and reduce_segments already index the segment buffers per
+    # query token (segm_output[token, head, segm, :]), so q_len > 1 is
+    # covered. The bound that matters is the total token count against the
+    # buffer rows (seq_threshold_3D); prefill chunks (~2048 tokens) still
+    # take the 2D path.
     _num_query_tokens = q.shape[0]
     if _SPEC_3D:
-        _fits_3d = (seq_threshold_3D is not None
-                    and _num_query_tokens <= seq_threshold_3D)
+        _fits_3d = (
+            seq_threshold_3D is not None and _num_query_tokens <= seq_threshold_3D
+        )
     else:  # Altverhalten (Kill-Switch)
-        _fits_3d = (seq_threshold_3D is not None
-                    and max_seqlen_q <= 1
-                    and num_seqs <= seq_threshold_3D)
+        _fits_3d = (
+            seq_threshold_3D is not None
+            and max_seqlen_q <= 1
+            and num_seqs <= seq_threshold_3D
+        )
     use_3d = not (
         (not _fits_3d)
         or num_par_softmax_segments is None
