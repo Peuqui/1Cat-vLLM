@@ -31,10 +31,6 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 logger = init_logger(__name__)
-# Fork (v100-skinny, 2026-08-29): the 3D split-KV path also serves
-# multi-token queries (MTP verification, q = k + 1). VLLM_TRITON_3D_SPEC=0
-# restores the previous behaviour for A/B runs.
-_SPEC_3D = envs.VLLM_TRITON_3D_SPEC
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
@@ -1027,34 +1023,17 @@ def unified_attention(
 
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
-    # 2. The total number of query tokens exceeds the buffer bound, or
-    # 3. Batch invariance is enabled
-    #
-    # Fork (v100-skinny): the previous rule (max_seqlen_q > 1 => 2D) sent
-    # every speculative verification to the serial 2D path, whose runtime
-    # grows with the context (RTX 8000 at 31k context: 58 -> 2.6 tok/s).
-    # The kernel and reduce_segments already index the segment buffers per
-    # query token (segm_output[token, head, segm, :]), so q_len > 1 is
-    # covered. The bound that matters is the total token count against the
-    # buffer rows (seq_threshold_3D); prefill chunks (~2048 tokens) still
-    # take the 2D path.
-    _num_query_tokens = q.shape[0]
-    if _SPEC_3D:
-        _fits_3d = (
-            seq_threshold_3D is not None and _num_query_tokens <= seq_threshold_3D
-        )
-    else:  # Altverhalten (Kill-Switch)
-        _fits_3d = (
-            seq_threshold_3D is not None
-            and max_seqlen_q <= 1
-            and num_seqs <= seq_threshold_3D
-        )
+    # 2. The batch includes at least one prefill request, or
+    # 3. The number of sequences exceeds the configured threshold, or
+    # 4. Batch invariance is enabled
     use_3d = not (
-        (not _fits_3d)
+        seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
+        or max_seqlen_q > 1
+        or num_seqs > seq_threshold_3D
         or is_batch_invariant
     )
 

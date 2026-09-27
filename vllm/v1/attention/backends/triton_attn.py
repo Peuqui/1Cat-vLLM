@@ -54,12 +54,7 @@ _logged_sm70_fp8_kv_cpp_cache_update = False
 
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
-# Fork (v100-skinny, 2026-08-29): with 16 segments a 30k context leaves
-# ~1,900 tokens per segment program to run serially, which bounded decode on
-# cards without the FlashAttention backend (RTX 8000: 15.3 tok/s at 30k).
-# More segments spread the context axis; act_num_segments trims the surplus
-# for short sequences. Override with VLLM_TRITON_SOFTMAX_SEGMENTS.
-NUM_PAR_SOFTMAX_SEGMENTS = envs.VLLM_TRITON_SOFTMAX_SEGMENTS
+NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
 
 
 def _sm70_fp8_kv_needs_cpp_cache_update(
