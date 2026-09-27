@@ -43,6 +43,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kMxfp4Static,
 )
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -393,11 +394,11 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             return False
         if not (torch.cuda.is_available() and TritonExperts._supports_current_device()):
             return False
-        # The LOCAL worker device decides, never device 0 of the visibility
-        # list (the Session-4 lesson). The skinny NVFP4 extension is built
-        # for sm70 and verified correct on sm75 (RTX-solo campaign).
-        cap = torch.cuda.get_device_capability(torch.accelerator.current_device_index())
-        return cap in ((7, 0), (7, 5))
+        # The skinny NVFP4 extension is built for sm70 and verified correct on
+        # sm75.
+        return current_platform.is_device_capability(
+            (7, 0)
+        ) or current_platform.is_device_capability((7, 5))
 
     def workspace_shapes(
         self,

@@ -1424,6 +1424,7 @@ class GPUModelRunner(
                 model_config.hf_text_config, parallel_config.pipeline_parallel_size
             )
         self._ple_offload_connector: Any | None = None
+
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
         self.is_mm_prefix_lm = self.model_config.is_mm_prefix_lm
 
@@ -9706,13 +9707,13 @@ class GPUModelRunner(
                 skip_discarded=True,
                 sampler_input=sampler_input,
             )
-            # Fork fix (v100-skinny): ship the tiny spec-state payloads over
-            # the gloo cpu_group instead of an NCCL collective on the
-            # device_group. With five PP stages the NCCL broadcast interleaves
-            # with the pipeline's send/recv ops on the same communicator and
-            # the first request deadlocks (PP0-2 in broadcast, PP3-4 in
-            # irecv); a CPU rendezvous has no stream-ordering constraint and
-            # the payload is [num_reqs, K+1] int32.
+            # The speculative round state goes over the gloo cpu_group. An
+            # NCCL broadcast on the device_group shares the communicator with
+            # the pipeline's send/recv; with five stages the two interleave
+            # and the first request hangs (ranks 0-2 in the broadcast, ranks
+            # 3-4 in irecv). A CPU rendezvous has no stream ordering to
+            # violate, and the payload is [num_reqs, num_spec_tokens + 1]
+            # int32.
             torch.distributed.broadcast(payload_cpu, src=pp.rank, group=pp.cpu_group)
             return
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
@@ -9747,8 +9748,6 @@ class GPUModelRunner(
                 dtype=torch.int32,
                 device=self.device,
             )
-        # Fork fix (v100-skinny): gloo cpu_group, see
-        # _pp_broadcast_prev_sampled_token_ids.
         torch.distributed.broadcast(payload.cpu(), src=pp.rank, group=pp.cpu_group)
 
     def _pp_check_token_ids(
@@ -9795,21 +9794,18 @@ class GPUModelRunner(
             )
 
     def _pp_receive_spec_decode_state(self, num_reqs: int) -> None:
-        """Receive the spec-decode round state from the last PP stage.
+        """Receive the speculative round state from the last PP stage.
 
-        Wire format (two broadcasts, statically known shapes):
-          1. sampled token matrix [num_reqs, num_spec_tokens + 1], -1 padded
-          2. draft token ids [num_reqs, num_spec_tokens]
-        Next-token ids, accepted counts and the hybrid (GDN/mamba) state
-        update are derived locally from the matrix, mirroring what the last
-        rank does in its full sample_tokens() path.
+        Wire format, two broadcasts of statically known shape:
+          1. the sampled token matrix [num_reqs, num_spec_tokens + 1], -1 padded
+          2. the draft token ids [num_reqs, num_spec_tokens]
+        The next token ids, the accepted counts and the hybrid (GDN/mamba)
+        state update are derived locally from the matrix, as the last rank
+        does in its full sample_tokens() path.
         """
         pp = get_pp_group()
-        # Fork fix (v100-skinny): gloo cpu_group, see
-        # _pp_broadcast_prev_sampled_token_ids.
         sampled_cpu = torch.empty(
-            (num_reqs, self.num_spec_tokens + 1),
-            dtype=torch.int32,
+            (num_reqs, self.num_spec_tokens + 1), dtype=torch.int32
         )
         torch.distributed.broadcast(sampled_cpu, src=pp.last_rank, group=pp.cpu_group)
         self._pp_check_token_ids("sampled", sampled_cpu[:, :1], skip_discarded=True)
@@ -9821,10 +9817,7 @@ class GPUModelRunner(
         assert self.valid_sampled_token_count_event is not None
         self._copy_valid_sampled_token_count(next_token_ids, valid_counts)
 
-        drafts_cpu = torch.empty(
-            (num_reqs, self.num_spec_tokens),
-            dtype=torch.int32,
-        )
+        drafts_cpu = torch.empty((num_reqs, self.num_spec_tokens), dtype=torch.int32)
         torch.distributed.broadcast(drafts_cpu, src=pp.last_rank, group=pp.cpu_group)
         self._pp_check_token_ids("draft", drafts_cpu, skip_discarded=False)
         self._draft_token_ids = drafts_cpu.to(self.device, non_blocking=True)
@@ -9833,12 +9826,10 @@ class GPUModelRunner(
         self._pp_nonlast_scheduler_output = None
         if scheduler_output is None:
             raise RuntimeError(
-                "PP spec decode: missing stashed scheduler_output for the "
-                "hybrid state update on a non-last rank."
+                "PP speculative decoding: this non-last rank has no stashed "
+                "scheduler_output for the hybrid-state update."
             )
-        if torch.cuda.get_device_capability(
-            torch.accelerator.current_device_index()
-        ) == (7, 5):
+        if current_platform.is_device_capability((7, 5)):
             # SM75 stage: the upstream GDN layers roll their speculative
             # states forward inside their own forward, driven by the
             # num_accepted_tokens metadata — only the buffers feeding that
@@ -11554,8 +11545,7 @@ class GPUModelRunner(
         logits = self.model.compute_logits(hidden_states)
         num_reqs = logits.size(0)
 
-        def dummy_tensors(v):
-            return torch.full((num_reqs,), v, device=self.device)
+        dummy_tensors = lambda v: torch.full((num_reqs,), v, device=self.device)
 
         dummy_metadata = SamplingMetadata(
             temperature=dummy_tensors(0.5),
@@ -12533,13 +12523,7 @@ class GPUModelRunner(
         just may have a performance penalty due to that backend treating decodes
         as prefills.
         """
-
-        def min_none_high(a, b):
-            if b is None:
-                return a
-            if a is None:
-                return b
-            return min(a, b)
+        min_none_high = lambda a, b: a if b is None else b if a is None else min(a, b)
 
         reorder_batch_thresholds: list[int | None] = [
             group.get_metadata_builder().reorder_batch_threshold

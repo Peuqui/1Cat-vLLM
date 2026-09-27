@@ -1070,10 +1070,7 @@ class DeepseekV4Indexer(nn.Module):
             if (
                 current_platform.is_cuda()
                 and not has_deep_gemm()
-                and torch.cuda.get_device_capability(
-                    torch.accelerator.current_device_index()
-                )
-                >= (8, 0)
+                and current_platform.has_device_capability(80)
             ):
                 assert not self.use_fp4_kv, (
                     "torch indexer-q fallback supports the FP8 path only"

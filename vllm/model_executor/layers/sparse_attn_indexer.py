@@ -96,17 +96,11 @@ MXFP4_BLOCK_SIZE = 32
 
 
 def _is_exact_sm70_cuda() -> bool:
-    # Fork fix (v100-skinny): decide on the WORKER'S device, not device 0
-    # of the visibility list -- on a heterogeneous pipeline (RTX 8000
-    # first) every rank saw sm75 and the V100 stages silently lost their
-    # SM70 paths (torch-reference indexer, generic projection/insert).
-    # Fork fix (v100-skinny), step 2: the fp16 Triton indexer path is not
-    # Volta-specific -- everything below Ampere lacks DeepGEMM and would
-    # otherwise fall to the torch reference logits path, whose host sync
-    # (int(seq_lens[i])) kills CUDA-graph capture on the SM75 stages.
-    return current_platform.is_cuda() and torch.cuda.get_device_capability(
-        torch.accelerator.current_device_index()
-    ) < (8, 0)
+    # The fp16 Triton indexer path is not Volta-specific: everything below
+    # Ampere lacks DeepGEMM and would otherwise fall to the torch reference
+    # logits path, whose host sync (int(seq_lens[i])) breaks CUDA-graph
+    # capture on SM75 stages.
+    return current_platform.is_cuda() and not current_platform.has_device_capability(80)
 
 
 def _gather_workspace_shapes(

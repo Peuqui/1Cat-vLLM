@@ -126,12 +126,8 @@ def _is_exact_sm70_glm_mhc(
 ) -> bool:
     if residual.dtype != torch.float16 or not current_platform.is_cuda():
         return False
-    # fork (v100-skinny): decide on the WORKER'S device, not device 0 --
-    # on the heterogeneous pipeline device 0 is a Turing card.
-    if torch.cuda.get_device_capability(torch.accelerator.current_device_index()) != (
-        7,
-        0,
-    ):
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.to_int() != 70:
         return False
     if residual.shape[-2:] != (4, 4096):
         return False
@@ -579,16 +575,13 @@ def mhc_pre_broadcast_tilelang(
     assert norm_weight is not None
 
     num_tokens = residual.shape[0]
-    # fork (v100-skinny): worker-local capability (see _is_exact_sm70_glm_mhc).
     capability = (
-        torch.cuda.get_device_capability(torch.accelerator.current_device_index())
-        if current_platform.is_cuda()
-        else None
+        current_platform.get_device_capability() if current_platform.is_cuda() else None
     )
     use_sm70_triton = (
         use_fp16
         and capability is not None
-        and capability == (7, 0)
+        and capability.to_int() == 70
         and hidden_size == 4096
         and hc_mult == 4
     )
@@ -894,18 +887,15 @@ def mhc_fused_post_pre_tilelang(
         else:
             n_splits = 1
 
-    # fork (v100-skinny): worker-local capability (see _is_exact_sm70_glm_mhc).
     capability = (
-        torch.cuda.get_device_capability(torch.accelerator.current_device_index())
-        if current_platform.is_cuda()
-        else None
+        current_platform.get_device_capability() if current_platform.is_cuda() else None
     )
     use_sm70_fp32_stage = (
         envs.VLLM_SM70_DSV4_MHC_FP32_STAGE
         and use_small_fma
         and use_fp16
         and capability is not None
-        and capability == (7, 0)
+        and capability.to_int() == 70
         and 1 <= num_tokens <= 8
         and hidden_size == 4096
         and hc_mult == 4
@@ -1094,7 +1084,7 @@ def mhc_fused_post_pre_tilelang(
     use_sm70_pre_norm = (
         use_fp16
         and capability is not None
-        and capability == (7, 0)
+        and capability.to_int() == 70
         and norm_weight is not None
         and hidden_size == 4096
         and hc_mult == 4

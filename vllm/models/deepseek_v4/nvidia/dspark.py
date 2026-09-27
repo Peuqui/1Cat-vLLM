@@ -48,6 +48,7 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .model import DeepseekV4DecoderLayer, make_deepseek_v4_expert_params_mapping
@@ -150,16 +151,12 @@ class DSparkDeepseekV4Model(nn.Module):
         # overflow before the following RMSNorm. A power-of-two input scale is
         # exact in FP16 and RMSNorm removes it; 2^-6 leaves ample headroom while
         # preserving the FP32-reference normalized result.
-        # Fork fix (v100-skinny): decide on the WORKER'S device and cover
-        # every card without native FP8 units (< SM89) — they all take the
-        # FP16-writing W8A16 path this scale protects. The old device-0
-        # check saw the RTX 8000 first and silently disabled the scale for
-        # a drafter running on SM75 via the same QPN8 route: main_proj
-        # overflowed in FP16 and DSpark acceptance collapsed to ~6 %.
-        device_capability = torch.cuda.get_device_capability(
-            torch.accelerator.current_device_index()
+        # Every card without native FP8 units (< SM89) takes the FP16-writing
+        # W8A16 path this scale protects; without it main_proj overflowed in
+        # FP16 on SM75 and DSpark acceptance collapsed to ~6 %.
+        self.main_proj_input_scale = (
+            1.0 if current_platform.has_device_capability(89) else 2.0**-6
         )
-        self.main_proj_input_scale = 2.0**-6 if device_capability < (8, 9) else 1.0
 
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
@@ -294,16 +291,9 @@ def _insert_context_kv(
         dtype=kv.dtype,
         device=kv.device,
     )
-    # Fork fix (v100-skinny): decide on the WORKER'S device, not device 0
-    # of the visibility list. On a heterogeneous pipeline (RTX 8000 first)
-    # the platform check returned False on every rank, and the V100 stage
-    # crashed in the fused op below ("requires sm_80+; got sm_70"). The
-    # fused op itself draws the line at sm_80, so anything older takes the
-    # sm70 software path.
-    device_capability = torch.cuda.get_device_capability(
-        torch.accelerator.current_device_index()
-    )
-    if device_capability < (8, 0):
+    # The fused op below requires sm_80+, so anything older takes the sm70
+    # software path.
+    if not current_platform.has_device_capability(80):
         from vllm.models.deepseek_v4.sm70.qnorm_rope_kv_fp8_insert import (
             sm70_qnorm_rope_kv_fp8_insert,
         )
