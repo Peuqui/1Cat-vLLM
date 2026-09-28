@@ -447,16 +447,7 @@ class SpeculativeConfig:
             "glm_moe_dsa",
         ):
             hf_config.model_type = "deepseek_mtp"
-        if (
-            hf_config.model_type == "deepseek_mtp"
-            # Fork fix (v100-skinny): this override is applied more than once
-            # along the draft-config path. On the second pass a deepseek_v4
-            # config already carries model_type "deepseek_mtp" and
-            # architectures ["DeepSeekV4MTPModel"]; without this guard the V3
-            # branch would hijack it to DeepSeekMTPModel (no SupportsPP) and a
-            # PP boot dies with "Pipeline parallelism is not supported".
-            and initial_architecture != "DeepSeekV4MTPModel"
-        ):
+        if hf_config.model_type == "deepseek_mtp":
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["DeepSeekMTPModel"]}
