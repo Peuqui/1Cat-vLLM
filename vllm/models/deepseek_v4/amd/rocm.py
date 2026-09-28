@@ -543,8 +543,10 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+        # DSpark's non-causal rows are noncausal_index_width wide, which is
+        # wider than the window.
         self.decode_swa_ragged_indices_buffer = torch.empty(
-            max_tokens * self.window_size,
+            max_tokens * max(self.window_size, self.noncausal_index_width),
             dtype=torch.int32,
             device=self.device,
         )
@@ -584,11 +586,8 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
                 self.decode_swa_ragged_indices_buffer,
                 self.decode_swa_ragged_indptr_buffer,
                 base.num_decode_tokens,
-                # Fork fix (v100-skinny): size the stable slice from the
-                # actual dense row width. The drafting path (DSpark block)
-                # builds SWA rows wider than `window_size` (window + block
-                # overlap), and the window_size assumption cut the copy
-                # short: 5 draft rows x 256 entries vs a 5 x 128 slice.
+                # The dense rows are window_size wide, or noncausal_index_width
+                # for DSpark's non-causal rows.
                 dense_swa.shape[1],
             )
 
