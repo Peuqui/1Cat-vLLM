@@ -558,21 +558,12 @@ class Fp8Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import (
-            qpn8_blk_enabled as _qpn8_blk_enabled,
-        )
+        # fork: SM70 always has a block-FP8 route (the skinny QPN8 kernel),
+        # so FP8 checkpoints are accepted from Volta on.
         if (
             current_platform.is_cuda()
             and current_platform.has_device_capability(70)
             and not current_platform.has_device_capability(75)
-            and (
-                envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
-                or sm70_tm.forces_marlin()
-                or sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
-                # fork: block-scaled FP8 via the skinny QPN8 kernel reaches
-                # init_fp8_linear_kernel when the paths above are disabled.
-                or _qpn8_blk_enabled()
-            )
         ):
             return 70
         return 75
@@ -761,16 +752,8 @@ class Fp8LinearMethod(LinearMethodBase):
         # fork: block-scaled FP8 goes to the skinny QPN8 kernel by DEFAULT
         # (measured against TurboMind on the DeepSeek attention shapes:
         # decode M<=8 up to 1.79x ahead, prefill parity -- see
-        # benchmarks/fp8_blk_backend_bench.py). VLLM_SM70_QPN8_BLK=0
-        # restores the TurboMind precedence below.
-        from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import (
-            qpn8_blk_enabled,
-        )
-        self.use_sm70_fp8_qpn8_blk = (
-            self._sm70_without_fp8_hw
-            and self.block_quant
-            and qpn8_blk_enabled()
-        )
+        # benchmarks/fp8_blk_backend_bench.py).
+        self.use_sm70_fp8_qpn8_blk = self._sm70_without_fp8_hw and self.block_quant
         self.use_sm70_dequant_fallback = (
             self._sm70_without_fp8_hw
             and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK

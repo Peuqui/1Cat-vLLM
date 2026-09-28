@@ -692,11 +692,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     # the 89 capability gate stood in the way. Scoped to the
                     # block strategy so per-tensor/channel W8A8 checkpoints
                     # keep their W8A16 fallback below.
-                    from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import (  # noqa: E501
-                        qpn8_blk_enabled,
-                    )
-                    if (weight_quant.strategy == QuantizationStrategy.BLOCK
-                            and qpn8_blk_enabled()):
+                    if weight_quant.strategy == QuantizationStrategy.BLOCK:
                         return _CompressedTensorsW8A8Fp8Sm70Block(
                             weight_quant=weight_quant,
                             is_static_input_scheme=(

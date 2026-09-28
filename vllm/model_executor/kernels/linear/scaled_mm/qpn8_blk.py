@@ -28,7 +28,6 @@ from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel impo
 
 logger = init_logger(__name__)
 
-_SM70_QPN8_BLK = envs.VLLM_SM70_QPN8_BLK
 # Same encoding as the per-tensor path: key splitk*10+nacc, +2 on nacc
 # selects the fast decoder. split16/fast is the measured frontier on the
 # production shapes; stash() falls back when K/16 does not divide.
@@ -39,11 +38,6 @@ _SM70_QPN8_BLK_CFG = tuple(int(v) for v in envs.VLLM_SM70_QPN8_BLK_CFG.split(","
 # cross between M=256 and M=512 on every shape with <20% between them, so
 # the measured-winner boundary 256 is used.
 _SM70_QPN8_BLK_WMMA_MAX = int(envs.VLLM_SM70_QPN8_BLK_WMMA_MAX)
-
-
-def qpn8_blk_enabled() -> bool:
-    """Gate shared with Fp8Config.get_min_capability (fork fp8.py patch)."""
-    return _SM70_QPN8_BLK
 
 
 _blk_verified_shapes: set = set()
@@ -115,8 +109,6 @@ class QPN8Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
 
     @classmethod
     def is_supported(cls, compute_capability=None):
-        if not _SM70_QPN8_BLK:
-            return False, "disabled via VLLM_SM70_QPN8_BLK=0"
         if not torch.cuda.is_available():
             return False, "CUDA unavailable"
         # The LOCAL worker device decides, never device 0 of the visibility
