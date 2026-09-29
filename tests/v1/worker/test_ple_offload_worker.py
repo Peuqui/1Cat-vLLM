@@ -65,10 +65,16 @@ class _TestDefaultModelLoader:
     def __init__(self, checkpoint_names: list[str]) -> None:
         self.checkpoint_names = checkpoint_names
 
-    def get_all_weights(self, model_config, model):
-        """Return a small streamed checkpoint for weight-filtering tests."""
+    def get_all_weights(self, model_config, model, skip_weight=None):
+        """Return a small streamed checkpoint for weight-filtering tests,
+        recording which tensors were handed out (and so touched)."""
         del model_config, model
-        return ((name, torch.ones(2)) for name in self.checkpoint_names)
+        self.touched: list[str] = []
+        for name in self.checkpoint_names:
+            if skip_weight is not None and skip_weight(name):
+                continue
+            self.touched.append(name)
+            yield name, torch.ones(2)
 
 
 def _load_test_ple_weights(
@@ -135,6 +141,27 @@ def test_ple_offload_loads_mapped_checkpoint_names(
         "checkpoint.ple.bias",
     ]
     assert runner.layer_names == ["ple"]
+
+
+def test_ple_offload_does_not_touch_other_checkpoint_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Handing out a tensor reads it (mmap readahead), so the offload process
+    # must skip everything but the PLE tensors before the loader yields them.
+    loaders: list[_TestDefaultModelLoader] = []
+    original = _TestDefaultModelLoader.__init__
+
+    def record(self, names):
+        original(self, names)
+        loaders.append(self)
+
+    monkeypatch.setattr(_TestDefaultModelLoader, "__init__", record)
+    _load_test_ple_weights(
+        monkeypatch,
+        ["checkpoint.ple.weight", "checkpoint.unrelated.weight", "checkpoint.ple.bias"],
+    )
+
+    assert loaders[0].touched == ["checkpoint.ple.weight", "checkpoint.ple.bias"]
 
 
 def test_ple_offload_loads_lazily_under_direct_io(

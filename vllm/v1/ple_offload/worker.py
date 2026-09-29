@@ -631,16 +631,19 @@ class PleOffloadRunner:
         mapper = getattr(model, "hf_to_vllm_mapper", None)
         matched_checkpoint_tensors = 0
 
+        def is_offload_weight(weight_name: str) -> bool:
+            mapped_name: str | None = weight_name
+            if mapper is not None:
+                mapped_names = mapper.apply_list([weight_name])
+                mapped_name = mapped_names[0] if mapped_names else None
+            return mapped_name is not None and mapped_name.startswith(offload_prefixes)
+
         def offload_only_iter(
             weights: Iterable[tuple[str, torch.Tensor]],
         ) -> Iterable[tuple[str, torch.Tensor]]:
             nonlocal matched_checkpoint_tensors
             for weight_name, tensor in weights:
-                mapped_name: str | None = weight_name
-                if mapper is not None:
-                    mapped_names = mapper.apply_list([weight_name])
-                    mapped_name = mapped_names[0] if mapped_names else None
-                if mapped_name is not None and mapped_name.startswith(offload_prefixes):
+                if is_offload_weight(weight_name):
                     matched_checkpoint_tensors += 1
                     yield weight_name, tensor
 
@@ -653,7 +656,14 @@ class PleOffloadRunner:
             for layer in offload_layers.values():
                 initialize_dummy_weights(layer, model_config)
         elif isinstance(loader, DefaultModelLoader):
-            all_weights = loader.get_all_weights(model_config, model)
+            # Skip the rest before it is touched: handing out even a mapped
+            # tensor reads it with readahead, which made this process read the
+            # whole checkpoint through the page cache (2026-09-29, Flash-Next).
+            all_weights = loader.get_all_weights(
+                model_config,
+                model,
+                skip_weight=lambda name: not is_offload_weight(name),
+            )
             loaded_params = model.load_weights(offload_only_iter(all_weights))
             if matched_checkpoint_tensors == 0:
                 raise RuntimeError(

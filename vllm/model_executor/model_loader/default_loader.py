@@ -370,14 +370,27 @@ class DefaultModelLoader(BaseModelLoader):
         self,
         model_config: ModelConfig,
         model: nn.Module,
+        skip_weight: Callable[[str], bool] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Stream the primary checkpoint's tensors, then the secondary ones.
+
+        *skip_weight* lets a caller that needs only part of the checkpoint
+        leave the rest out before it is touched: even a memory-mapped tensor
+        is read (with readahead) once it is handed out.
+        """
+        model_skip = self._skip_weight_for(model)
+        if skip_weight is not None and model_skip is not None:
+            caller_skip = skip_weight
+            skip_weight = lambda name: caller_skip(name) or model_skip(name)  # noqa: E731
+        elif skip_weight is None:
+            skip_weight = model_skip
         primary_weights = DefaultModelLoader.Source(
             model_config.model,
             model_config.revision,
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
-            skip_weight=self._skip_weight_for(model),
+            skip_weight=skip_weight,
             map_weight=getattr(model, "map_checkpoint_weight", None),
         )
         yield from self._get_weights_iterator(primary_weights)
