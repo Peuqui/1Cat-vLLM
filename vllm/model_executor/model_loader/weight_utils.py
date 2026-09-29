@@ -41,7 +41,11 @@ from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
 )
-from vllm.model_executor.model_loader.direct_io import direct_io_weights
+from vllm.model_executor.model_loader.direct_io import (
+    direct_io_weights,
+    is_decoder_layer_weight,
+    released_mapped_weights,
+)
 from vllm.model_executor.model_loader.ep_weight_filter import (
     should_skip_weight,
 )
@@ -961,12 +965,18 @@ def _keep_direct_weight(
     local_expert_ids: set[int] | None,
     skip_weight: Callable[[str], bool] | None,
     map_weight: Callable[[str], bool] | None,
+    read_directly: bool,
 ) -> bool:
-    """Whether to read a tensor with O_DIRECT: kept, and not one the model
-    wants memory-mapped."""
-    if map_weight is not None and map_weight(name):
+    """Whether a kept tensor goes through O_DIRECT (*read_directly*) or the
+    memory map: decoder-layer tensors are read directly unless the model
+    wants them mapped; everything else is mapped, so that a pipeline stage
+    reads only the embeddings, heads or MTP layers it actually uses."""
+    if not _keep_weight(name, indexed_weights, local_expert_ids, skip_weight):
         return False
-    return _keep_weight(name, indexed_weights, local_expert_ids, skip_weight)
+    direct = is_decoder_layer_weight(name) and not (
+        map_weight is not None and map_weight(name)
+    )
+    return direct == read_directly
 
 
 def safetensors_weights_iterator(
@@ -992,8 +1002,9 @@ def safetensors_weights_iterator(
     checkpoint (e.g. a drafter shipped inside its target's checkpoint) avoid
     reading the rest.
 
-    With the "direct" strategy, tensors that *map_weight* accepts are still
-    yielded memory-mapped, after the directly read ones of the same shard.
+    With the "direct" strategy only decoder-layer tensors are read with
+    O_DIRECT; the rest and those *map_weight* accepts are yielded
+    memory-mapped after them, and their pages are released once consumed.
     """
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
@@ -1094,23 +1105,19 @@ def safetensors_weights_iterator(
                 if _keep_weight(name, indexed_weights, local_expert_ids, skip_weight):
                     yield name, param
         elif safetensors_load_strategy == "direct":
-            yield from direct_io_weights(
-                st_file,
-                functools.partial(
-                    _keep_direct_weight,
-                    indexed_weights=indexed_weights,
-                    local_expert_ids=local_expert_ids,
-                    skip_weight=skip_weight,
-                    map_weight=map_weight,
-                ),
+            keep = functools.partial(
+                _keep_direct_weight,
+                indexed_weights=indexed_weights,
+                local_expert_ids=local_expert_ids,
+                skip_weight=skip_weight,
+                map_weight=map_weight,
             )
-            if map_weight is not None:
-                with safe_open(st_file, framework="pt") as f:
-                    for name in f.keys():  # noqa: SIM118
-                        if map_weight(name) and _keep_weight(
-                            name, indexed_weights, local_expert_ids, skip_weight
-                        ):
-                            yield name, f.get_tensor(name)
+            yield from direct_io_weights(
+                st_file, functools.partial(keep, read_directly=True)
+            )
+            yield from released_mapped_weights(
+                st_file, functools.partial(keep, read_directly=False)
+            )
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
             # instead we reconstruct the subclasses here before returning

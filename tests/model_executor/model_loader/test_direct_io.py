@@ -131,17 +131,25 @@ def _file_backed(tensor: torch.Tensor) -> bool:
     return False
 
 
-def test_mapped_weights_stay_file_backed_under_direct_io(tmp_path):
+def test_only_decoder_layers_are_read_directly(tmp_path):
+    # Decoder layers go through O_DIRECT unless the model wants them mapped;
+    # embeddings, vision and MTP tensors stay mapped. Their pages are released
+    # after each one is consumed, which must not change the data read later.
     path = tmp_path / "shard.safetensors"
     _checkpoint(path)
-    mapped = {"model.language_model.layers.1.w", "mtp.layers.0.w"}
+    requested = {"model.language_model.layers.1.w"}
+    mapped = requested | {
+        "mtp.layers.0.w",
+        "model.visual.blocks.0.w",
+        "model.language_model.embed_tokens.weight",
+    }
 
     got = dict(
         safetensors_weights_iterator(
             [str(path)],
             use_tqdm_on_load=False,
             safetensors_load_strategy="direct",
-            map_weight=mapped.__contains__,
+            map_weight=requested.__contains__,
         )
     )
 

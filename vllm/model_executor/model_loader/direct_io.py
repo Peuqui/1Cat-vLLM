@@ -11,8 +11,14 @@ direct I/O does.
 Under pipeline parallelism a memory-mapped shard only reads the pages a stage
 touches. A reader that fills buffers itself has to decide up front, so
 tensors of decoder layers outside this stage's range are not read at all.
+
+Only decoder-layer tensors, the bulk of a checkpoint, are read this way. The
+rest (embeddings, heads, vision towers, MTP layers) and tensors the model asks
+to keep mapped are memory-mapped, so a stage reads only what it uses, and their
+pages are released from the page cache once the loader has consumed them.
 """
 
+import ctypes
 import json
 import mmap
 import os
@@ -21,6 +27,7 @@ from collections.abc import Callable, Generator
 
 import regex as re
 import torch
+from safetensors import safe_open
 
 # O_DIRECT needs offsets, lengths and buffers aligned to the logical block
 # size; 4 KiB covers the devices in use.
@@ -52,6 +59,32 @@ _DTYPES = {
 _DECODER_LAYER = re.compile(
     r"^(?:|model\.|model\.language_model\.|language_model\.model\.)layers\.(\d+)\."
 )
+
+
+MADV_RANDOM = 1
+MADV_DONTNEED = 4
+
+
+def madvise_mapped_tensor(tensor: torch.Tensor, advice: int) -> None:
+    """Apply one madvise value to the pages a mapped CPU tensor covers."""
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    address = tensor.data_ptr()
+    byte_count = tensor.numel() * tensor.element_size()
+    aligned_address = address - address % page_size
+    aligned_end = (address + byte_count + page_size - 1) // page_size * page_size
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.madvise(
+        ctypes.c_void_p(aligned_address),
+        ctypes.c_size_t(aligned_end - aligned_address),
+        advice,
+    ):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def is_decoder_layer_weight(name: str) -> bool:
+    """Whether a tensor belongs to a decoder layer of the main stack."""
+    return _DECODER_LAYER.match(name) is not None
 
 
 def decoder_layer_filter(start: int, end: int) -> Callable[[str], bool]:
@@ -93,6 +126,33 @@ def _read_run(fd: int, start: int, end: int) -> tuple[mmap.mmap, int]:
         done += count
     view.release()
     return buffer, begin
+
+
+def released_mapped_weights(
+    path: str, keep: Callable[[str], bool]
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield the memory-mapped tensors of one shard for which `keep` is True,
+    and drop each one's pages from the page cache once the consumer is done
+    with it (a loader copies a tensor before it asks for the next one).
+
+    A consumer that keeps a tensor still reads correct data: the pages are
+    clean file pages and fault back in from disk.
+    """
+    with safe_open(path, framework="pt") as shard, open(path, "rb", buffering=0) as raw:
+        header, data_start = _read_header(raw.fileno())
+        for name in shard.keys():  # noqa: SIM118
+            if not keep(name):
+                continue
+            tensor = shard.get_tensor(name)
+            yield name, tensor
+            # A page still mapped here is one the page cache keeps; unmap
+            # first, then drop the file range.
+            if tensor.numel():
+                madvise_mapped_tensor(tensor, MADV_DONTNEED)
+            begin, end = header[name]["data_offsets"]
+            os.posix_fadvise(
+                raw.fileno(), data_start + begin, end - begin, os.POSIX_FADV_DONTNEED
+            )
 
 
 def direct_io_weights(

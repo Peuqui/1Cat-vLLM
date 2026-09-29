@@ -49,6 +49,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_masked_input_and_mask,
 )
+from vllm.model_executor.model_loader.direct_io import (
+    MADV_DONTNEED,
+    MADV_RANDOM,
+    madvise_mapped_tensor,
+)
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.parameter import (
     ModelWeightParameter,
@@ -97,8 +102,6 @@ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
-_MADV_RANDOM = 1
-_MADV_DONTNEED = 4
 
 logger = init_logger(__name__)
 
@@ -141,25 +144,8 @@ def _advise_random_file_access(tensor: torch.Tensor) -> str:
             "weights; eager or copied tensors are unsupported"
         )
 
-    _madvise_mapped_tensor(tensor, _MADV_RANDOM)
+    madvise_mapped_tensor(tensor, MADV_RANDOM)
     return mapped_path
-
-
-def _madvise_mapped_tensor(tensor: torch.Tensor, advice: int) -> None:
-    """Apply one madvise value to the pages a mapped CPU tensor covers."""
-    page_size = os.sysconf("SC_PAGE_SIZE")
-    address = tensor.data_ptr()
-    byte_count = tensor.numel() * tensor.element_size()
-    aligned_address = address - address % page_size
-    aligned_end = (address + byte_count + page_size - 1) // page_size * page_size
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.madvise(
-        ctypes.c_void_p(aligned_address),
-        ctypes.c_size_t(aligned_end - aligned_address),
-        advice,
-    ):
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error))
 
 
 @triton.jit
@@ -1517,7 +1503,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         of every shard it accepts (_advise_random_file_access refuses others).
         """
         if self._release_disk_pages and self._disk_mapped_paths:
-            _madvise_mapped_tensor(shard, _MADV_DONTNEED)
+            madvise_mapped_tensor(shard, MADV_DONTNEED)
 
     def _gather_mapped_rows(self, flat_ids: np.ndarray) -> np.ndarray:
         """Read the given PLE rows from the mapped checkpoint shards.
