@@ -15,6 +15,7 @@ import vllm.v1.ple_offload.connector as ple_offload_connector_module
 import vllm.v1.worker.gpu_worker as gpu_worker_module
 from tests.utils import set_lazy_env
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
+from vllm.config.load import LoadConfig
 from vllm.model_executor.layers import ple_offload_layer
 from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
@@ -73,10 +74,18 @@ class _TestDefaultModelLoader:
 def _load_test_ple_weights(
     monkeypatch: pytest.MonkeyPatch,
     checkpoint_names: list[str],
+    load_config: LoadConfig | None = None,
+    used_load_configs: list[LoadConfig] | None = None,
 ) -> tuple[ple_offload_worker.PleOffloadRunner, _WeightLoadingModel]:
     """Run PLE weight discovery with a mapped synthetic checkpoint."""
     model = _WeightLoadingModel()
     loader = _TestDefaultModelLoader(checkpoint_names)
+
+    def get_model_loader(config: LoadConfig) -> _TestDefaultModelLoader:
+        if used_load_configs is not None:
+            used_load_configs.append(config)
+        return loader
+
     monkeypatch.setattr(
         ple_offload_worker,
         "initialize_model",
@@ -90,7 +99,7 @@ def _load_test_ple_weights(
     monkeypatch.setattr(
         ple_offload_worker,
         "get_model_loader",
-        lambda _: loader,
+        get_model_loader,
     )
     monkeypatch.setattr(
         ple_offload_worker,
@@ -103,7 +112,7 @@ def _load_test_ple_weights(
     )
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(dtype=torch.float32),
-        load_config=SimpleNamespace(),
+        load_config=load_config or LoadConfig(),
     )
     runner._layers = {}
     runner._load_weights()
@@ -126,6 +135,23 @@ def test_ple_offload_loads_mapped_checkpoint_names(
         "checkpoint.ple.bias",
     ]
     assert runner.layer_names == ["ple"]
+
+
+def test_ple_offload_loads_lazily_under_direct_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The disk tier serves PLE rows from the mapped checkpoint; O_DIRECT
+    # buffers are anonymous memory the offload process must not load into.
+    used: list[LoadConfig] = []
+
+    _load_test_ple_weights(
+        monkeypatch,
+        ["checkpoint.ple.weight", "checkpoint.ple.bias"],
+        LoadConfig(safetensors_load_strategy="direct"),
+        used,
+    )
+
+    assert [config.safetensors_load_strategy for config in used] == ["lazy"]
 
 
 def test_ple_offload_rejects_checkpoint_without_matching_weights(

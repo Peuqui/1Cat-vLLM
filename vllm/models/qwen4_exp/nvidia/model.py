@@ -98,7 +98,7 @@ except ModuleNotFoundError as exc:
         del module, dtype
 
 
-from .ple_layer import Qwen4ExpPLELayer
+from .ple_layer import Qwen4ExpPLELayer, is_ple_checkpoint_shard
 from .qsa import Qwen4ExpQSAAttention
 
 logger = init_logger(__name__)
@@ -1055,6 +1055,12 @@ class Qwen4ExpForCausalLM(
         positions = torch.arange(len(input_tokens), dtype=torch.long)
         return positions.unsqueeze(0).expand(3, -1), 0
 
+    def map_checkpoint_weight(self, name: str) -> bool:
+        # Under direct I/O the PLE table (47 GiB for Flash-Next) would be read
+        # whole into anonymous memory, though each rank uses only its rows and
+        # the disk tier serves the rest from the mapped checkpoint.
+        return is_ple_checkpoint_shard(name)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
             self,
@@ -1258,6 +1264,12 @@ class Qwen4ExpForConditionalGeneration(
         if inputs_embeds is not None and get_pp_group().is_first_rank:
             self._clear_deepstack_input_embeds(inputs_embeds.size(0))
         return hidden_states
+
+    def map_checkpoint_weight(self, name: str) -> bool:
+        # Under direct I/O the PLE table (47 GiB for Flash-Next) would be read
+        # whole into anonymous memory, though each rank uses only its rows and
+        # the disk tier serves the rest from the mapped checkpoint.
+        return is_ple_checkpoint_shard(name)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(

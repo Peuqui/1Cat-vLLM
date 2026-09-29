@@ -102,6 +102,19 @@ _MADV_DONTNEED = 4
 
 logger = init_logger(__name__)
 
+# Checkpoint tensors of the PLE table: ``...ngram_embedding.shard_<i>.weight``.
+PLE_SHARD_PREFIX = "ngram_embedding.shard_"
+
+
+def is_ple_checkpoint_shard(name: str) -> bool:
+    """Whether a checkpoint tensor is a shard of the PLE embedding table.
+
+    The ranks read only their rows of these shards and the disk tier serves
+    the rest from the mapped checkpoint, so they must stay memory-mapped
+    under direct I/O (see map_checkpoint_weight of the models).
+    """
+    return f".{PLE_SHARD_PREFIX}" in name or name.startswith(PLE_SHARD_PREFIX)
+
 
 def _advise_random_file_access(tensor: torch.Tensor) -> str:
     """Require a lazy file mapping and disable destructive mmap read-around."""
@@ -1719,7 +1732,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         }
         loaded: set[str] = set()
         regular_weights: list[tuple[str, torch.Tensor]] = []
-        shard_prefix = "ngram_embedding.shard_"
+        shard_prefix = PLE_SHARD_PREFIX
 
         for name, loaded_weight in weights:
             leaf_name = name.rsplit(".", 1)[-1]

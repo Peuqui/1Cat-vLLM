@@ -5,6 +5,7 @@
 import asyncio
 import concurrent.futures
 import fnmatch
+import functools
 import glob
 import hashlib
 import json
@@ -40,6 +41,7 @@ from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
 )
+from vllm.model_executor.model_loader.direct_io import direct_io_weights
 from vllm.model_executor.model_loader.ep_weight_filter import (
     should_skip_weight,
 )
@@ -952,6 +954,21 @@ def _keep_weight(
     return skip_weight is None or not skip_weight(name)
 
 
+def _keep_direct_weight(
+    name: str,
+    *,
+    indexed_weights: set[str] | None,
+    local_expert_ids: set[int] | None,
+    skip_weight: Callable[[str], bool] | None,
+    map_weight: Callable[[str], bool] | None,
+) -> bool:
+    """Whether to read a tensor with O_DIRECT: kept, and not one the model
+    wants memory-mapped."""
+    if map_weight is not None and map_weight(name):
+        return False
+    return _keep_weight(name, indexed_weights, local_expert_ids, skip_weight)
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -960,6 +977,7 @@ def safetensors_weights_iterator(
     *,
     indexed_weights_by_file: Mapping[str, set[str]] | None = None,
     skip_weight: Callable[[str], bool] | None = None,
+    map_weight: Callable[[str], bool] | None = None,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -973,6 +991,9 @@ def safetensors_weights_iterator(
     skipped the same way. It lets a model that loads only part of a shared
     checkpoint (e.g. a drafter shipped inside its target's checkpoint) avoid
     reading the rest.
+
+    With the "direct" strategy, tensors that *map_weight* accepts are still
+    yielded memory-mapped, after the directly read ones of the same shard.
     """
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
@@ -1072,6 +1093,24 @@ def safetensors_weights_iterator(
             for name, param in state_dict.items():
                 if _keep_weight(name, indexed_weights, local_expert_ids, skip_weight):
                     yield name, param
+        elif safetensors_load_strategy == "direct":
+            yield from direct_io_weights(
+                st_file,
+                functools.partial(
+                    _keep_direct_weight,
+                    indexed_weights=indexed_weights,
+                    local_expert_ids=local_expert_ids,
+                    skip_weight=skip_weight,
+                    map_weight=map_weight,
+                ),
+            )
+            if map_weight is not None:
+                with safe_open(st_file, framework="pt") as f:
+                    for name in f.keys():  # noqa: SIM118
+                        if map_weight(name) and _keep_weight(
+                            name, indexed_weights, local_expert_ids, skip_weight
+                        ):
+                            yield name, f.get_tensor(name)
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
             # instead we reconstruct the subclasses here before returning

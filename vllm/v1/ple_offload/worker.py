@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection
 from multiprocessing.reduction import ForkingPickler
 from typing import Any, cast
@@ -584,6 +584,13 @@ class PleOffloadRunner:
         """
         model_config = self.vllm_config.model_config
         load_config = self.vllm_config.load_config
+        if load_config.safetensors_load_strategy == "direct":
+            # This process needs only the PLE tensors, and the disk tier serves
+            # them from the mapped checkpoint (file-backed shards). O_DIRECT
+            # would copy the tables into anonymous memory and read every other
+            # tensor of the checkpoint only to drop it; the lazy mapping reads
+            # just the PLE pages.
+            load_config = replace(load_config, safetensors_load_strategy="lazy")
 
         # Step 1: build complete structure, while only PLE subtrees allocate CPU
         # memory. All transformer, MoE, and vision parameters remain on meta.

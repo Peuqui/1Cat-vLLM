@@ -78,6 +78,10 @@ class LoadConfig:
     - "prefetch": Checkpoint files are read into the OS page cache before
       workers load them, speeding up the model loading phase. Useful on
       network or high-latency storage.
+    - "direct": Shards are read with O_DIRECT into private buffers, past the
+      page cache, so a checkpoint larger than host RAM does not push other
+      processes into swap. Under pipeline parallelism each stage reads only
+      its own decoder layers.
     - "torchao": Weights are loaded in upfront and then reconstructed
       into torchao tensor subclasses. This is used when the checkpoint
       was quantized using torchao and saved using safetensors.
