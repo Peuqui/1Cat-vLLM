@@ -36,26 +36,50 @@ from vllm.model_executor.model_loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
 logger = init_logger(__name__)
 
 
+def _decoder_root(model: nn.Module) -> nn.Module:
+    """The module to search for the decoder stack: the language model of a
+    multimodal model, otherwise the model itself."""
+    if isinstance(model, SupportsMultiModal):
+        return model.get_language_model()
+    return model
+
+
 def _pipeline_stage_layer_range(model: nn.Module) -> tuple[int, int] | None:
     """[start, end) of the decoder layers this pipeline stage holds, or None
     when it holds all of them. vLLM decoder stacks keep a full-length
     `layers` list with placeholders and record their range in
-    start_layer/end_layer."""
-    for module in model.modules():
+    start_layer/end_layer.
+
+    Multimodal models are searched in their language model only: an encoder
+    tower built with make_layers carries its own pipeline range, which must
+    not filter the language model's layers. Two different partial ranges
+    are ambiguous and raise instead of skipping the wrong layers."""
+    ranges = set()
+    for module in _decoder_root(model).modules():
         start = getattr(module, "start_layer", None)
         end = getattr(module, "end_layer", None)
         layers = getattr(module, "layers", None)
-        if isinstance(start, int) and isinstance(end, int) and layers is not None:
-            if start == 0 and end == len(layers):
-                return None
-            return start, end
-    return None
+        if (
+            isinstance(start, int)
+            and isinstance(end, int)
+            and layers is not None
+            and not (start == 0 and end == len(layers))
+        ):
+            ranges.add((start, end))
+    if len(ranges) > 1:
+        raise ValueError(
+            "Direct I/O loading found several pipeline-partial layer stacks "
+            f"{sorted(ranges)} in {type(model).__name__} and cannot tell which "
+            "one the checkpoint's decoder layers belong to"
+        )
+    return ranges.pop() if ranges else None
 
 
 class DefaultModelLoader(BaseModelLoader):

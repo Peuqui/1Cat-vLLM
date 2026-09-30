@@ -19,6 +19,7 @@ from vllm.model_executor.model_loader.direct_io import (
 from vllm.model_executor.model_loader.weight_utils import (
     safetensors_weights_iterator,
 )
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 
 
 def _checkpoint(path) -> dict[str, torch.Tensor]:
@@ -161,7 +162,7 @@ def test_only_decoder_layers_are_read_directly(tmp_path):
             assert _file_backed(tensor) == (name in mapped), name
 
 
-def _sharing_rank(rank, init_file, path, out_dir, keep_all):
+def _sharing_rank(rank, init_file, path, out_dir, mode):
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2
     )
@@ -171,9 +172,23 @@ def _sharing_rank(rank, init_file, path, out_dir, keep_all):
             raise AssertionError("the follower read the disk")
 
         direct_io._read_run = no_disk
+    elif mode == "leader_cannot_open":
+
+        def no_open(*args):
+            raise OSError(22, "O_DIRECT not supported")
+
+        direct_io.os.open = no_open
+    elif mode == "leader_cannot_read":
+
+        def eof(*args):
+            raise EOFError("truncated shard")
+
+        direct_io._read_run = eof
     sharing = direct_io.RunSharing(dist.group.WORLD, 0, rank == 0)
     keep = (
-        (lambda name: True) if keep_all or rank == 0 else (lambda name: "mtp" in name)
+        (lambda name: "mtp" in name)
+        if mode == "different_tensors" and rank == 1
+        else (lambda name: True)
     )
     try:
         got = {
@@ -187,30 +202,94 @@ def _sharing_rank(rank, init_file, path, out_dir, keep_all):
         dist.destroy_process_group()
 
 
+def _run_sharing(tmp_path, mode):
+    path = tmp_path / "shard.safetensors"
+    _checkpoint(path)
+    mp.spawn(
+        _sharing_rank,
+        args=(str(tmp_path / "init"), str(path), str(tmp_path), mode),
+        nprocs=2,
+    )
+    return path, [torch.load(tmp_path / f"rank{rank}.pt") for rank in (0, 1)]
+
+
 def test_run_sharing_reads_once_per_group(tmp_path):
-    path = tmp_path / "shard.safetensors"
-    _checkpoint(path)
+    path, results = _run_sharing(tmp_path, "all")
+    for result in results:
+        _assert_same(result, _reference(path))
 
-    mp.spawn(
-        _sharing_rank,
-        args=(str(tmp_path / "init"), str(path), str(tmp_path), True),
-        nprocs=2,
+
+@pytest.mark.parametrize(
+    "mode,message",
+    [
+        ("different_tensors", "select different tensors"),
+        ("leader_cannot_open", "select different tensors"),
+        ("leader_cannot_read", "leader could not read"),
+    ],
+)
+def test_run_sharing_fails_together(tmp_path, mode, message):
+    # No rank may be left waiting for a broadcast that never comes.
+    _, results = _run_sharing(tmp_path, mode)
+    for result in results:
+        assert message in result["error"]
+
+
+def test_run_of_only_empty_tensors_at_an_aligned_offset(tmp_path):
+    path = tmp_path / "shard.safetensors"
+    save_file(
+        {
+            "model.layers.0.a": torch.zeros(4096 - 80, dtype=torch.uint8),
+            "model.layers.0.e": torch.empty(0, 4),
+        },
+        str(path),
     )
 
-    for rank in (0, 1):
-        _assert_same(torch.load(tmp_path / f"rank{rank}.pt"), _reference(path))
+    got = dict(direct_io_weights(str(path), lambda name: name.endswith(".e")))
+
+    assert got["model.layers.0.e"].shape == (0, 4)
 
 
-def test_run_sharing_fails_together_on_different_tensors(tmp_path):
+def test_release_keeps_a_neighbours_in_place_write(tmp_path):
+    # Only whole pages inside a released tensor are dropped: a small tensor
+    # sharing a page with its neighbour keeps what the consumer wrote to it.
     path = tmp_path / "shard.safetensors"
-    _checkpoint(path)
-
-    mp.spawn(
-        _sharing_rank,
-        args=(str(tmp_path / "init"), str(path), str(tmp_path), False),
-        nprocs=2,
+    save_file(
+        {"a.w": torch.zeros(16), "b.w": torch.arange(4096, dtype=torch.float32)},
+        str(path),
     )
+    kept = {}
+    for name, tensor in direct_io.released_mapped_weights(str(path), lambda n: True):
+        if name == "a.w":
+            tensor[3] = 7.0
+        kept[name] = tensor
 
-    for rank in (0, 1):
-        result = torch.load(tmp_path / f"rank{rank}.pt")
-        assert "select different tensors" in result["error"]
+    assert kept["a.w"][3] == 7.0
+    assert torch.equal(kept["b.w"], torch.arange(4096, dtype=torch.float32))
+
+
+class _Encoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.start_layer, self.end_layer = 16, 32
+        self.layers = nn.ModuleList(nn.Identity() for _ in range(32))
+
+
+class _Multimodal(nn.Module, SupportsMultiModal):
+    def __init__(self):
+        super().__init__()
+        self.audio_tower = _Encoder()
+        self.language_model = nn.Sequential(_Stack(14, 28, 28))
+
+    def get_language_model(self):
+        return self.language_model
+
+
+def test_stage_range_comes_from_the_language_model():
+    # An encoder tower registered first carries its own pipeline range.
+    assert _pipeline_stage_layer_range(_Multimodal()) == (14, 28)
+
+
+def test_ambiguous_stage_ranges_raise():
+    model = nn.Sequential(_Encoder(), _Stack(14, 28, 28))
+    with pytest.raises(ValueError, match="several pipeline-partial"):
+        _pipeline_stage_layer_range(model)

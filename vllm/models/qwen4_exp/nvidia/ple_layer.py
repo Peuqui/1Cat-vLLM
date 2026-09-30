@@ -78,6 +78,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from ..common.ple import (
+    PLE_SHARD_PREFIX,
     PLEDiskSegment,
     PLEPlacement,
     PLERemotePlacement,
@@ -104,19 +105,6 @@ _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
 
 logger = init_logger(__name__)
-
-# Checkpoint tensors of the PLE table: ``...ngram_embedding.shard_<i>.weight``.
-PLE_SHARD_PREFIX = "ngram_embedding.shard_"
-
-
-def is_ple_checkpoint_shard(name: str) -> bool:
-    """Whether a checkpoint tensor is a shard of the PLE embedding table.
-
-    The ranks read only their rows of these shards and the disk tier serves
-    the rest from the mapped checkpoint, so they must stay memory-mapped
-    under direct I/O (see map_checkpoint_weight of the models).
-    """
-    return f".{PLE_SHARD_PREFIX}" in name or name.startswith(PLE_SHARD_PREFIX)
 
 
 def _advise_random_file_access(tensor: torch.Tensor) -> str:

@@ -98,7 +98,8 @@ except ModuleNotFoundError as exc:
         del module, dtype
 
 
-from .ple_layer import Qwen4ExpPLELayer, is_ple_checkpoint_shard
+from ..common.ple import is_ple_checkpoint_shard
+from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention
 
 logger = init_logger(__name__)

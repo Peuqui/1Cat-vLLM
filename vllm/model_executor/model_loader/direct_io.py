@@ -67,6 +67,13 @@ MADV_RANDOM = 1
 MADV_DONTNEED = 4
 
 
+def _madvise(address: int, length: int, advice: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.madvise(ctypes.c_void_p(address), ctypes.c_size_t(length), advice):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
 def madvise_mapped_tensor(tensor: torch.Tensor, advice: int) -> None:
     """Apply one madvise value to the pages a mapped CPU tensor covers."""
     page_size = os.sysconf("SC_PAGE_SIZE")
@@ -74,14 +81,7 @@ def madvise_mapped_tensor(tensor: torch.Tensor, advice: int) -> None:
     byte_count = tensor.numel() * tensor.element_size()
     aligned_address = address - address % page_size
     aligned_end = (address + byte_count + page_size - 1) // page_size * page_size
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.madvise(
-        ctypes.c_void_p(aligned_address),
-        ctypes.c_size_t(aligned_end - aligned_address),
-        advice,
-    ):
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error))
+    _madvise(aligned_address, aligned_end - aligned_address, advice)
 
 
 def is_decoder_layer_weight(name: str) -> bool:
@@ -154,9 +154,12 @@ def released_mapped_weights(
     and drop each one's pages from the page cache once the consumer is done
     with it (a loader copies a tensor before it asks for the next one).
 
-    A consumer that keeps a tensor still reads correct data: the pages are
-    clean file pages and fault back in from disk.
+    Only whole pages inside the tensor are released, so a neighbour's pages
+    stay. A consumer that keeps an unmodified tensor still reads correct data
+    (the pages fault back in from disk); in-place writes to a kept tensor
+    are lost, since safetensors maps the shard privately.
     """
+    page = os.sysconf("SC_PAGE_SIZE")
     with safe_open(path, framework="pt") as shard, open(path, "rb", buffering=0) as raw:
         header, data_start = _read_header(raw.fileno())
         for name in shard.keys():  # noqa: SIM118
@@ -164,11 +167,16 @@ def released_mapped_weights(
                 continue
             tensor = shard.get_tensor(name)
             yield name, tensor
+            begin, end = header[name]["data_offsets"]
+            if end == begin:
+                continue  # posix_fadvise length 0 would mean "to end of file"
             # A page still mapped here is one the page cache keeps; unmap
             # first, then drop the file range.
-            if tensor.numel():
-                madvise_mapped_tensor(tensor, MADV_DONTNEED)
-            begin, end = header[name]["data_offsets"]
+            address = tensor.data_ptr()
+            first = -(-address // page) * page
+            last = (address + end - begin) // page * page
+            if last > first:
+                _madvise(first, last - first, MADV_DONTNEED)
             os.posix_fadvise(
                 raw.fileno(), data_start + begin, end - begin, os.POSIX_FADV_DONTNEED
             )
@@ -196,20 +204,31 @@ def _coalesce(
 
 
 def _check_same_runs(
-    path: str, runs: list[tuple[int, int, int, int]], sharing: RunSharing
+    path: str,
+    runs: list[tuple[int, int, int, int]],
+    sharing: RunSharing,
+    leader_ok: bool,
 ) -> None:
-    """Every rank of the group must expect the leader's runs; otherwise a
-    broadcast would pair different tensors. All ranks agree on the outcome,
-    so they fail together instead of the leader waiting for a lost peer."""
+    """Every rank of the group must expect the leader's runs, and the leader
+    must have opened the shard; otherwise a broadcast would pair different
+    tensors or never come. All ranks agree on the outcome, so they fail
+    together instead of waiting for a lost peer."""
     leader_runs: list[object] = [runs]
     dist.broadcast_object_list(leader_runs, src=sharing.leader, group=sharing.group)
-    same = torch.tensor([int(leader_runs[0] == runs)])
+    same = torch.tensor([int(leader_runs[0] == runs and leader_ok)])
     dist.all_reduce(same, op=dist.ReduceOp.MIN, group=sharing.group)
     if not same.item():
         raise RuntimeError(
             f"Direct I/O run sharing: the ranks of the group select different "
-            f"tensors of {path}"
+            f"tensors of {path}, or its leader could not open it"
         )
+
+
+def _shared_status(ok: bool, sharing: RunSharing) -> bool:
+    """The leader's read status for the run, as every rank sees it."""
+    status = torch.tensor([int(ok)])
+    dist.broadcast(status, src=sharing.leader, group=sharing.group)
+    return bool(status.item())
 
 
 def direct_io_weights(
@@ -236,18 +255,46 @@ def direct_io_weights(
         tensors.append((data_start + begin, data_start + end, name, info))
     tensors.sort(key=lambda entry: entry[0])
     runs = _coalesce(tensors)
-    if sharing is not None:
-        _check_same_runs(path, runs, sharing)
     reads = sharing is None or sharing.is_leader
+    fd = -1
+    open_error: OSError | None = None
+    if reads:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+        except OSError as error:
+            if sharing is None:
+                raise
+            open_error = error
+    if sharing is not None:
+        try:
+            _check_same_runs(path, runs, sharing, leader_ok=open_error is None)
+        except RuntimeError as error:
+            raise error from open_error
 
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT) if reads else -1
     try:
         for index, last, run_start, run_end in runs:
+            if run_start == run_end:
+                # Only empty tensors: nothing to read, and a zero-size
+                # buffer cannot be mapped.
+                for _, _, name, info in tensors[index:last]:
+                    yield name, torch.empty(info["shape"], dtype=_DTYPES[info["dtype"]])
+                continue
+            read_error: Exception | None = None
             if reads:
-                buffer, buffer_start = _read_run(fd, run_start, run_end)
+                try:
+                    buffer, buffer_start = _read_run(fd, run_start, run_end)
+                except (OSError, EOFError) as error:
+                    if sharing is None:
+                        raise
+                    read_error = error
             else:
                 buffer, buffer_start = _run_buffer(run_start, run_end)
             if sharing is not None:
+                if not _shared_status(read_error is None, sharing):
+                    raise RuntimeError(
+                        f"Direct I/O run sharing: the group's leader could not "
+                        f"read {path}"
+                    ) from read_error
                 dist.broadcast(
                     torch.frombuffer(buffer, dtype=torch.uint8),
                     src=sharing.leader,
@@ -267,5 +314,5 @@ def direct_io_weights(
                 )
                 yield name, raw.view(dtype).reshape(shape)
     finally:
-        if reads:
+        if fd >= 0:
             os.close(fd)
