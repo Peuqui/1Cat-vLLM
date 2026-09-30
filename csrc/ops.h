@@ -159,7 +159,8 @@ void awq_gemm_sm70_out_tile_reduce(
 void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
                        torch::Tensor _kernel, torch::Tensor _scaling_factors,
                        int64_t group_size, int64_t k_ld, int64_t q_ld,
-                       bool gated_silu);
+                       bool gated_silu,
+                       bool preserve_default_partition = false);
 
 std::vector<torch::Tensor> fp8_qpn8_prepare_sm70(torch::Tensor qweight,
                                                  torch::Tensor scales);
@@ -437,6 +438,9 @@ void sm70_f16_gate_mul_out(torch::Tensor out, torch::Tensor _in_feats,
 
 void qwen38_shared_gate_exact_out(torch::Tensor out, torch::Tensor input,
                                   torch::Tensor weight);
+
+void qwen38_shared_gate_sigmoid_mul_out(torch::Tensor out,
+                                        torch::Tensor logits);
 
 int64_t sm70_gemm_import_cache(torch::Tensor device_hint,
                                const std::string& path);
@@ -767,6 +771,12 @@ void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
                      torch::Tensor& out);
 void sm70_qwen38_hc_down_allgather(fptr_t _fa, torch::Tensor& input,
                                    torch::Tensor& output);
+void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
+                          torch::Tensor packed_down, torch::Tensor packed_up,
+                          torch::Tensor partials, torch::Tensor lora,
+                          torch::Tensor local_output, torch::Tensor output,
+                          torch::Tensor injection, bool round_down_partials,
+                          bool cooperative, bool full_unroll, bool fused_chain);
 void sm70_qwen38_hc_gate_mix(fptr_t _fa, torch::Tensor& local_gate,
                              torch::Tensor& branches, torch::Tensor& output);
 void sm70_qwen38_hc_output_allgather(fptr_t _fa, torch::Tensor& local_block,

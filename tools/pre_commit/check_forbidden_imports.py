@@ -45,6 +45,7 @@ CHECK_IMPORTS = {
             "tests/tokenizers_/test_hf.py",
             "tests/utils_/test_hashing.py",
             "tests/compile/test_aot_compile.py",
+            "tests/compile/test_aot_triton_side_table.py",
             "benchmarks/kernels/graph_machete_bench.py",
             "benchmarks/kernels/benchmark_lora.py",
             "benchmarks/kernels/benchmark_machete.py",
@@ -85,6 +86,9 @@ CHECK_IMPORTS = {
             # AOT inspection needs compiler/backend modules that the vLLM
             # runtime shim deliberately does not export.
             "benchmarks/kernels/deepseek_v4_sm70_aot_check.py",
+            # Standalone source-built kernel screen: run before installing a
+            # vLLM runtime, including CPU-only layout tests and compilation.
+            "benchmarks/kernels/benchmark_sm70_hc_batch_reuse.py",
         },
     ),
 }

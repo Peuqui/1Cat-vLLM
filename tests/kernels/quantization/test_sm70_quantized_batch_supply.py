@@ -6,7 +6,7 @@ import pytest
 import torch
 
 
-@pytest.mark.parametrize("rows", [33, 63, 64, 65])
+@pytest.mark.parametrize("rows", [33, 40, 48, 49, 56, 63, 64, 65])
 @pytest.mark.parametrize("kind", ["fp4", "fp8_channel", "fp8_block"])
 @pytest.mark.parametrize("gated", [False, True])
 @pytest.mark.parametrize("k,width", [(2048, 2048), (4352, 2112)])
@@ -133,6 +133,7 @@ def test_batch_captured_tail_keeps_partition(monkeypatch, kind):
             int(meta[0]),
             int(meta[1]),
             False,
+            *([True] if kind == "fp8" else []),
         )
 
     # Only M64 is tuned. Smaller shapes first appear during graph capture,

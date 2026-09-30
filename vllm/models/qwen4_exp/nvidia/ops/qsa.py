@@ -46,6 +46,7 @@ if hasattr(torch.ops._C_qsa_sm70, "qsa_lexicographic_topk"):
 
 
 _SM70_INDEXER_CUBLAS = os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS", "1") == "1"
+_SM70_QSA_MTP_TOPK = os.getenv("VLLM_SM70_QSA_MTP_TOPK", "0") == "1"
 _SM70_INDEXER_SCORE_TILE_BYTES = (
     int(os.getenv("VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB", "64")) * 1024 * 1024
 )
@@ -172,6 +173,7 @@ def _qsa_mqa_paged_kernel(
     STAGES: tl.constexpr,
     MAX_N: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
+    ORDERED_HEAD_SUM: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     dims = tl.arange(0, BLOCK_D)
@@ -233,7 +235,27 @@ def _qsa_mqa_paged_kernel(
         )
         scores = tl.dot(keys, query, out_dtype=tl.float32)
         scores = tl.where(heads[None, :] < NUM_HEADS, tl.maximum(scores, 0.0), 0.0)
-        score = tl.sum(scores, axis=1) / score_divisor
+        if ORDERED_HEAD_SUM:
+            # The SM70 64-column reference sums the four live heads from
+            # left to right. A narrower tile otherwise changes that tree.
+            # Benchmark-only: exact but slower; runtime keeps the default.
+            tl.static_assert(NUM_HEADS == 4)
+            h0 = tl.gather(scores, tl.full((BLOCK_N, 1), 0, tl.int32), 1).reshape(
+                (BLOCK_N,)
+            )
+            h1 = tl.gather(scores, tl.full((BLOCK_N, 1), 1, tl.int32), 1).reshape(
+                (BLOCK_N,)
+            )
+            h2 = tl.gather(scores, tl.full((BLOCK_N, 1), 2, tl.int32), 1).reshape(
+                (BLOCK_N,)
+            )
+            h3 = tl.gather(scores, tl.full((BLOCK_N, 1), 3, tl.int32), 1).reshape(
+                (BLOCK_N,)
+            )
+            score = ((h0 + h1) + h2) + h3
+        else:
+            score = tl.sum(scores, axis=1)
+        score = score / score_divisor
         tl.store(
             logits_ptr + row * stride_logits_row + columns,
             tl.where(page_valid, score, -float("inf")),
@@ -1483,12 +1505,15 @@ def qsa_select_paged_tokens(
                 "Using exact SM70 QSA lexicographic top-k "
                 "(score descending, block index ascending)."
             )
-            _sm70_qsa_lexicographic_topk_op()(
-                logits,
-                visible_blocks,
-                blocks,
-                block_topk,
-            )
+            if _SM70_QSA_MTP_TOPK and blocks.shape[0] in (5, 10):
+                torch.ops._C.qsa_lexicographic_topk(
+                    logits, visible_blocks, blocks, block_topk, True
+                )
+                logger.info_once("Using exact SM70 MTP batch QSA selector.")
+            else:
+                _sm70_qsa_lexicographic_topk_op()(
+                    logits, visible_blocks, blocks, block_topk
+                )
         else:
             topk_op = (
                 torch.ops._C.cooperative_topk
