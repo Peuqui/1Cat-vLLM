@@ -379,8 +379,14 @@ class DefaultModelLoader(BaseModelLoader):
         parallelism, the decoder layers another stage owns. A memory-mapped
         shard only reads what a stage touches; direct I/O reads up front, so
         it must leave those tensors out itself."""
+        from vllm.distributed import get_pp_group
+
         skip_weight = getattr(model, "skip_checkpoint_weight", None)
         if self.load_config.safetensors_load_strategy != "direct":
+            return skip_weight
+        # Without pipeline parallelism there is no stage to filter, and not
+        # every multimodal model can name its language model.
+        if get_pp_group().world_size == 1:
             return skip_weight
         layer_range = _pipeline_stage_layer_range(model)
         if layer_range is None:

@@ -224,10 +224,11 @@ def _check_same_runs(
         )
 
 
-def _shared_status(ok: bool, sharing: RunSharing) -> bool:
-    """The leader's read status for the run, as every rank sees it."""
+def _group_ready(ok: bool, sharing: RunSharing) -> bool:
+    """Whether every rank of the group has its part of the run: the leader
+    the data it read, the others a buffer to receive it into."""
     status = torch.tensor([int(ok)])
-    dist.broadcast(status, src=sharing.leader, group=sharing.group)
+    dist.all_reduce(status, op=dist.ReduceOp.MIN, group=sharing.group)
     return bool(status.item())
 
 
@@ -265,13 +266,13 @@ def direct_io_weights(
             if sharing is None:
                 raise
             open_error = error
-    if sharing is not None:
-        try:
-            _check_same_runs(path, runs, sharing, leader_ok=open_error is None)
-        except RuntimeError as error:
-            raise error from open_error
 
     try:
+        if sharing is not None:
+            try:
+                _check_same_runs(path, runs, sharing, leader_ok=open_error is None)
+            except RuntimeError as error:
+                raise error from open_error
         for index, last, run_start, run_end in runs:
             if run_start == run_end:
                 # Only empty tensors: nothing to read, and a zero-size
@@ -279,22 +280,22 @@ def direct_io_weights(
                 for _, _, name, info in tensors[index:last]:
                     yield name, torch.empty(info["shape"], dtype=_DTYPES[info["dtype"]])
                 continue
-            read_error: Exception | None = None
-            if reads:
-                try:
+            run_error: Exception | None = None
+            try:
+                if reads:
                     buffer, buffer_start = _read_run(fd, run_start, run_end)
-                except (OSError, EOFError) as error:
-                    if sharing is None:
-                        raise
-                    read_error = error
-            else:
-                buffer, buffer_start = _run_buffer(run_start, run_end)
+                else:
+                    buffer, buffer_start = _run_buffer(run_start, run_end)
+            except (OSError, EOFError) as error:
+                if sharing is None:
+                    raise
+                run_error = error
             if sharing is not None:
-                if not _shared_status(read_error is None, sharing):
+                if not _group_ready(run_error is None, sharing):
                     raise RuntimeError(
-                        f"Direct I/O run sharing: the group's leader could not "
-                        f"read {path}"
-                    ) from read_error
+                        f"Direct I/O run sharing: a rank of the group could not "
+                        f"read or buffer {path}"
+                    ) from run_error
                 dist.broadcast(
                     torch.frombuffer(buffer, dtype=torch.uint8),
                     src=sharing.leader,

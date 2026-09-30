@@ -166,12 +166,32 @@ def _sharing_rank(rank, init_file, path, out_dir, mode):
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2
     )
+    open_fds: set[int] = set()
+    real_open, real_close = direct_io.os.open, direct_io.os.close
+
+    def tracked_open(*args):
+        fd = real_open(*args)
+        open_fds.add(fd)
+        return fd
+
+    def tracked_close(fd):
+        open_fds.discard(fd)
+        real_close(fd)
+
+    direct_io.os.open = tracked_open
+    direct_io.os.close = tracked_close
     if rank == 1:
         # The follower receives every run and must not read the disk.
         def no_disk(*args):
             raise AssertionError("the follower read the disk")
 
         direct_io._read_run = no_disk
+        if mode == "follower_cannot_buffer":
+
+            def no_memory(*args):
+                raise OSError(12, "Cannot allocate memory")
+
+            direct_io._run_buffer = no_memory
     elif mode == "leader_cannot_open":
 
         def no_open(*args):
@@ -199,6 +219,7 @@ def _sharing_rank(rank, init_file, path, out_dir, mode):
     except RuntimeError as error:
         torch.save({"error": str(error)}, f"{out_dir}/rank{rank}.pt")
     finally:
+        torch.save(len(open_fds), f"{out_dir}/open_fds{rank}.pt")
         dist.destroy_process_group()
 
 
@@ -210,6 +231,8 @@ def _run_sharing(tmp_path, mode):
         args=(str(tmp_path / "init"), str(path), str(tmp_path), mode),
         nprocs=2,
     )
+    for rank in (0, 1):
+        assert torch.load(tmp_path / f"open_fds{rank}.pt") == 0, "leaked shard fd"
     return path, [torch.load(tmp_path / f"rank{rank}.pt") for rank in (0, 1)]
 
 
@@ -224,7 +247,8 @@ def test_run_sharing_reads_once_per_group(tmp_path):
     [
         ("different_tensors", "select different tensors"),
         ("leader_cannot_open", "select different tensors"),
-        ("leader_cannot_read", "leader could not read"),
+        ("leader_cannot_read", "could not read or buffer"),
+        ("follower_cannot_buffer", "could not read or buffer"),
     ],
 )
 def test_run_sharing_fails_together(tmp_path, mode, message):
