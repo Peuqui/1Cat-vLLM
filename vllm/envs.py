@@ -206,25 +206,11 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QPN2_M16_NATIVE: bool = True
     VLLM_SM70_NVFP4_QPN2_PACK: str = "auto"
     # Fork switches (v100-skinny); registered so they enter the compile factors.
-    VLLM_SKINNY_NVFP4: bool = False
     VLLM_SKINNY_NVFP4_SRC: str | None = None
-    VLLM_SKINNY_MAX_M: int = 64
-    VLLM_SKINNY_QPN: bool = True
-    VLLM_SKINNY_DROP_CT: bool = True
-    VLLM_SKINNY_QPN2: bool = True
-    VLLM_SKINNY_DENSE_PREFILL: bool = True
-    VLLM_SKINNY_ROUTE_COUNT_FILE: str | None = None
-    VLLM_SKINNY_LMHEAD: bool = False
-    VLLM_SKINNY_LMHEAD_NATIVE: str = ""
-    VLLM_SKINNY_QPN_LMHEAD: bool = True
-    VLLM_SKINNY_FUSED_ARGMAX: bool = False
     VLLM_SKINNY_MXFP4_SCALES: bool = True
     VLLM_SM70_NVFP4_MOE_SKINNY: bool = True
     VLLM_SM70_NVFP4_MOE_GROUPED_MAX_TOKENS: int = 512
     VLLM_SM70_NVFP4_MOE_QPN_CFG: str = "16,1,8,1"
-    VLLM_SM70_NVFP4_EMU_CHUNK: int = 4
-    VLLM_SM70_MODELOPT: bool = True
-    VLLM_SM70_FP8_REFERENCE: bool = True
     VLLM_SM70_QPN8: bool = True
     VLLM_SM70_QPN8_TWOOP: bool = False
     VLLM_SM70_QPN8_CHUNK_MAX: int = 96
@@ -2014,20 +2000,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fork switches (v100-skinny). Registered so that each one enters the
     # torch.compile cache key: they change the traced graph, and an
     # unregistered switch let a cached graph of the other path load.
-    "VLLM_SKINNY_NVFP4": lambda: os.getenv("VLLM_SKINNY_NVFP4", "0") == "1",
     "VLLM_SKINNY_NVFP4_SRC": lambda: os.getenv("VLLM_SKINNY_NVFP4_SRC"),
-    "VLLM_SKINNY_MAX_M": lambda: int(os.getenv("VLLM_SKINNY_MAX_M", "64")),
-    "VLLM_SKINNY_QPN": lambda: os.getenv("VLLM_SKINNY_QPN", "1") == "1",
-    "VLLM_SKINNY_DROP_CT": lambda: os.getenv("VLLM_SKINNY_DROP_CT", "1") == "1",
-    "VLLM_SKINNY_QPN2": lambda: os.getenv("VLLM_SKINNY_QPN2", "1") == "1",
-    "VLLM_SKINNY_DENSE_PREFILL": lambda: os.getenv("VLLM_SKINNY_DENSE_PREFILL", "1")
-    == "1",
-    "VLLM_SKINNY_ROUTE_COUNT_FILE": lambda: os.getenv("VLLM_SKINNY_ROUTE_COUNT_FILE"),
-    "VLLM_SKINNY_LMHEAD": lambda: os.getenv("VLLM_SKINNY_LMHEAD", "0") == "1",
-    "VLLM_SKINNY_LMHEAD_NATIVE": lambda: os.getenv("VLLM_SKINNY_LMHEAD_NATIVE", ""),
-    "VLLM_SKINNY_QPN_LMHEAD": lambda: os.getenv("VLLM_SKINNY_QPN_LMHEAD", "1") == "1",
-    "VLLM_SKINNY_FUSED_ARGMAX": lambda: os.getenv("VLLM_SKINNY_FUSED_ARGMAX", "0")
-    == "1",
     "VLLM_SKINNY_MXFP4_SCALES": lambda: os.getenv("VLLM_SKINNY_MXFP4_SCALES", "1")
     == "1",
     "VLLM_SM70_NVFP4_MOE_SKINNY": lambda: os.getenv("VLLM_SM70_NVFP4_MOE_SKINNY", "1")
@@ -2038,11 +2011,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_NVFP4_MOE_QPN_CFG": lambda: os.getenv(
         "VLLM_SM70_NVFP4_MOE_QPN_CFG", "16,1,8,1"
     ),
-    "VLLM_SM70_NVFP4_EMU_CHUNK": lambda: int(
-        os.getenv("VLLM_SM70_NVFP4_EMU_CHUNK", "4")
-    ),
-    "VLLM_SM70_MODELOPT": lambda: os.getenv("VLLM_SM70_MODELOPT", "1") == "1",
-    "VLLM_SM70_FP8_REFERENCE": lambda: os.getenv("VLLM_SM70_FP8_REFERENCE", "1") == "1",
     "VLLM_SM70_QPN8": lambda: os.getenv("VLLM_SM70_QPN8", "1") == "1",
     "VLLM_SM70_QPN8_TWOOP": lambda: os.getenv("VLLM_SM70_QPN8_TWOOP", "0") == "1",
     "VLLM_SM70_QPN8_CHUNK_MAX": lambda: int(

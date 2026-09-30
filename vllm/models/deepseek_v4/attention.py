@@ -96,39 +96,6 @@ def _fill_short_context_topk_indices(
     )
 
 
-# ---------------------------------------------------------------------------
-# fork: pre-Hopper (no DeepGEMM) reference paths. The fp8_einsum O-projection
-# and the Triton fp8 quant ops need Hopper (Triton refuses fp8e4nv casts on
-# Volta); on such devices wo_a is fp16-dequantized at load (QPN8-blk is_bmm
-# route) and these torch implementations mirror the kernels' documented
-# contracts exactly (incl. the bf16 rounding round-trip of the rotated Q).
-# ---------------------------------------------------------------------------
-
-
-def _torch_indexer_q_rope_quant(
-    positions, q, cos_sin, weights, softmax_scale, head_scale
-):
-    t, h, d = q.shape
-    half = cos_sin.shape[-1] // 2
-    rot = 2 * half
-    nope = d - rot
-    x = q.to(torch.float32)
-    cs = cos_sin[positions].to(torch.float32)
-    cos = cs[:, :half].unsqueeze(1)
-    sin = cs[:, half:].unsqueeze(1)
-    xr = x[..., nope:]
-    e, o = xr[..., 0::2], xr[..., 1::2]
-    re = (e * cos - o * sin).to(torch.bfloat16).to(torch.float32)
-    ro = (o * cos + e * sin).to(torch.bfloat16).to(torch.float32)
-    xrot = torch.stack((re, ro), dim=-1).reshape(t, h, rot)
-    xq = torch.cat((x[..., :nope], xrot), dim=-1) if nope else xrot
-    amax = xq.abs().amax(-1).clamp_min(1e-4)
-    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
-    q8 = (xq / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
-    w = weights.to(torch.float32) * scale * softmax_scale * head_scale
-    return q8, w
-
-
 def _is_exact_sm70_cuda() -> bool:
     return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
 
@@ -1067,28 +1034,6 @@ class DeepseekV4Indexer(nn.Module):
             # ReplicatedLinear returns (output, bias); bias is None.
             q, _ = self.wq_b(qr)
             q = q.view(-1, self.n_head, self.head_dim)
-            # Fork fix (v100-skinny): pre-Ampere ranks feed the fp16 Triton
-            # indexer, whose software branch in fused_indexer_q_rope_quant
-            # emits fp16 q + folded weights. The torch fp8 reference below
-            # is the DeepGEMM-less path for Ampere/Ada only; routing
-            # pre-Ampere through it fed fp8 to the fp16 indexer
-            # ("assert q_quant.dtype == torch.float16" in capture).
-            if (
-                current_platform.is_cuda()
-                and not has_deep_gemm()
-                and current_platform.has_device_capability(80)
-            ):
-                assert not self.use_fp4_kv, (
-                    "torch indexer-q fallback supports the FP8 path only"
-                )
-                return _torch_indexer_q_rope_quant(
-                    positions,
-                    q,
-                    rotary_emb.cos_sin_cache,
-                    indexer_weights,
-                    self.softmax_scale,
-                    self.n_head**-0.5,
-                )
             return fused_indexer_q_rope_quant(
                 positions,
                 q,

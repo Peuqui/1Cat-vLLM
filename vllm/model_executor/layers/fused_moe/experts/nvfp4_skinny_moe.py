@@ -26,6 +26,7 @@ gemm(w2 slice) -> weighted scatter-add. Prefill M-dispatch: qpn M<=16,
 decode/verify regime never chunks).
 """
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -46,6 +47,99 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+# kernels/skinny_kernels.cu of a dnv2003/v100-skinny checkout; the source is not
+# part of this tree.
+_SKINNY_SRC = envs.VLLM_SKINNY_NVFP4_SRC
+
+
+def _qpn_prepack(codes: torch.Tensor, scales: torch.Tensor, scale_group: int = 16):
+    """Fragment-order prepack for gemm_qpn: [tile N/32][group K/scale_group]
+    [lane 32] x 8B, nibbles pre-interleaved so the TM decoder's (i, i+4)
+    output is exactly the adjacent-k B-fragment register pair. Pure
+    permutation of the checkpoint bytes.
+
+    ``scale_group`` is how many codes share one scale: 16 for NVFP4
+    (fp8-e4m3), 32 for MXFP4 (E8M0). Only the scale table changes size --
+    the code layout is identical, because a 32-code MXFP4 block is just two
+    adjacent 16-code groups that happen to share a scale."""
+    n, k2 = codes.shape
+    k = k2 * 2
+    if n % 32 or k % 64 or k % scale_group:
+        return None, None
+    dev = codes.device
+    tiles, groups = n // 32, k // scale_group
+    lane = torch.arange(32, device=dev)
+    col = ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) > 0).long() * 4
+    korder = torch.tensor(
+        [0, 2, 4, 6, 1, 3, 5, 7, 8, 10, 12, 14, 9, 11, 13, 15], device=dev
+    )
+    nib = torch.stack([codes & 0xF, codes >> 4], dim=-1).view(n, k)
+    cgroups = k // 16  # code groups: always 16 codes per fragment pair
+    g = torch.arange(groups, device=dev)
+    cg = torch.arange(cgroups, device=dev)
+    kidx = cg.view(cgroups, 1) * 16 + korder.view(1, 16)
+    qc = torch.empty(tiles, cgroups, 32, 8, dtype=torch.uint8, device=dev)
+    qs = torch.empty(tiles, groups, 32, dtype=torch.uint8, device=dev)
+    # Chunk the gather: the int64 broadcast-index intermediates are 16x
+    # the payload — one-shot on lm_head (37984x5120) spikes 2.4 GiB and
+    # OOM'd the memory-profiler forward. Cap transients at ~300 MB.
+    chunk = max(1, 36864 // max(groups, cgroups))
+    for t0 in range(0, tiles, chunk):
+        t1 = min(t0 + chunk, tiles)
+        tt = t1 - t0
+        ncol = torch.arange(t0, t1, device=dev).view(tt, 1) * 32 + col.view(1, 32)
+        nb = nib[
+            ncol.view(tt, 1, 32, 1).expand(tt, cgroups, 32, 16),
+            kidx.view(1, cgroups, 1, 16).expand(tt, cgroups, 32, 16),
+        ]
+        qc[t0:t1] = nb[..., 0::2] | (nb[..., 1::2] << 4)
+        qs[t0:t1] = scales[
+            ncol.view(tt, 1, 32).expand(tt, groups, 32),
+            g.view(1, groups, 1).expand(tt, groups, 32),
+        ]
+    del nib
+    return qc.view(-1).contiguous(), qs.view(-1).contiguous()
+
+
+_skinny_ext = None
+
+
+def _get_skinny_ext():
+    global _skinny_ext
+    if _skinny_ext is None:
+        from torch.utils.cpp_extension import load
+
+        if not _SKINNY_SRC:
+            raise RuntimeError(
+                "The skinny MoE kernels need VLLM_SKINNY_NVFP4_SRC pointing at "
+                "kernels/skinny_kernels.cu of a v100-skinny checkout."
+            )
+
+        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "7.0")
+        # Build for both pre-Ampere targets. An sm_70 cubin does run on
+        # Turing through CUDA's upward binary compatibility, but the compiler
+        # then schedules and allocates registers for Volta. Measured on real
+        # expert shapes (64 experts, N=2048, K=4096, decode batch of 6,
+        # RTX 8000): moe_qpn 0.307 -> 0.292 ms at the w13 config (16,1) and
+        # 0.315 -> 0.294 ms at the w2 config (8,1), i.e. 5-7% for free. The
+        # mma.m8n8k4 instruction itself is inline PTX and stays the same.
+        # Cost: first-boot compile grows from ~70 s to ~270 s, cached after.
+        _skinny_ext = load(
+            name="skinny_nvfp4_v11",
+            sources=[_SKINNY_SRC],
+            extra_cuda_cflags=[
+                "-O3",
+                "--use_fast_math",
+                "-lineinfo",
+                "-gencode=arch=compute_70,code=sm_70",
+                "-gencode=arch=compute_75,code=sm_75",
+            ],
+            verbose=False,
+        )
+        logger.info_once("SM70 skinny NVFP4 kernel loaded from %s", _SKINNY_SRC)
+    return _skinny_ext
+
 
 _SKINNY_MOE_ENABLED = envs.VLLM_SM70_NVFP4_MOE_SKINNY
 # Largest batch the grouped kernel serves. It reads an expert's weights once
@@ -328,10 +422,6 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         Every serving path below reads this layout; there is no
         checkpoint-layout copy left afterwards.
         """
-        from vllm.model_executor.kernels.linear.nvfp4.marlin import (
-            _qpn_prepack,
-        )
-
         w13, w2 = layer.w13_weight.data, layer.w2_weight.data
         for name, w in (("w13", w13), ("w2", w2)):
             if w.size(1) % 32 or (w.size(2) * 2) % 64:
@@ -524,10 +614,6 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         self._check_apply_args(
             w1, hidden_states, expert_map, apply_router_weight_on_input
         )
-        from vllm.model_executor.kernels.linear.nvfp4.marlin import (
-            _get_skinny_ext,
-        )
-
         scales = self._get_scale_caches()
         ext = _get_skinny_ext()
         num_tokens, top_k = topk_ids.shape
@@ -630,10 +716,6 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
                 "Per-expert skinny NVFP4 MoE does not support "
                 "apply_router_weight_on_input."
             )
-
-        from vllm.model_executor.kernels.linear.nvfp4.marlin import (
-            _get_skinny_ext,
-        )
 
         scales = self._get_scale_caches()
         inter_dim = self.adjust_N_for_activation(w1.size(1), activation)

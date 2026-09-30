@@ -123,7 +123,7 @@ def test_moe_qpn_mxfp4_mode_matches_the_checkpoint_scales(capability):
     ]
     if not devices:
         pytest.skip(f"no GPU with capability {capability}")
-    from vllm.model_executor.kernels.linear.nvfp4.marlin import (
+    from vllm.model_executor.layers.fused_moe.experts.nvfp4_skinny_moe import (
         _get_skinny_ext,
         _qpn_prepack,
     )
