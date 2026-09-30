@@ -36,12 +36,14 @@ from vllm.config.load import (
     LoadConfig,
 )
 from vllm.distributed import get_tensor_model_parallel_rank, get_world_group
+from vllm.distributed.parallel_state import get_tp_group, model_parallel_is_initialized
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
 )
 from vllm.model_executor.model_loader.direct_io import (
+    RunSharing,
     direct_io_weights,
     is_decoder_layer_weight,
     released_mapped_weights,
@@ -958,6 +960,18 @@ def _keep_weight(
     return skip_weight is None or not skip_weight(name)
 
 
+def _direct_io_sharing(local_expert_ids: set[int] | None) -> RunSharing | None:
+    """The tensor-parallel group reads the same decoder tensors, so its first
+    rank reads them for all; not under expert parallelism, where each rank
+    keeps other experts."""
+    if local_expert_ids is not None or not model_parallel_is_initialized():
+        return None
+    tp_group = get_tp_group()
+    if tp_group.world_size == 1:
+        return None
+    return RunSharing(tp_group.cpu_group, tp_group.first_rank, tp_group.is_first_rank)
+
+
 def _keep_direct_weight(
     name: str,
     *,
@@ -1113,7 +1127,9 @@ def safetensors_weights_iterator(
                 map_weight=map_weight,
             )
             yield from direct_io_weights(
-                st_file, functools.partial(keep, read_directly=True)
+                st_file,
+                functools.partial(keep, read_directly=True),
+                _direct_io_sharing(local_expert_ids),
             )
             yield from released_mapped_weights(
                 st_file, functools.partial(keep, read_directly=False)

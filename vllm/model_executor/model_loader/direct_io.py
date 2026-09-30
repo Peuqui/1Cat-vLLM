@@ -24,9 +24,11 @@ import mmap
 import os
 import struct
 from collections.abc import Callable, Generator
+from dataclasses import dataclass
 
 import regex as re
 import torch
+import torch.distributed as dist
 from safetensors import safe_open
 
 # O_DIRECT needs offsets, lengths and buffers aligned to the logical block
@@ -105,15 +107,32 @@ def _read_header(fd: int) -> tuple[dict, int]:
     return header, 8 + header_len
 
 
-def _read_run(fd: int, start: int, end: int) -> tuple[mmap.mmap, int]:
-    """Read [start, end) with O_DIRECT; return the buffer and the aligned
-    file offset it starts at."""
+@dataclass(frozen=True)
+class RunSharing:
+    """Ranks that read the same tensors of a shard (the tensor-parallel ranks
+    of one pipeline stage): the leader reads each run from disk and
+    broadcasts it over the CPU group, so the group reads the checkpoint once."""
+
+    group: dist.ProcessGroup
+    leader: int  # global rank
+    is_leader: bool
+
+
+def _run_buffer(start: int, end: int) -> tuple[mmap.mmap, int]:
+    """An aligned buffer for [start, end) and the file offset it starts at."""
     begin = start - start % _ALIGN
     stop = -(-end // _ALIGN) * _ALIGN
     # Private, not the default shared mapping: shared anonymous memory is
     # shmem, which only swap can evict and which /proc/self/maps shows as
     # the file /dev/zero.
     buffer = mmap.mmap(-1, stop - begin, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    return buffer, begin
+
+
+def _read_run(fd: int, start: int, end: int) -> tuple[mmap.mmap, int]:
+    """Read [start, end) with O_DIRECT; return the buffer and the aligned
+    file offset it starts at."""
+    buffer, begin = _run_buffer(start, end)
     view = memoryview(buffer)
     done = 0
     while begin + done < end:
@@ -155,11 +174,52 @@ def released_mapped_weights(
             )
 
 
+def _coalesce(
+    tensors: list[tuple[int, int, str, dict]],
+) -> list[tuple[int, int, int, int]]:
+    """(first, last, start, end): tensors[first:last] are read as one run."""
+    runs = []
+    index = 0
+    while index < len(tensors):
+        run_start, run_end = tensors[index][0], tensors[index][1]
+        last = index + 1
+        while (
+            last < len(tensors)
+            and tensors[last][0] - run_end < _MAX_GAP
+            and tensors[last][1] - run_start <= _MAX_RUN
+        ):
+            run_end = max(run_end, tensors[last][1])
+            last += 1
+        runs.append((index, last, run_start, run_end))
+        index = last
+    return runs
+
+
+def _check_same_runs(
+    path: str, runs: list[tuple[int, int, int, int]], sharing: RunSharing
+) -> None:
+    """Every rank of the group must expect the leader's runs; otherwise a
+    broadcast would pair different tensors. All ranks agree on the outcome,
+    so they fail together instead of the leader waiting for a lost peer."""
+    leader_runs: list[object] = [runs]
+    dist.broadcast_object_list(leader_runs, src=sharing.leader, group=sharing.group)
+    same = torch.tensor([int(leader_runs[0] == runs)])
+    dist.all_reduce(same, op=dist.ReduceOp.MIN, group=sharing.group)
+    if not same.item():
+        raise RuntimeError(
+            f"Direct I/O run sharing: the ranks of the group select different "
+            f"tensors of {path}"
+        )
+
+
 def direct_io_weights(
-    path: str, keep: Callable[[str], bool]
+    path: str,
+    keep: Callable[[str], bool],
+    sharing: RunSharing | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Yield the tensors of one safetensors shard for which `keep` is True,
-    read with O_DIRECT in coalesced runs in file order."""
+    read with O_DIRECT in coalesced runs in file order. With *sharing* only
+    the group's leader reads; the others receive each run from it."""
     with open(path, "rb", buffering=0) as header_file:
         header, data_start = _read_header(header_file.fileno())
 
@@ -175,21 +235,24 @@ def direct_io_weights(
         begin, end = info["data_offsets"]
         tensors.append((data_start + begin, data_start + end, name, info))
     tensors.sort(key=lambda entry: entry[0])
+    runs = _coalesce(tensors)
+    if sharing is not None:
+        _check_same_runs(path, runs, sharing)
+    reads = sharing is None or sharing.is_leader
 
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECT) if reads else -1
     try:
-        index = 0
-        while index < len(tensors):
-            run_start, run_end = tensors[index][0], tensors[index][1]
-            last = index + 1
-            while (
-                last < len(tensors)
-                and tensors[last][0] - run_end < _MAX_GAP
-                and tensors[last][1] - run_start <= _MAX_RUN
-            ):
-                run_end = max(run_end, tensors[last][1])
-                last += 1
-            buffer, buffer_start = _read_run(fd, run_start, run_end)
+        for index, last, run_start, run_end in runs:
+            if reads:
+                buffer, buffer_start = _read_run(fd, run_start, run_end)
+            else:
+                buffer, buffer_start = _run_buffer(run_start, run_end)
+            if sharing is not None:
+                dist.broadcast(
+                    torch.frombuffer(buffer, dtype=torch.uint8),
+                    src=sharing.leader,
+                    group=sharing.group,
+                )
             for begin, end, name, info in tensors[index:last]:
                 dtype = _DTYPES[info["dtype"]]
                 shape = info["shape"]
@@ -203,6 +266,6 @@ def direct_io_weights(
                     offset=begin - buffer_start,
                 )
                 yield name, raw.view(dtype).reshape(shape)
-            index = last
     finally:
-        os.close(fd)
+        if reads:
+            os.close(fd)

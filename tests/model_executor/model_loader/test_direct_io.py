@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import nn
@@ -157,3 +159,58 @@ def test_only_decoder_layers_are_read_directly(tmp_path):
     for name, tensor in got.items():
         if tensor.numel():
             assert _file_backed(tensor) == (name in mapped), name
+
+
+def _sharing_rank(rank, init_file, path, out_dir, keep_all):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=2
+    )
+    if rank == 1:
+        # The follower receives every run and must not read the disk.
+        def no_disk(*args):
+            raise AssertionError("the follower read the disk")
+
+        direct_io._read_run = no_disk
+    sharing = direct_io.RunSharing(dist.group.WORLD, 0, rank == 0)
+    keep = (
+        (lambda name: True) if keep_all or rank == 0 else (lambda name: "mtp" in name)
+    )
+    try:
+        got = {
+            name: tensor.clone()
+            for name, tensor in direct_io_weights(path, keep, sharing)
+        }
+        torch.save(got, f"{out_dir}/rank{rank}.pt")
+    except RuntimeError as error:
+        torch.save({"error": str(error)}, f"{out_dir}/rank{rank}.pt")
+    finally:
+        dist.destroy_process_group()
+
+
+def test_run_sharing_reads_once_per_group(tmp_path):
+    path = tmp_path / "shard.safetensors"
+    _checkpoint(path)
+
+    mp.spawn(
+        _sharing_rank,
+        args=(str(tmp_path / "init"), str(path), str(tmp_path), True),
+        nprocs=2,
+    )
+
+    for rank in (0, 1):
+        _assert_same(torch.load(tmp_path / f"rank{rank}.pt"), _reference(path))
+
+
+def test_run_sharing_fails_together_on_different_tensors(tmp_path):
+    path = tmp_path / "shard.safetensors"
+    _checkpoint(path)
+
+    mp.spawn(
+        _sharing_rank,
+        args=(str(tmp_path / "init"), str(path), str(tmp_path), False),
+        nprocs=2,
+    )
+
+    for rank in (0, 1):
+        result = torch.load(tmp_path / f"rank{rank}.pt")
+        assert "select different tensors" in result["error"]
