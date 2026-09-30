@@ -223,8 +223,6 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_MOE_GROUPED_MAX_TOKENS: int = 512
     VLLM_SM70_NVFP4_MOE_QPN_CFG: str = "16,1,8,1"
     VLLM_SM70_NVFP4_EMU_CHUNK: int = 4
-    VLLM_SM70_QPN8_BLK_CFG: str = "16,3"
-    VLLM_SM70_QPN8_BLK_WMMA_MAX: int = 256
     VLLM_SM70_MODELOPT: bool = True
     VLLM_SM70_FP8_REFERENCE: bool = True
     VLLM_SM70_QPN8: bool = True
@@ -2042,10 +2040,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_NVFP4_EMU_CHUNK": lambda: int(
         os.getenv("VLLM_SM70_NVFP4_EMU_CHUNK", "4")
-    ),
-    "VLLM_SM70_QPN8_BLK_CFG": lambda: os.getenv("VLLM_SM70_QPN8_BLK_CFG", "16,3"),
-    "VLLM_SM70_QPN8_BLK_WMMA_MAX": lambda: int(
-        os.getenv("VLLM_SM70_QPN8_BLK_WMMA_MAX", "256")
     ),
     "VLLM_SM70_MODELOPT": lambda: os.getenv("VLLM_SM70_MODELOPT", "1") == "1",
     "VLLM_SM70_FP8_REFERENCE": lambda: os.getenv("VLLM_SM70_FP8_REFERENCE", "1") == "1",
