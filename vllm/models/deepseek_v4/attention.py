@@ -23,9 +23,8 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
-    quantize_and_insert_k_cache,
 )
-from vllm.utils.deep_gemm import fp8_einsum, has_deep_gemm
+from vllm.utils.deep_gemm import fp8_einsum
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inv_rope_einsum
 
 if TYPE_CHECKING:
@@ -96,29 +95,24 @@ def _fill_short_context_topk_indices(
     )
 
 
-def _is_exact_sm70_cuda() -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+def _is_volta_or_turing_cuda() -> bool:
+    # Both lack BF16, FP8 and FlashMLA, so Turing takes the SM70 route too. Its
+    # kernels are Triton with software FP8; the TurboMind-backed pieces it calls
+    # keep their own exact-SM70 checks.
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        70
+    )
 
 
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
     """Pick the platform-specific V4 sparse MLA impl class. Sole platform check."""
-    # fork: the "ROCM" impl carries no AMD dependency -- it is pure Triton and
-    # subclasses the NVIDIA backend/metadata builders. FlashMLA needs SM90+, so
-    # pre-Hopper CUDA takes the same Triton path instead of having none.
-    # NOTE (2026-09-03): the exact-SM70 branch below this catch-all is dead
-    # code ON PURPOSE for pipeline boots -- selecting the SM70 impl per stage
-    # gives PP stages DIFFERENT attention backends (V4_SM70_TRITON_SPARSE vs
-    # ROCM_V4_FLASHMLA_SPARSE) and the cross-stage metadata contract breaks
-    # (PP0 prefill lost its topk indices, assert in amd/rocm.py:795). An A/B
-    # of the SM70 kernels must either run standalone or make every stage
-    # declare a compatible backend/metadata plan first.
-    if current_platform.is_rocm() or not current_platform.has_device_capability(90):
+    if current_platform.is_rocm():
         from vllm.models.deepseek_v4.amd.rocm import (
             DeepseekV4ROCMAiterMLASparseImpl,
         )
 
         return DeepseekV4ROCMAiterMLASparseImpl
-    if _is_exact_sm70_cuda():
+    if _is_volta_or_turing_cuda():
         from vllm.models.deepseek_v4.sm70.sparse import (
             DeepseekV4SM70SparseImpl,
         )
@@ -195,7 +189,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        self._use_sm70_path = _is_exact_sm70_cuda()
+        self._use_sm70_path = _is_volta_or_turing_cuda()
         self.n_local_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
@@ -348,13 +342,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
         o = o_padded[:, : self.n_local_heads, :]
 
-        # Fork fix (v100-skinny): the grouped SM70 projection needs a
-        # TurboMind-prepared wo_a. With the QPN8-blk is_bmm route wo_a is
-        # fp16-dequantised at load ([N, K] matrix, `_qpn8_dequant16`) and
-        # the reference einsum below is the matching implementation --
-        # calling the grouped path on it gives z the wrong shape, off by the group count
-        # ("shape '[T, 4096]' is invalid for input of size T*8*4096").
-        if self._use_sm70_path and not getattr(self.wo_a, "_qpn8_dequant16", False):
+        if self._use_sm70_path:
             from vllm.models.deepseek_v4.sm70.projection import (
                 sm70_grouped_output_projection,
             )
@@ -380,27 +368,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.o_lora_rank,
                 self.wo_a,
             )
-            return self.wo_b(z.flatten(1))
-
-        if not has_deep_gemm():
-            # fork: pre-Hopper reference O path -- wo_a.weight is the
-            # fp16-dequantized [N, K] matrix (QPN8-blk is_bmm route).
-            if not getattr(self.wo_a, "_qpn8_dequant16", False):
-                raise RuntimeError(
-                    "DeepSeek-V4 O projection without DeepGEMM needs the "
-                    "fp16-dequantized wo_a of the QPN8 block-FP8 route; "
-                    "this stage has the FP8 weight."
-                )
-            from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-                _apply_inv_rope_ref,
-            )
-
-            o_ref = _apply_inv_rope_ref(
-                self.rotary_emb, o, positions, self.rope_head_dim
-            ).to(o.dtype)
-            o_ref = o_ref.view(num_tokens, self.n_local_groups, -1)
-            w = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            z = torch.einsum("tgd,grd->tgr", o_ref, w)
             return self.wo_b(z.flatten(1))
 
         # O projection: inverse RoPE + FP8 quant + einsum + wo_b
@@ -668,33 +635,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         #            allocates and returns the padded q tensor.
         #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert
         # kv is unchanged; mla_attn reads kv solely via swa_kv_cache.
-        if not current_platform.has_device_capability(80):
-            # fork: the fused kernel is gated sm80+. Both halves exist as
-            # tested components, so this assembles them instead of porting
-            # the kernel: q_head_norm is the same weightless per-head RMSNorm
-            # the kernel applies, DeepseekV4ScalingRotaryEmbedding.forward_native
-            # is the GPT-J rope on the LAST rotary_dim (its own docstring), and
-            # quantize_and_insert_k_cache is the Triton twin of the KV half --
-            # same UE8M0 quant, same 448-fp8 + 128-bf16 + 8-scale byte layout.
-            q = self.q_head_norm(q)
-            # rope q and kv separately: forward_native broadcasts cos/sin over
-            # a head dimension, which kv ([tokens, head_dim]) does not have.
-            q, _ = self.rotary_emb.forward_native(positions, q)
-            kv_roped, _ = self.rotary_emb.forward_native(positions, kv.unsqueeze(1))
-            quantize_and_insert_k_cache(
-                kv_roped.squeeze(1).to(torch.bfloat16).contiguous(),
-                swa_kv_cache_2d,
-                swa_metadata.slot_mapping,
-                block_size=swa_metadata.block_size,
-            )
-            if self.n_local_heads < self.padded_heads:
-                q = F.pad(
-                    q,
-                    (0, 0, 0, self.padded_heads - self.n_local_heads),
-                    value=0.0,
-                )
-            return q
-
         return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
             q,
             kv,
@@ -782,13 +722,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             vllm_config.scheduler_config.max_num_batched_tokens
         )
         self.max_model_len = vllm_config.model_config.max_model_len
-        # Most query tokens one decode step can carry: every running request
-        # with its speculative tokens. Sizes the decode kernel workspace.
-        self.max_decode_query_tokens = min(
-            self.max_num_batched_tokens,
-            vllm_config.scheduler_config.max_num_seqs
-            * (1 + vllm_config.num_speculative_tokens),
-        )
         # DeepseekV4 only supports fp8 kv-cache format for now.
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
 

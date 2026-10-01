@@ -469,13 +469,12 @@ class DeepseekCompressor(nn.Module):
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
 
         compress_norm_rope_store_fn: Callable[..., None]
-        if current_platform.is_cuda() and not current_platform.is_device_capability(
-            (7, 0)
+        if (
+            current_platform.is_cuda()
+            and not current_platform.is_device_capability_family(70)
         ):
             # NVIDIA GPUs.
-            # fork: the CuteDSL kernel needs Hopper+. Pre-Hopper takes the
-            # Triton kernel that AMD already uses for this exact layout.
-            if self.head_dim == 512 and current_platform.has_device_capability(90):
+            if self.head_dim == 512:
                 from .nvidia.ops.sparse_attn_compress_cutedsl import (
                     compress_norm_rope_store_cutedsl,
                 )
@@ -488,7 +487,7 @@ class DeepseekCompressor(nn.Module):
                 # Use a triton kernel.
                 compress_norm_rope_store_fn = compress_norm_rope_store_triton
         else:
-            # AMD GPUs.
+            # AMD GPUs, Volta and Turing.
             # Always use a triton kernel.
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
 

@@ -120,17 +120,6 @@ class QPN8Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
         if weight.dtype != torch.float8_e4m3fn:
             weight = weight.view(torch.float8_e4m3fn)
 
-        if getattr(layer, "is_bmm", False):
-            # is_bmm layers (DeepSeek-V4 wo_a): the model consumes layer.weight
-            # directly in a grouped einsum (the fp8_einsum path needs
-            # DeepGEMM), so the weight is dequantized to fp16 once at load.
-            full = block_scales.repeat_interleave(128, 0).repeat_interleave(128, 1)
-            layer.weight = torch.nn.Parameter(
-                (weight.to(torch.float32) * full).half(), requires_grad=False
-            )
-            layer._qpn8_dequant16 = True
-            return
-
         codes, group_scales = sm70_ops.fp8_qpn8_prepare_sm70(weight, block_scales)
         k_dim, n_dim = (int(dim) for dim in codes.shape)
         layer._qpn8_codes = codes
@@ -154,8 +143,6 @@ class QPN8Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
         bias: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        if getattr(layer, "_qpn8_dequant16", False):
-            return torch.nn.functional.linear(x, layer.weight, bias)
         codes = layer._qpn8_codes
         split_k, accumulator_chains, prefetch_codes = layer._qpn8_cfg
         y = torch.ops.sm70_fp8.qpn8_native_linear(

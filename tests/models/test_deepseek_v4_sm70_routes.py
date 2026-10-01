@@ -3,6 +3,7 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from vllm.platforms.interface import DeviceCapability
@@ -19,7 +20,7 @@ def test_sm70_sparse_backend_contract():
     assert DeepseekV4SM70SparseBackend.supports_compute_capability(
         DeviceCapability(7, 0)
     )
-    assert not DeepseekV4SM70SparseBackend.supports_compute_capability(
+    assert DeepseekV4SM70SparseBackend.supports_compute_capability(
         DeviceCapability(7, 5)
     )
     assert not DeepseekV4SM70SparseBackend.supports_compute_capability(
@@ -40,17 +41,20 @@ def test_sm70_sparse_backend_uses_v4_packed_kv_layout():
     ) == (3, 256, 584)
 
 
-def test_pre_hopper_cuda_selects_the_generic_triton_impl():
-    # Every pre-Hopper stage takes the same impl on purpose: per-stage impls
-    # gave pipeline stages different backends and broke the metadata contract.
+@pytest.mark.parametrize("minor", [0, 5])
+def test_volta_and_turing_select_triton_sparse_impl(minor):
     from vllm.models.deepseek_v4 import attention
-    from vllm.models.deepseek_v4.amd.rocm import DeepseekV4ROCMAiterMLASparseImpl
+    from vllm.models.deepseek_v4.sm70.sparse import DeepseekV4SM70SparseImpl
 
+    capability = DeviceCapability(7, minor)
     platform = MagicMock()
     platform.is_rocm.return_value = False
-    platform.has_device_capability.return_value = False
+    platform.is_cuda.return_value = True
+    platform.is_device_capability_family.side_effect = (
+        lambda family: capability.to_int() // 10 == family // 10
+    )
     with patch.object(attention, "current_platform", platform):
-        assert attention._select_v4_sparse_impl() is DeepseekV4ROCMAiterMLASparseImpl
+        assert attention._select_v4_sparse_impl() is DeepseekV4SM70SparseImpl
 
 
 def test_sm70_sparse_qk_dsplit_uses_graph_workspace():
@@ -109,7 +113,7 @@ def test_sm70_sparse_qk_dsplit_uses_one_tp4_head_group():
     assert _qk_dsplit_block_h(8) == 8
 
 
-def test_hopper_and_newer_select_flashmla():
+def test_hopper_does_not_select_sm70_impl():
     from vllm.models.deepseek_v4 import attention
     from vllm.models.deepseek_v4.nvidia.flashmla import (
         DeepseekV4FlashMLASparseImpl,
@@ -117,11 +121,9 @@ def test_hopper_and_newer_select_flashmla():
 
     platform = MagicMock()
     platform.is_rocm.return_value = False
-    platform.has_device_capability.return_value = True
-    with (
-        patch.object(attention, "current_platform", platform),
-        patch.object(attention, "_is_exact_sm70_cuda", return_value=False),
-    ):
+    platform.is_cuda.return_value = True
+    platform.is_device_capability_family.return_value = False
+    with patch.object(attention, "current_platform", platform):
         assert attention._select_v4_sparse_impl() is DeepseekV4FlashMLASparseImpl
 
 
@@ -323,3 +325,73 @@ def test_v4_c128_metadata_keeps_upstream_packed_layout_by_default():
 
     assert global_decode.stride() == (128, 1)
     assert prefill_local.stride() == (128, 1)
+
+
+def test_sm70_sparse_bmm_decode_takes_graph_workspace_buffers():
+    from vllm.models.deepseek_v4.sm70 import sparse
+
+    q = torch.empty((6, 64, 512), dtype=torch.float16)
+    output = torch.empty_like(q)
+    layer = MagicMock()
+    layer.compress_ratio = 1
+    layer.swa_cache_layer.kv_cache = torch.empty((1, 256, 584), dtype=torch.uint8)
+    layer.scale = 512**-0.5
+    layer.attn_sink = torch.zeros(64, dtype=torch.float32)
+
+    metadata = MagicMock()
+    metadata.num_decode_tokens = 6
+    metadata.decode_swa_indices = torch.zeros((6, 1, 128), dtype=torch.int32)
+    metadata.decode_swa_lens = torch.full((6,), 128, dtype=torch.int32)
+
+    workspace_manager = MagicMock()
+    workspace_manager.get_simultaneous.side_effect = lambda *specs: tuple(
+        torch.empty(shape, dtype=dtype) for shape, dtype in specs
+    )
+    with (
+        patch.object(sparse.envs, "VLLM_SM70_DSV4_SPARSE_MLA_BMM", True),
+        patch.object(sparse.envs, "VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA", True),
+        patch.object(
+            sparse, "current_workspace_manager", return_value=workspace_manager
+        ),
+        patch.object(sparse, "sparse_attn_decode_bmm") as bmm,
+        patch.object(sparse, "sm70_sparse_attention_paged_fp8_splitk") as splitk,
+        patch.object(sparse, "sm70_sparse_attention_paged_fp8") as paged,
+    ):
+        sparse.DeepseekV4SM70SparseImpl._forward_decode(
+            layer=layer,
+            q=q,
+            compressed_cache=None,
+            output=output,
+            sparse_metadata=None,
+            swa_metadata=metadata,
+            swa_only=True,
+        )
+
+    splitk.assert_not_called()
+    paged.assert_not_called()
+    bmm.assert_called_once()
+    keys, scores, logits, probs = bmm.call_args.args[-4:]
+    assert keys.shape == (6, 128, 512)
+    assert scores.shape == (6, 64, 128)
+    assert logits.shape == probs.shape == (6, 64, 129)
+
+
+def test_sm70_sparse_bmm_prefill_buffers_share_the_kv_workspace_request():
+    from vllm.models.deepseek_v4.sm70 import sparse
+
+    layer = MagicMock()
+    layer.max_num_batched_tokens = 2048
+    q = torch.empty((1, 64, 512), dtype=torch.float16)
+    impl = sparse.DeepseekV4SM70SparseImpl
+
+    with patch.object(sparse.envs, "VLLM_SM70_DSV4_SPARSE_MLA_BMM_PREFILL", False):
+        assert impl._prefill_bmm_workspace_specs(layer, q, 640) == []
+    with patch.object(sparse.envs, "VLLM_SM70_DSV4_SPARSE_MLA_BMM_PREFILL", True):
+        specs = impl._prefill_bmm_workspace_specs(layer, q, 640)
+    # One pass holds at most MAX_TOKENS_PER_PASS tokens, whatever the batch.
+    assert [shape for shape, _ in specs] == [
+        (128, 640, 512),
+        (128, 64, 640),
+        (128, 64, 641),
+        (128, 64, 641),
+    ]

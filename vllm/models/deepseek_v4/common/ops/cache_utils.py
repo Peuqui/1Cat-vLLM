@@ -1,12 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-#
-# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.3.0
-# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
-# Changes: software-FP8 / CuteDSL gating keyed on the absence of native
-# FP8 units (< SM89) instead of exactly SM70, so the SM75 stages of a
-# mixed V100+RTX8000 pipeline take the software path too (three sites:
-# quantize/insert, dequantize/gather, cutedsl dispatch).
 """
 Triton kernels for DeepseekV4 paged K-cache management and sparse-attention index
 preparation.
@@ -31,11 +24,8 @@ from .fp8_software import fp8_e4m3fn_bits_to_fp32, fp32_to_fp8_e4m3fn_bits
 
 
 def needs_software_fp8() -> bool:
-    """Whether Triton has to decode and encode FP8 in software. Native FP8
-    exists from Ada (sm89) on. The original condition matched sm70 exactly,
-    right on a V100-only machine and wrong on a mixed one: the sm75 stages
-    (RTX 8000) took the hardware path, and Triton cannot compile
-    tl.float8e4nv there (2026-09-01)."""
+    """Whether Triton has to decode FP8 in software: native FP8 exists from
+    Ada (sm89) on."""
     return current_platform.is_cuda() and not current_platform.has_device_capability(
         (8, 9)
     )

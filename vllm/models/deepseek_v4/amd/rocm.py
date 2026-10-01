@@ -1,40 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-#
-# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.3.0
-# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
-# Changes: SWA ragged copy sized from the actual dense row width (drafting rows
-# are wider than window_size); batched-matmul decode and prefill attention.
 
-import functools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import torch
 
-import vllm.envs as envs
 from vllm.forward_context import get_forward_context
-from vllm.logger import init_logger
-from vllm.models.deepseek_v4.common.ops import (
-    compute_global_topk_indices_and_lens,
-    dequantize_and_gather_k_cache,
-    sparse_attn_decode_bmm,
-    sparse_attn_prefill_bmm,
-    sparse_decode_bmm_workspace_specs,
-    sparse_prefill_bmm_workspace_specs,
-)
+from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
 from vllm.models.deepseek_v4.nvidia.flashmla import (
     DeepseekV4FlashMLASparseBackend,
     DeepseekV4SparseMLAAttentionImpl,
 )
-from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
-    _C128A_TOPK_ALIGNMENT,
     FlashMLASparseMetadata,
     FlashMLASparseMetadataBuilder,
 )
@@ -53,8 +35,6 @@ if TYPE_CHECKING:
     from vllm.models.deepseek_v4.attention import (
         DeepseekV4MLAAttention,
     )
-
-logger = init_logger(__name__)
 
 
 def _build_indptr_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
@@ -612,49 +592,6 @@ class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4FlashMLASparseBackend):
         return DeepseekV4ROCMAiterMLASparseImpl
 
 
-# CUDA device classes the batched-matmul decode was measured on (V100 and RTX
-# 8000, 64 heads, 6 query tokens: C4 20x, C128 8x, SWA 5x over the ragged
-# decode kernel at identical output). Decided per device, so the stages of a
-# heterogeneous pipeline each take the kernel that fits their own card.
-_BMM_DECODE_CAPABILITIES = ((7, 0), (7, 5))
-
-
-@functools.cache
-def _bmm_sparse_decode_enabled(device: torch.device) -> bool:
-    if not envs.VLLM_DSV4_BMM_SPARSE_DECODE or not current_platform.is_cuda():
-        return False
-    return torch.cuda.get_device_capability(device) in _BMM_DECODE_CAPABILITIES
-
-
-def _bmm_sparse_prefill_enabled() -> bool:
-    # Plain torch on the BLAS library, so no device class to pick; ROCm keeps
-    # its Triton kernel because the comparison was only measured on CUDA.
-    return envs.VLLM_DSV4_BMM_SPARSE_PREFILL and current_platform.is_cuda()
-
-
-def _prefill_workspace_specs(
-    layer: "DeepseekV4MLAAttention",
-    q: torch.Tensor,
-    chunk_size: int,
-    gather_width: int,
-    index_width: int,
-) -> list[tuple[tuple[int, ...], torch.dtype]]:
-    """Workspaces one prefill chunk holds at the same time: the gathered KV
-    and, for the batched-matmul attention, its buffers."""
-    specs: list[tuple[tuple[int, ...], torch.dtype]] = [
-        ((chunk_size, gather_width, q.shape[-1]), q.dtype)
-    ]
-    if _bmm_sparse_prefill_enabled():
-        specs += sparse_prefill_bmm_workspace_specs(
-            layer.max_num_batched_tokens,
-            q.shape[1],
-            q.shape[-1],
-            index_width,
-            q.dtype,
-        )
-    return specs
-
-
 class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
     """ROCm sparse MLA implementation used by DeepSeek V4's custom MLA layer."""
 
@@ -684,10 +621,9 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         attn_metadata = forward_context.attn_metadata
 
         if attn_metadata is None:
-            # Warmup dummy run: no real metadata. Reserve the workspaces
-            # _forward_prefill and _forward_decode would; the dequantize /
-            # topk / attention kernels are skipped this step. Widths are upper
-            # bounds of the index tensors the real steps see.
+            # Warmup dummy run: no real metadata. Reserve the same bf16
+            # gather workspace _forward_prefill would; the dequantize / topk
+            # / sparse_fwd kernels are skipped this step.
             swa_only = layer.compress_ratio <= 1
             N = (
                 0
@@ -696,38 +632,9 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 // layer.compress_ratio
             )
             M = N + layer.window_size + layer.max_num_batched_tokens
-            if swa_only:
-                extra_width = 0
-            elif layer.compress_ratio == 4:
-                assert layer.topk_indices_buffer is not None
-                extra_width = layer.topk_indices_buffer.shape[-1]
-            else:
-                extra_width = round_up(N, _C128A_TOPK_ALIGNMENT)
             current_workspace_manager().get_simultaneous(
-                *_prefill_workspace_specs(
-                    layer,
-                    q,
-                    cls.PREFILL_CHUNK_SIZE,
-                    M,
-                    round_up(
-                        extra_width + layer.window_size,
-                        _SPARSE_PREFILL_TOPK_ALIGNMENT,
-                    ),
-                )
+                ((cls.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
             )
-            if _bmm_sparse_decode_enabled(q.device):
-                # Decode and prefill never share a step's workspace, so this
-                # only raises the reservation when decode needs more.
-                current_workspace_manager().get_simultaneous(
-                    *sparse_decode_bmm_workspace_specs(
-                        layer.max_decode_query_tokens,
-                        q.shape[1],
-                        q.shape[-1],
-                        round_up(layer.window_size + layer.max_num_batched_tokens, 128),
-                        extra_width,
-                        q.dtype,
-                    )
-                )
             output.zero_()
             return
 
@@ -786,12 +693,6 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
         num_decodes = swa_metadata.num_decodes
         num_decode_tokens = swa_metadata.num_decode_tokens
 
-        if _bmm_sparse_decode_enabled(q.device):
-            cls._forward_decode_bmm(
-                layer, q, kv_cache, swa_metadata, attn_metadata, swa_only, output
-            )
-            return
-
         topk_indices = None
         topk_lens = None
         topk_ragged_indices = None
@@ -839,76 +740,6 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             nope_head_dim=layer.nope_head_dim,
             rope_head_dim=layer.rope_head_dim,
             output=output,
-        )
-
-    @classmethod
-    def _forward_decode_bmm(
-        cls,
-        layer: "DeepseekV4MLAAttention",
-        q: torch.Tensor,
-        kv_cache: torch.Tensor | None,
-        swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
-        attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata | None,
-        swa_only: bool,
-        output: torch.Tensor,
-    ) -> None:
-        """Decode through the batched-matmul attention. Same metadata as the
-        ragged path; it reads the dense index tensors instead of the ragged ones."""
-        num_decode_tokens = swa_metadata.num_decode_tokens
-        topk_indices = None
-        topk_lens = None
-        if not swa_only:
-            assert attn_metadata is not None
-            if layer.compress_ratio == 4:
-                assert layer.topk_indices_buffer is not None
-                assert swa_metadata.is_valid_token is not None
-                global_indices, topk_lens = compute_global_topk_indices_and_lens(
-                    layer.topk_indices_buffer[:num_decode_tokens],
-                    swa_metadata.token_to_req_indices,
-                    attn_metadata.block_table[: swa_metadata.num_decodes],
-                    attn_metadata.block_size // layer.compress_ratio,
-                    swa_metadata.is_valid_token[:num_decode_tokens],
-                )
-                topk_indices = global_indices.view(num_decode_tokens, 1, -1)
-            else:
-                topk_indices = attn_metadata.c128a_global_decode_topk_indices
-                topk_lens = attn_metadata.c128a_decode_topk_lens
-
-        logger.info_once(
-            "DeepSeek V4 sparse MLA decode: batched-matmul attention on %s.",
-            torch.cuda.get_device_name(q.device),
-        )
-        swa_indices = swa_metadata.decode_swa_indices
-        swa_lens = swa_metadata.decode_swa_lens
-        assert swa_indices is not None and swa_lens is not None
-        main_width = swa_indices.reshape(num_decode_tokens, -1).shape[1]
-        extra_width = (
-            0
-            if topk_indices is None
-            else topk_indices.reshape(num_decode_tokens, -1).shape[1]
-        )
-        buffers = current_workspace_manager().get_simultaneous(
-            *sparse_decode_bmm_workspace_specs(
-                num_decode_tokens,
-                q.shape[1],
-                q.shape[2],
-                main_width,
-                extra_width,
-                q.dtype,
-            )
-        )
-        sparse_attn_decode_bmm(
-            q,
-            layer.swa_cache_layer.kv_cache,
-            swa_indices,
-            swa_lens,
-            kv_cache,
-            topk_indices,
-            topk_lens,
-            layer.scale,
-            layer.attn_sink[: q.shape[1]],
-            output,
-            *buffers,
         )
 
     @classmethod
@@ -963,15 +794,10 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
             cls.PREFILL_CHUNK_SIZE
         )
 
-        kv, *bmm_buffers = current_workspace_manager().get_simultaneous(
-            *_prefill_workspace_specs(
-                layer,
-                q,
-                cls.PREFILL_CHUNK_SIZE,
-                M,
-                round_up(top_k + layer.window_size, _SPARSE_PREFILL_TOPK_ALIGNMENT),
-            )
-        )
+        workspace_manager = current_workspace_manager()
+        kv = workspace_manager.get_simultaneous(
+            ((cls.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+        )[0]
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * cls.PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + cls.PREFILL_CHUNK_SIZE, num_prefills)
@@ -1021,22 +847,6 @@ class DeepseekV4ROCMAiterMLASparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 M,
                 N,
             )
-            if bmm_buffers:
-                logger.info_once(
-                    "DeepSeek V4 sparse MLA prefill: batched-matmul attention on %s.",
-                    torch.cuda.get_device_name(q.device),
-                )
-                sparse_attn_prefill_bmm(
-                    q[query_start:query_end],
-                    kv.view(-1, q.shape[-1]),
-                    combined_indices,
-                    combined_lens,
-                    layer.scale,
-                    layer.attn_sink[: q.shape[1]],
-                    output[query_start:query_end],
-                    *bmm_buffers,
-                )
-                continue
             rocm_sparse_attn_prefill(
                 q=q[query_start:query_end],
                 kv=kv.view(-1, 1, q.shape[-1]),

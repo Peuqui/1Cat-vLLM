@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-#
-# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.3.0
-# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
-# Changes: USE_SOFTWARE_FP8 keyed on the absence of native FP8 units
-# (< SM89) instead of exactly SM70, for mixed V100+RTX8000 pipelines.
 """
 Fused compressor + FP8/MXFP4 UE8M0 quantization + KV cache insert kernels.
 

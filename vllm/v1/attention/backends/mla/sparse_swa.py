@@ -104,18 +104,6 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         return DeepseekSparseSWABackend
 
 
-def _needs_triton_sparse_swa() -> bool:
-    """Whether this device must use the Triton SWA path instead of FlashMLA.
-
-    fork: FlashMLA is SM90+, so pre-Hopper CUDA needs the same treatment ROCm
-    already gets -- the Triton metadata builder, and no FlashMLA tile
-    scheduler. The kernels behind it carry no AMD dependency.
-    """
-    if current_platform.is_rocm():
-        return True
-    return current_platform.is_cuda() and not current_platform.has_device_capability(90)
-
-
 class DeepseekSparseSWABackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
@@ -135,7 +123,7 @@ class DeepseekSparseSWABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["DeepseekSparseSWAMetadataBuilder"]:
-        if _needs_triton_sparse_swa():
+        if current_platform.is_rocm():
             from vllm.models.deepseek_v4.amd.rocm import (
                 DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
             )
@@ -508,11 +496,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         }
         if (
             num_decode_tokens == 0
-            or _needs_triton_sparse_swa()
+            or current_platform.is_rocm()
             or current_platform.is_xpu()
             or (
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and current_platform.is_device_capability_family(70)
             )
         ):
             return out

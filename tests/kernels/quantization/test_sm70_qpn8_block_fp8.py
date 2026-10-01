@@ -15,6 +15,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic128Sym,
     kFp8Static128BlockSym,
 )
+from vllm.utils.torch_utils import current_stream
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -33,7 +34,7 @@ def _config(n: int, k: int) -> FP8ScaledMMLinearLayerConfig:
     )
 
 
-def _layer(n: int, k: int, is_bmm: bool = False):
+def _layer(n: int, k: int):
     torch.manual_seed(n + k)
     raw = torch.randint(0, 256, (n, k), dtype=torch.uint8, device="cuda")
     # 0x7F/0xFF are e4m3 NaN codes; a checkpoint never stores them.
@@ -45,7 +46,6 @@ def _layer(n: int, k: int, is_bmm: bool = False):
     reference = weight.float() * full
     layer = torch.nn.Module()
     layer.prefix = f"test.{n}x{k}"
-    layer.is_bmm = is_bmm
     layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
     layer.weight_scale_inv = torch.nn.Parameter(scales.clone(), requires_grad=False)
     return layer, reference
@@ -84,7 +84,10 @@ def test_concurrent_streams_keep_their_own_prefill_buffer(default_vllm_config):
     kernel_b.process_weights_after_loading(layer_b)
     x = torch.randn(256, 1024, device="cuda", dtype=torch.float16) * 0.1
     aux = torch.cuda.Stream()
-    main = torch.cuda.current_stream()
+    # vLLM's stream, as the model code takes it: leaving the aux context below
+    # restores it, while torch's default stream would stay recorded as vLLM's
+    # current stream and break later graph captures in this process.
+    main = current_stream()
     aux.wait_stream(main)
     for _ in range(20):
         with torch.cuda.stream(aux):
@@ -95,14 +98,3 @@ def test_concurrent_streams_keep_their_own_prefill_buffer(default_vllm_config):
     for y, reference in ((y_a, reference_a), (y_b, reference_b)):
         expected = x.float() @ reference.t()
         assert ((y.float() - expected).norm() / expected.norm()).item() < 1e-3
-
-
-def test_bmm_layer_keeps_a_dequantized_weight(default_vllm_config):
-    layer, reference = _layer(8192, 4096, is_bmm=True)
-    QPN8Fp8BlockScaledMMLinearKernel(_config(8192, 4096)).process_weights_after_loading(
-        layer
-    )
-    assert layer._qpn8_dequant16
-    assert layer.weight.dtype == torch.float16
-    # The model's reference einsum reads this fp16 weight directly.
-    assert torch.equal(layer.weight, reference.half())

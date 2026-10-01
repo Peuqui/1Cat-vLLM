@@ -356,8 +356,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128: bool = False
     VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT: bool = False
-    VLLM_DSV4_BMM_SPARSE_DECODE: bool = True
-    VLLM_DSV4_BMM_SPARSE_PREFILL: bool = True
+    VLLM_SM70_DSV4_SPARSE_MLA_BMM: bool = False
+    VLLM_SM70_DSV4_SPARSE_MLA_BMM_PREFILL: bool = False
     VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK: bool = False
     VLLM_SM70_FP8_MOE_BATCHED_GEMM: bool = True
     VLLM_SM70_FP8_MOE_BATCHED_W13_PER_EXPERT_DISPATCH: bool = False
@@ -2722,22 +2722,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT": lambda: bool(
         int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT", "0"))
     ),
-    # DeepSeek V4 generic Triton sparse-MLA impl (every pre-SM90 CUDA device,
-    # including all stages of a heterogeneous pipeline): run decode as an
-    # indexed dequantizing gather plus two batched matmuls on the device
-    # classes it was measured on. The backend and metadata stay the same on
-    # every stage; only the decode kernel call differs. Set to 0 for the
-    # ragged Triton decode kernel.
-    "VLLM_DSV4_BMM_SPARSE_DECODE": lambda: bool(
-        int(os.getenv("VLLM_DSV4_BMM_SPARSE_DECODE", "1"))
+    # Sparse MLA decode as one dequantizing gather per token and two batched
+    # matmuls. Wins over the split-K routes from about 16 heads per rank with
+    # speculative decoding; slower at 8 heads per rank (TP8). Opt-in.
+    "VLLM_SM70_DSV4_SPARSE_MLA_BMM": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_BMM", "0"))
     ),
-    # DeepSeek V4 sparse MLA prefill on CUDA through the generic Triton impl:
-    # gather each token's keys once and run the attention as two batched
-    # matmuls instead of the head-by-head Triton prefill kernel (5-10x on
-    # V100 and RTX 8000, closer to an fp64 reference). Set to 0 for the
-    # Triton prefill kernel.
-    "VLLM_DSV4_BMM_SPARSE_PREFILL": lambda: bool(
-        int(os.getenv("VLLM_DSV4_BMM_SPARSE_PREFILL", "1"))
+    # Sparse MLA prefill as one gather per token and two batched matmuls over
+    # the gathered FP16 KV; 1.3x to 7x over the gathered Triton kernel on V100.
+    "VLLM_SM70_DSV4_SPARSE_MLA_BMM_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_SM70_DSV4_SPARSE_MLA_BMM_PREFILL", "0"))
     ),
     # Diagnostic FP8 MoE fallback lane on V100. Dense FP8 linear can still use
     # TurboMind W8A16, but MoE expert weights are dequantized once to fp16 and

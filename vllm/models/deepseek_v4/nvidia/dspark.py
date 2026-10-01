@@ -1,11 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-#
-# Modified by the v100-skinny contributors, 2026, from 1Cat-vLLM 1.3.0
-# (https://github.com/1CatAI/1Cat-vLLM). Licensed under Apache-2.0.
-# Changes: the FP16 main_proj input scale and the software context-KV insert
-# are keyed on missing native FP8 units (< SM89) and on missing sm_80 kernels
-# instead of exactly SM70, so the Turing stages of a mixed pipeline take them.
 """DeepSeek V4 DSpark draft model.
 
 DSpark predicts a non-causal block in one three-layer forward pass, then adds
@@ -141,15 +135,14 @@ class DSparkDeepseekV4Model(nn.Module):
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # DSpark's target aux streams can reach O(1e4) before main_proj. The
-        # SM70 W8A16 kernel writes FP16, so the otherwise valid projection can
-        # overflow before the following RMSNorm. A power-of-two input scale is
-        # exact in FP16 and RMSNorm removes it; 2^-6 leaves ample headroom while
-        # preserving the FP32-reference normalized result.
-        # Every card without native FP8 units (< SM89) takes the FP16-writing
-        # W8A16 path this scale protects; without it main_proj overflowed in
-        # FP16 on SM75 and DSpark acceptance collapsed to ~6 %.
+        # W8A16 kernels on Volta and Turing (TurboMind, Marlin) write FP16, so
+        # the otherwise valid projection can overflow before the following
+        # RMSNorm. A power-of-two input scale is exact in FP16 and RMSNorm
+        # removes it; 2^-6 leaves ample headroom while preserving the
+        # FP32-reference normalized result. On Turing without it, DSpark's
+        # draft acceptance fell to about 6 %.
         self.main_proj_input_scale = (
-            1.0 if current_platform.has_device_capability(89) else 2.0**-6
+            2.0**-6 if current_platform.is_device_capability_family(70) else 1.0
         )
 
         self.topk_indices_buffer = torch.empty(
@@ -274,9 +267,7 @@ def _insert_context_kv(
         dtype=kv.dtype,
         device=kv.device,
     )
-    # The fused op below requires sm_80+, so anything older takes the sm70
-    # software path.
-    if not current_platform.has_device_capability(80):
+    if current_platform.is_device_capability_family(70):
         from vllm.models.deepseek_v4.sm70.qnorm_rope_kv_fp8_insert import (
             sm70_qnorm_rope_kv_fp8_insert,
         )
