@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Block-FP8 linears on SM70/SM75 through 1Cat's native QPN8 operators."""
+"""Block-FP8 linears on SM70/SM75 through the native QPN8 operators."""
 
 import pytest
 import torch
 
+import vllm.envs as envs
+from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
 from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import (
     QPN8Fp8BlockScaledMMLinearKernel,
 )
@@ -49,6 +51,29 @@ def _layer(n: int, k: int):
     layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
     layer.weight_scale_inv = torch.nn.Parameter(scales.clone(), requires_grad=False)
     return layer, reference
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_is_opt_in(monkeypatch, enabled: bool):
+    monkeypatch.setenv("VLLM_SM70_FP8_BLOCK_QPN8", "1" if enabled else "0")
+    envs.disable_envs_cache()
+    assert QPN8Fp8BlockScaledMMLinearKernel.is_supported()[0] is enabled
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_kernel_selection_takes_qpn8_for_block_fp8_when_enabled(
+    monkeypatch, default_vllm_config, enabled: bool
+):
+    monkeypatch.setenv("VLLM_SM70_FP8_BLOCK_QPN8", "1" if enabled else "0")
+    envs.disable_envs_cache()
+    kernel = init_fp8_linear_kernel(
+        activation_quant_key=kFp8Dynamic128Sym,
+        weight_quant_key=kFp8Static128BlockSym,
+        weight_shape=(1536, 4096),
+        input_dtype=torch.float16,
+        out_dtype=torch.float16,
+    )
+    assert isinstance(kernel, QPN8Fp8BlockScaledMMLinearKernel) is enabled
 
 
 def test_admits_only_block_128_geometry():

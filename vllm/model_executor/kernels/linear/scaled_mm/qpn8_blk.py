@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Block-scaled FP8 linears on SM70/SM75 through 1Cat's native QPN8 (fork addition).
+"""Block-scaled FP8 linears on SM70/SM75 through the native QPN8 operators.
 
-Serves blockwise-FP8 linears (weight_block_size [128, 128], DeepSeek-class
+Serves blockwise-FP8 linears (weight_block_size [128, 128], e.g. DeepSeek-V4
 attention and shared experts) on Volta and Turing with the fp8_qpn8_* operators
-of csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu. 1Cat admits those operators only
-for measured shape tables inside its exact-SM70 TurboMind branch; this kernel
-admits every block-FP8 linear whose shape the operators accept, on both card
-generations (the sm_70 cubins run on sm_75, and TurboMind's FP8 GEMM has no
-sm_75 kernel at all).
+of csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu, when VLLM_SM70_FP8_BLOCK_QPN8 is
+set. The TurboMind branch admits those operators only for measured shape
+tables on exact SM70; this kernel admits every block-FP8 linear whose shape the
+operators accept, on both card generations (the sm_70 cubins run on sm_75, and
+TurboMind's FP8 GEMM has no sm_75 kernel).
 
 Weight-only: activations stay fp16 (apply_input_quant=False). M <= 8 runs the
 QPN8 GEMM on the packed codes; larger M dequantizes into a dense fp16 buffer
@@ -22,6 +22,7 @@ lets the two dequantized weights overwrite each other.
 import torch
 from torch.library import custom_op
 
+import vllm.envs as envs
 from vllm import _sm70_ops as sm70_ops
 from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel import (
     Fp8BlockScaledMMLinearKernel,
@@ -79,14 +80,16 @@ class QPN8Fp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
 
     @classmethod
     def is_supported(cls, compute_capability=None):
-        if not torch.cuda.is_available():
-            return False, "CUDA unavailable"
+        if not envs.VLLM_SM70_FP8_BLOCK_QPN8:
+            return False, "VLLM_SM70_FP8_BLOCK_QPN8 is not set"
         from vllm.platforms import current_platform
 
         # The worker's own device decides: stages of a mixed pipeline differ.
-        cap = current_platform.get_device_capability()
-        if cap is None or tuple(cap) not in ((7, 0), (7, 5)):
-            return False, f"{cap} is not sm70/sm75"
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(70)
+        ):
+            return False, "native QPN8 runs on Volta and Turing"
         return True, None
 
     @classmethod
