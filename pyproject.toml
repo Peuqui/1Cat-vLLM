@@ -48,9 +48,7 @@ lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:regi
 lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver"
 
 [tool.setuptools_scm]
-# Version tags are vX.Y.Z. Strict matching requires a dot, so tags without one
-# (a fork's verification or archive tags) are never parsed as the version.
-tag = { strict = true }
+# no extra settings needed, presence enables setuptools-scm
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -1169,15 +1169,32 @@ def _cuda_arch_contains(major: int, minor: int = 0) -> bool:
     return arches is not None and (major, minor) in arches
 
 
+# Release tags are vX.Y.Z. Matching only those keeps tags of any other shape
+# (a fork's verification or archive tags) from being parsed as the version.
+_VERSION_DESCRIBE_COMMAND = [
+    "git",
+    "describe",
+    "--dirty",
+    "--tags",
+    "--long",
+    "--match",
+    "v*.*",
+]
+
+
 def get_vllm_version() -> str:
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
     if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
         print(f"Overriding VLLM version with {env_version} from VLLM_VERSION_OVERRIDE")
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
-        return get_version(write_to="vllm/_version.py")
+        return get_version(
+            write_to="vllm/_version.py", git_describe_command=_VERSION_DESCRIBE_COMMAND
+        )
 
-    version = get_version(write_to="vllm/_version.py")
+    version = get_version(
+        write_to="vllm/_version.py", git_describe_command=_VERSION_DESCRIBE_COMMAND
+    )
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():
