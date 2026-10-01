@@ -72,14 +72,6 @@ SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
 QUANTIZATION_SCHEME_MAP_TYPE = dict[str, dict[str, QuantizationArgs] | None]
 
 
-class _CompressedTensorsW8A8Fp8Sm70Block(CompressedTensorsW8A8Fp8):
-    """fork: block-strategy W8A8Fp8 admitted on SM70 (QPN8 kernel serves it)."""
-
-    @classmethod
-    def get_min_capability(cls) -> int:
-        return 70
-
-
 class CompressedTensorsConfig(QuantizationConfig):
     def __init__(
         self,
@@ -685,20 +677,6 @@ class CompressedTensorsConfig(QuantizationConfig):
                         ),
                     )
                 else:
-                    # fork: BLOCK-scaled fp8 weights are served on SM70 by
-                    # the skinny QPN8 kernel -- the scheme's BLOCK path is a
-                    # clean delegation to init_fp8_linear_kernel, which
-                    # selects QPN8Fp8BlockScaledMMLinearKernel there; only
-                    # the 89 capability gate stood in the way. Scoped to the
-                    # block strategy so per-tensor/channel W8A8 checkpoints
-                    # keep their W8A16 fallback below.
-                    if weight_quant.strategy == QuantizationStrategy.BLOCK:
-                        return _CompressedTensorsW8A8Fp8Sm70Block(
-                            weight_quant=weight_quant,
-                            is_static_input_scheme=(
-                                input_quant and not input_quant.dynamic
-                            ),
-                        )
                     # note: input_quant will be present for converted models;
                     # will be ignored during inference post loading
                     return CompressedTensorsW8A16Fp8(

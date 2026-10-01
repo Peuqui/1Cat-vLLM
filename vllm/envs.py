@@ -211,10 +211,6 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_MOE_SKINNY: bool = True
     VLLM_SM70_NVFP4_MOE_GROUPED_MAX_TOKENS: int = 512
     VLLM_SM70_NVFP4_MOE_QPN_CFG: str = "16,1,8,1"
-    VLLM_SM70_QPN8: bool = True
-    VLLM_SM70_QPN8_TWOOP: bool = False
-    VLLM_SM70_QPN8_CHUNK_MAX: int = 96
-    VLLM_SM70_QPN8_MT2: bool = True
     VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY: str | None = None
     VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M: int = 1024
@@ -649,7 +645,6 @@ if TYPE_CHECKING:
     VLLM_SM70_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH: bool = False
     VLLM_SM70_QWEN38_HYBRID_PLE: bool = False
-    VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING: bool = False
     VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL: bool = False
@@ -2011,12 +2006,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_NVFP4_MOE_QPN_CFG": lambda: os.getenv(
         "VLLM_SM70_NVFP4_MOE_QPN_CFG", "16,1,8,1"
     ),
-    "VLLM_SM70_QPN8": lambda: os.getenv("VLLM_SM70_QPN8", "1") == "1",
-    "VLLM_SM70_QPN8_TWOOP": lambda: os.getenv("VLLM_SM70_QPN8_TWOOP", "0") == "1",
-    "VLLM_SM70_QPN8_CHUNK_MAX": lambda: int(
-        os.getenv("VLLM_SM70_QPN8_CHUNK_MAX", "96")
-    ),
-    "VLLM_SM70_QPN8_MT2": lambda: os.getenv("VLLM_SM70_QPN8_MT2", "1") == "1",
     # Reuse the already resident QPN2 code/scale layout for bounded-workspace
     # FP16 large-M prefill. M<=8 decode and speculative verification remain on
     # QPN2. This stays opt-in until full-model speed and quality gates pass.
@@ -3869,13 +3858,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # uses the asynchronous CPU/disk-mmap offload result.
     "VLLM_SM70_QWEN38_HYBRID_PLE": lambda: bool(
         os.getenv("VLLM_SM70_QWEN38_HYBRID_PLE", "0").strip().lower()
-        in ("1", "true", "yes", "on")
-    ),
-    # Diagnostic-only profiling knob. The SM70 compile-graph quality profile
-    # disables AOT cache reload by default due known token drift, but long
-    # profiler runs need an explicit way to reuse compile artifacts.
-    "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING": lambda: bool(
-        os.getenv("VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING", "0").strip().lower()
         in ("1", "true", "yes", "on")
     ),
     "VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD": lambda: bool(
