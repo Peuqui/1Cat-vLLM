@@ -172,6 +172,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS_ONLY: bool = False
     VLLM_SM70_FP8_PREFILL_EXACT_DENSE: bool = True
     VLLM_SM70_FP8_QPN8: bool = False
+    VLLM_SM70_FP8_BLOCK_QPN8: bool = False
     VLLM_SM70_FP8_QPN8_M16: bool = True
     VLLM_SM70_FP8_QPN8_M32_CHUNKED: bool = True
     VLLM_SM70_FP8_QPN8_M32_NATIVE: bool = True
@@ -1837,6 +1838,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # online route also stays opt-in because it requantizes checkpoint BF16
     # attention, GDN, QSA, and mHC weights without calibration.
     "VLLM_SM70_FP8_QPN8": lambda: bool(int(os.getenv("VLLM_SM70_FP8_QPN8", "0"))),
+    # Serve every [128, 128] block-FP8 linear on Volta and Turing with the
+    # native QPN8 operators (QPN8Fp8BlockScaledMMLinearKernel) instead of
+    # TurboMind (Volta) or Marlin (Turing), independent of layer names and
+    # parallel layout. Opt-in.
+    "VLLM_SM70_FP8_BLOCK_QPN8": lambda: bool(
+        int(os.getenv("VLLM_SM70_FP8_BLOCK_QPN8", "0"))
+    ),
     # Opt-in Qwen3.8 DFlash2 B2 candidate. It keeps channel-FP8 weights in
     # QPN8 form for exact M=9..16 projection shapes instead of reconstructing
     # a full FP16 matrix before every GEMM.
