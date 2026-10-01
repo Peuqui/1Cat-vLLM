@@ -821,9 +821,9 @@ def _decode_cublas_blocker(
 
     requirements = (
         (
-            "a CUDA Volta device",
+            "a CUDA Volta or Turing device",
             lambda: current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0)),
+            and current_platform.is_device_capability_family(70),
         ),
         (
             f"a key bound of at least {_DECODE_CUBLAS_MIN_KEYS}",
