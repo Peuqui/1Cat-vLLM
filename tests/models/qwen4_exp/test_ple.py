@@ -355,7 +355,10 @@ def test_derived_host_share_cut_by_the_host_goes_to_the_disk_tier(
     monkeypatch.setattr(ple_module, "ple_host_reserve_bytes", lambda total: 0)
     layer = _pinned_layer(num_embeddings=16)
     _patch_device_spill(monkeypatch, layer, 10 * 8)
-    layer.materialize_tables()
+    # The host cap counts the ranks sharing the host from the parallel config,
+    # which is set while the model loads.
+    with set_current_vllm_config(VllmConfig()):
+        layer.materialize_tables()
     assert (layer._device_rows, layer._host_rows, layer._disk_rows) == (6, 3, 7)
 
 

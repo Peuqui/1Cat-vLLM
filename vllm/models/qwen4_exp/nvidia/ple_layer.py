@@ -700,7 +700,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             return budget
         # The table lives on the first pipeline stage only, so its
         # tensor-parallel ranks are the ones sharing this host's memory.
-        ranks = self.tp_size
+        parallel = get_current_vllm_config().parallel_config
+        ranks = min(parallel.tensor_parallel_size, parallel.local_world_size) * (
+            parallel.data_parallel_size_local
+        )
         host_reserve = ple_host_reserve_bytes(host_total)
         capped = cap_host_budget_bytes(
             budget_bytes=budget,
@@ -744,7 +747,17 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             host_budget = explicit_host
         else:
             assert spill is not None
-            host_budget = self._cap_derived_host_budget(spill)
+            derived = spill
+            if envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+                # This decision precedes draft loading and graph profiling. The
+                # measured allocation is not the final non-PLE footprint;
+                # filling its apparent headroom can leave no memory for
+                # KV/graph pools. Hybrid PLE already executes prefill
+                # off-device. Keep its decode table in host memory too, subject
+                # to the host cap, rather than requiring a checkpoint-specific
+                # HOST_GIB launch override.
+                derived = table_bytes
+            host_budget = self._cap_derived_host_budget(derived)
         vram_budget = None
         if cascade:
             assert spill is not None
