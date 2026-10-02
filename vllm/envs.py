@@ -4815,6 +4815,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PLE_DISK_OFFLOAD_NUM_THREADS": lambda: int(
         os.getenv("VLLM_PLE_DISK_OFFLOAD_NUM_THREADS", "0")
     ),
+    # Log rows, wall time and page faults of every PLE disk gather in the
+    # offload worker (disk lane and cascade disk tier).
     "VLLM_PLE_DISK_OFFLOAD_PROFILE": lambda: (
         os.getenv("VLLM_PLE_DISK_OFFLOAD_PROFILE", "False").lower() in ("true", "1")
     ),
