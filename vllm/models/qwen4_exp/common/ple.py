@@ -393,6 +393,7 @@ def cap_host_budget_bytes(
     available_bytes: int,
     reserve_bytes: int,
     ranks_sharing_host: int,
+    row_cache_bytes: int,
 ) -> int:
     """Bound a rank's pinned-host budget by its fair share of the host.
 
@@ -401,7 +402,8 @@ def cap_host_budget_bytes(
     per rank therefore double-books it: on a 30 GB host with 20 GB available,
     two ranks each saw room for 7 GiB, pinned 14 GiB together and pushed the
     engine processes, the checkpoint loading and everything else into swap
-    (2026-09-06). The share is what remains after the reserve, divided by the
+    (2026-09-06). The share is what remains after the reserve and the disk
+    tier's row cache, which the offload worker holds besides, divided by the
     ranks; a budget above it is cut to the share. What no longer spills stays
     on the device, and if the context then does not fit, the KV allocator
     reports the reachable max_model_len -- host memory is the hard limit,
@@ -410,7 +412,9 @@ def cap_host_budget_bytes(
 
     if ranks_sharing_host <= 0:
         raise ValueError("ranks_sharing_host must be positive")
-    share = max(0, available_bytes - reserve_bytes) // ranks_sharing_host
+    share = (
+        max(0, available_bytes - reserve_bytes - row_cache_bytes) // ranks_sharing_host
+    )
     return min(budget_bytes, share)
 
 
@@ -429,6 +433,12 @@ def ple_host_budget_bytes() -> int | None:
     """Configured host bytes per rank for the PLE table, or None to derive them."""
 
     return env_gib_bytes("VLLM_QWEN4EXP_PLE_HOST_GIB")
+
+
+def ple_disk_row_cache_bytes(kernel_config: Any) -> int:
+    """Host bytes the PLE offload worker keeps for the disk tier's hot rows."""
+
+    return int(kernel_config.ple_disk_row_cache_gib * 1024**3)
 
 
 def ple_host_reserve_bytes(host_total_bytes: int) -> int:
@@ -473,28 +483,44 @@ def ple_cascade_configured() -> bool:
     return bool(getattr(kernel, "ple_disk_cascade_active", False))
 
 
-def check_ple_host_share(text_config: Any, ranks_sharing_host: int) -> None:
-    """Refuse a configured pinned-host share the host cannot hold.
+def check_ple_host_share(
+    text_config: Any, ranks_sharing_host: int, row_cache_bytes: int
+) -> None:
+    """Refuse a configured pinned-host share or disk row cache the host
+    cannot hold.
 
     Runs once before any rank starts. The ranks place their tables at the same
     time, so a rank that reads the host memory while a sibling already pins its
     share would count that share twice and refuse a configuration that fits.
-    The reserve covers what the loading claims afterwards.
+    The reserve covers what the loading claims afterwards. The row cache comes
+    on top of the ranks' shares, so both have to fit together.
     """
 
     if not getattr(text_config, "ple_layer_ids", None):
         return
-    budget = ple_host_budget_bytes()
+    budget = ple_host_budget_bytes() or 0
+    row_cache = row_cache_bytes
     available = available_host_bytes()
     total = total_host_bytes()
-    if not budget or available is None or total is None:
+    if not (budget or row_cache) or available is None or total is None:
         return
     reserve = ple_host_reserve_bytes(total)
+    beyond_reserve = max(0, available - reserve)
+    if row_cache > beyond_reserve:
+        raise ValueError(
+            f"ple_disk_row_cache_gib asks for {format_gib(row_cache)} GiB, "
+            f"but only {format_gib(beyond_reserve)} GiB of the "
+            f"{format_gib(available)} GiB available are left beyond the "
+            f"{format_gib(reserve)} GiB kept in reserve. Lower "
+            "kernel_config.ple_disk_row_cache_gib or "
+            "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB."
+        )
     share = cap_host_budget_bytes(
         budget_bytes=budget,
         available_bytes=available,
         reserve_bytes=reserve,
         ranks_sharing_host=ranks_sharing_host,
+        row_cache_bytes=row_cache,
     )
     if share < budget:
         raise ValueError(
@@ -502,13 +528,16 @@ def check_ple_host_share(text_config: Any, ranks_sharing_host: int) -> None:
             f"pinned host memory per rank, but each of the {ranks_sharing_host} "
             f"tensor-parallel ranks may pin at most {format_gib(share)} GiB: "
             f"{format_gib(available)} GiB available, {format_gib(reserve)} GiB "
-            "kept in reserve. Lower VLLM_QWEN4EXP_PLE_HOST_GIB or "
-            "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB."
+            f"kept in reserve, {format_gib(row_cache)} GiB for the disk row "
+            "cache. Lower VLLM_QWEN4EXP_PLE_HOST_GIB, "
+            "kernel_config.ple_disk_row_cache_gib "
+            "or VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB."
         )
     logger.info(
-        "Qwen4Exp PLE host share %s GiB per rank fits: %d ranks, %s GiB "
-        "available, %s GiB kept in reserve.",
+        "Qwen4Exp PLE host share %s GiB per rank and disk row cache %s GiB fit: "
+        "%d ranks, %s GiB available, %s GiB kept in reserve.",
         format_gib(budget),
+        format_gib(row_cache),
         ranks_sharing_host,
         format_gib(available),
         format_gib(reserve),

@@ -103,11 +103,13 @@ from ..common.ple import (
     plan_ple_placement,
     ple_cascade_configured,
     ple_disk_mask,
+    ple_disk_row_cache_bytes,
     ple_host_budget_bytes,
     ple_host_reserve_bytes,
     ple_vram_reserve_bytes,
     total_host_bytes,
 )
+from ..common.ple_row_cache import PLERowCache
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -788,24 +790,27 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             parallel.data_parallel_size_local
         )
         host_reserve = ple_host_reserve_bytes(host_total)
+        row_cache = ple_disk_row_cache_bytes(get_current_vllm_config().kernel_config)
         capped = cap_host_budget_bytes(
             budget_bytes=budget,
             available_bytes=host_available,
             reserve_bytes=host_reserve,
             ranks_sharing_host=ranks,
+            row_cache_bytes=row_cache,
         )
         if capped == budget:
             return budget
         logger.warning(
             "Qwen4Exp PLE host budget cut from %s to %s: %s host memory "
-            "available, %s kept in reserve, shared by %d tensor-parallel ranks. "
-            "The rest of the table stays on the device or goes to the disk "
-            "tier; if the requested context no longer fits, the KV allocator "
-            "reports the reachable max_model_len.",
+            "available, %s kept in reserve, %s for the disk row cache, shared by "
+            "%d tensor-parallel ranks. The rest of the table stays on the device "
+            "or goes to the disk tier; if the requested context no longer fits, "
+            "the KV allocator reports the reachable max_model_len.",
             format_gib(budget),
             format_gib(capped),
             format_gib(host_available),
             format_gib(host_reserve),
+            format_gib(row_cache),
             ranks,
         )
         return capped
@@ -1214,6 +1219,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             )
         )
         self._profile_disk_gathers = envs.VLLM_PLE_DISK_OFFLOAD_PROFILE
+        self._disk_row_cache: PLERowCache | None = None
         self._disk_executor: ThreadPoolExecutor | None = None
         from .gguf_embedding import (
             Qwen4ExpPackedGGUFEmbedding,
@@ -1277,6 +1283,18 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 self.split_ngram_parts,
                 num_threads,
             )
+            row_cache_bytes = (
+                ple_disk_row_cache_bytes(runtime.kernel_config)
+                if runtime is not None
+                else 0
+            )
+            if row_cache_bytes:
+                self._disk_row_cache = PLERowCache(row_cache_bytes, self.head_dim)
+                logger.info(
+                    "Qwen4Exp PLE disk row cache: %s GiB for %d rows.",
+                    format_gib(row_cache_bytes),
+                    self._disk_row_cache.capacity_rows,
+                )
         elif _should_use_pinned_host_ple(config):
             if quant_method is None:
                 raise NotImplementedError(
@@ -1708,14 +1726,32 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             _advise_spans(spans, _MADV_DONTNEED)
 
     def _gather_mapped_rows(self, flat_ids: np.ndarray) -> np.ndarray:
+        """Serve the given PLE rows, from the row cache where it holds them.
+
+        Shared by the whole-table disk lane and by the cascade's disk tier.
+        Without kernel_config.ple_disk_row_cache_gib every row is read from the mapped
+        checkpoint.
+        """
+        cache = self._disk_row_cache
+        if cache is None:
+            return self._read_mapped_rows(flat_ids)
+        rows = np.empty((flat_ids.size, self.head_dim), dtype=np.uint8)
+        missed = cache.lookup(flat_ids, rows)
+        if missed.any():
+            missed_ids = flat_ids[missed]
+            read = self._read_mapped_rows(missed_ids)
+            rows[missed] = read
+            cache.insert(missed_ids, read)
+        return rows
+
+    def _read_mapped_rows(self, flat_ids: np.ndarray) -> np.ndarray:
         """Read the given PLE rows from the mapped checkpoint shards.
 
         The native row gather requests a request's missing pages together and
         copies the rows. Without it, short requests copy their rows straight
         from the retained mappings; longer ones read sorted unique ids per
         shard, which keeps the mmap reads local, and read the shards in
-        parallel where a thread pool is configured. Shared by the whole-table
-        disk lane and by the cascade's disk tier.
+        parallel where a thread pool is configured.
         """
         if any(shard is None for shard in self._disk_shards):
             raise RuntimeError("PLE disk lookup started before every shard was loaded")
@@ -1797,16 +1833,19 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         cascade's disk tier alike."""
         if not self._profile_disk_gathers:
             return self._gather_mapped_rows(flat_ids)
+        cache = self._disk_row_cache
+        hits_before = cache.hits if cache is not None else 0
         faults_before = resource.getrusage(resource.RUSAGE_SELF)
         started = time.perf_counter()
         rows = self._gather_mapped_rows(flat_ids)
         wall_ms = (time.perf_counter() - started) * 1000.0
         faults_after = resource.getrusage(resource.RUSAGE_SELF)
         logger.info(
-            "PLE disk mmap gather: tokens=%d rows=%d wall=%.3f ms "
+            "PLE disk mmap gather: tokens=%d rows=%d cached=%d wall=%.3f ms "
             "major_faults=%d minor_faults=%d",
             num_tokens,
             flat_ids.size,
+            cache.hits - hits_before if cache is not None else 0,
             wall_ms,
             faults_after.ru_majflt - faults_before.ru_majflt,
             faults_after.ru_minflt - faults_before.ru_minflt,

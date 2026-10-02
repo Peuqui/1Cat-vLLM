@@ -38,6 +38,7 @@ from vllm.models.qwen4_exp.common.ple import (
     ple_disk_mask,
     total_host_bytes,
 )
+from vllm.models.qwen4_exp.common.ple_row_cache import PLERowCache
 from vllm.models.qwen4_exp.nvidia.ple_layer import (
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPinnedHostEmbedding,
@@ -314,22 +315,45 @@ def test_configured_host_share_is_checked_once_before_the_ranks_start(
     monkeypatch.setattr(ple_common, "total_host_bytes", lambda: 30 * gib)
     # 30 GiB host, 7.5 GiB reserve: two ranks of 6 GiB need 19.5 GiB available.
     monkeypatch.setattr(ple_common, "available_host_bytes", lambda: int(19.5 * gib))
-    check_ple_host_share(ple_config, ranks_sharing_host=2)
+    check_ple_host_share(ple_config, ranks_sharing_host=2, row_cache_bytes=0)
     monkeypatch.setattr(ple_common, "available_host_bytes", lambda: 19 * gib)
     with pytest.raises(ValueError, match="asks for 6.0 GiB .* at most 5.75 GiB"):
-        check_ple_host_share(ple_config, ranks_sharing_host=2)
+        check_ple_host_share(ple_config, ranks_sharing_host=2, row_cache_bytes=0)
     # A smaller reserve makes room again.
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "4")
-    check_ple_host_share(ple_config, ranks_sharing_host=2)
+    check_ple_host_share(ple_config, ranks_sharing_host=2, row_cache_bytes=0)
 
     # Nothing to check: models without PLE, a derived share, an unknown host.
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
-    check_ple_host_share(SimpleNamespace(), ranks_sharing_host=2)
+    check_ple_host_share(SimpleNamespace(), ranks_sharing_host=2, row_cache_bytes=0)
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", None)
-    check_ple_host_share(ple_config, ranks_sharing_host=2)
+    check_ple_host_share(ple_config, ranks_sharing_host=2, row_cache_bytes=0)
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", "6")
     monkeypatch.setattr(ple_common, "available_host_bytes", lambda: None)
-    check_ple_host_share(ple_config, ranks_sharing_host=2)
+    check_ple_host_share(ple_config, ranks_sharing_host=2, row_cache_bytes=0)
+
+
+def test_disk_row_cache_counts_against_the_host_share(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gib = 1024**3
+    ple_config = SimpleNamespace(ple_layer_ids=[1])
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
+    monkeypatch.setattr(ple_common, "total_host_bytes", lambda: 30 * gib)
+    monkeypatch.setattr(ple_common, "available_host_bytes", lambda: int(19.5 * gib))
+    # The cache comes on top of the ranks' shares: two ranks of 6 GiB fit in
+    # 19.5 GiB available beside a 7.5 GiB reserve, not with 1 GiB of cache.
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", "6")
+    with pytest.raises(ValueError, match="at most 5.5 GiB.*1.0 GiB for the disk"):
+        check_ple_host_share(ple_config, ranks_sharing_host=2, row_cache_bytes=gib)
+    # Without a host share the cache is checked on its own, as on a cascade
+    # that keeps nothing in pinned host memory.
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", "0")
+    check_ple_host_share(ple_config, ranks_sharing_host=2, row_cache_bytes=12 * gib)
+    with pytest.raises(ValueError, match="row_cache_gib asks for 12.5 GiB"):
+        check_ple_host_share(
+            ple_config, ranks_sharing_host=2, row_cache_bytes=int(12.5 * gib)
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
@@ -629,6 +653,7 @@ def test_cap_host_budget_shares_the_host_between_ranks() -> None:
         available_bytes=20 * gib,
         reserve_bytes=int(7.5 * gib),
         ranks_sharing_host=2,
+        row_cache_bytes=0,
     )
     assert share == int(12.5 * gib) // 2
     # A budget below the share passes untouched.
@@ -638,6 +663,7 @@ def test_cap_host_budget_shares_the_host_between_ranks() -> None:
             available_bytes=20 * gib,
             reserve_bytes=int(7.5 * gib),
             ranks_sharing_host=2,
+            row_cache_bytes=0,
         )
         == 2 * gib
     )
@@ -648,13 +674,26 @@ def test_cap_host_budget_shares_the_host_between_ranks() -> None:
             available_bytes=6 * gib,
             reserve_bytes=8 * gib,
             ranks_sharing_host=2,
+            row_cache_bytes=0,
         )
         == 0
     )
     with pytest.raises(ValueError):
         cap_host_budget_bytes(
-            budget_bytes=gib, available_bytes=gib, reserve_bytes=0, ranks_sharing_host=0
+            budget_bytes=gib,
+            available_bytes=gib,
+            reserve_bytes=0,
+            ranks_sharing_host=0,
+            row_cache_bytes=0,
         )
+    # The offload worker's row cache leaves the ranks that much less.
+    assert cap_host_budget_bytes(
+        budget_bytes=int(7.09 * gib),
+        available_bytes=20 * gib,
+        reserve_bytes=int(7.5 * gib),
+        ranks_sharing_host=2,
+        row_cache_bytes=int(2.5 * gib),
+    ) == (5 * gib)
 
 
 def test_ple_host_reserve_defaults_to_a_quarter_of_the_host(
@@ -822,6 +861,7 @@ def _make_disk_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     # anonymous memory would destroy it.
     module._release_disk_pages = False
     module._profile_disk_gathers = False
+    module._disk_row_cache = None
     module._disk_shard_size = 4
     module._disk_shard_boundaries = torch.tensor([4], dtype=torch.int64)
     module.head_dim = 2
@@ -2110,3 +2150,65 @@ def test_cascade_disk_tier_profiles_each_gather(
     gathers = [args for message, args in logged if "disk mmap gather" in message]
     assert len(gathers) == 1
     assert gathers[0][:2] == (tokens, int((ids >= resident).sum()))
+
+
+def test_cascade_worker_keeps_a_row_cache_only_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = VllmConfig()
+    monkeypatch.setattr(ple_module, "get_current_vllm_config_or_none", lambda: runtime)
+    assert _make_cascade_worker_embedding(monkeypatch)._disk_row_cache is None
+    runtime.kernel_config.ple_disk_row_cache_gib = 0.001
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    cache = layer._disk_row_cache
+    assert cache is not None
+    expected = PLERowCache(int(0.001 * 1024**3), layer.head_dim)
+    assert cache.capacity_rows == expected.capacity_rows > 0
+
+
+def test_disk_gather_serves_repeated_rows_from_the_row_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Cached rows are the checkpoint's bytes and never reach the disk again.
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    raw = _fill_worker_shards(layer)
+    layer._disk_row_cache = PLERowCache(1 << 20, layer.head_dim)
+    read_rows: list[int] = []
+    read_mapped_rows = layer._read_mapped_rows
+
+    def counting_read(flat_ids: np.ndarray) -> np.ndarray:
+        read_rows.append(flat_ids.size)
+        return read_mapped_rows(flat_ids)
+
+    monkeypatch.setattr(layer, "_read_mapped_rows", counting_read)
+    shuffled = np.random.default_rng(0).permutation(raw.shape[0])
+    # Disjoint ids for the decode and the prefill route.
+    for ids in (shuffled[:40], shuffled[40:340]):
+        count = ids.size
+        read_rows.clear()
+        assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+        assert sum(read_rows) == count
+        read_rows.clear()
+        assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+        assert read_rows == []
+
+
+def test_disk_gather_profile_counts_the_cached_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_lazy_env(monkeypatch, "VLLM_PLE_DISK_OFFLOAD_PROFILE", "1")
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    raw = _fill_worker_shards(layer)
+    layer._disk_row_cache = PLERowCache(1 << 20, layer.head_dim)
+    logged: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        ple_module.logger,
+        "info",
+        lambda message, *args: logged.append(args)
+        if "disk mmap gather" in message
+        else None,
+    )
+    ids = np.arange(0, raw.shape[0], 7)
+    layer._profiled_gather(ids, num_tokens=3)
+    layer._profiled_gather(ids, num_tokens=3)
+    assert [args[:3] for args in logged] == [(3, ids.size, 0), (3, ids.size, ids.size)]
