@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import math
 from collections.abc import Callable
 from dataclasses import asdict, fields
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
@@ -797,6 +798,10 @@ class KernelConfig:
         default_factory=dict, init=False, repr=False
     )
     """Observed CPU row-reader admission and startup byte/performance checks."""
+    ple_disk_row_cache_gib: float = 0.0
+    """Host GiB the PLE offload worker keeps for the disk tier's hot rows, on
+    top of the ranks' pinned share; 0 reads every disk-tier row from the
+    mapped checkpoint."""
     ple_disk_cascade_active: bool = Field(default=False, init=False)
     """Resolved FP8 storage, dtype and pipeline capability admission."""
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
@@ -824,6 +829,15 @@ class KernelConfig:
         default_factory=dict, init=False, repr=False
     )
     """Observed PLE input operator selection and fallback reasons."""
+
+    @field_validator("ple_disk_row_cache_gib")
+    @classmethod
+    def _finite_row_cache(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"ple_disk_row_cache_gib must be finite and non-negative, got {value}"
+            )
+        return value
 
     @field_validator("moe_backend", mode="before")
     @classmethod
@@ -930,6 +944,8 @@ class KernelConfig:
             "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",
             "qsa_host_kv_reason",
+            # Host-side cache of the PLE offload worker; no graph depends on it.
+            "ple_disk_row_cache_gib",
         }
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")
