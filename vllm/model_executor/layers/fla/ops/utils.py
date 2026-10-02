@@ -191,7 +191,12 @@ class Backend(Enum):
 
 
 @functools.cache
-def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
+def check_shared_mem(arch: str = "none", tensor_idx: int | None = None) -> bool:
+    # Without an explicit index, ask the worker's own device. Index 0 is the
+    # first visible card, which on a mixed rig (e.g. an Ampere card next to a
+    # V100) would pick tile sizes the worker's own card cannot hold.
+    if tensor_idx is None:
+        tensor_idx = device_torch_lib.current_device()
     try:
         device_shared_mem_list = get_all_max_shared_mem()
         max_shared_memory = device_shared_mem_list[tensor_idx]
