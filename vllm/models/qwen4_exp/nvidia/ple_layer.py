@@ -1154,6 +1154,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 getattr(runtime, "kernel_config", None), "ple_disk_release_pages", False
             )
         )
+        self._profile_disk_gathers = envs.VLLM_PLE_DISK_OFFLOAD_PROFILE
         self._disk_executor: ThreadPoolExecutor | None = None
         from .gguf_embedding import (
             Qwen4ExpPackedGGUFEmbedding,
@@ -1326,7 +1327,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             return
         # Read from the mapped checkpoint; only the ids that belong to the
         # disk tier are touched.
-        output_rows.numpy()[on_disk] = self._gather_mapped_rows(disk_ids)
+        output_rows.numpy()[on_disk] = self._profiled_gather(
+            disk_ids, ngram_ids.shape[0]
+        )
 
     @staticmethod
     def _shift_precompute(
@@ -1703,6 +1706,28 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 pass
         return np.take(sorted_output, inverse, axis=0)
 
+    def _profiled_gather(self, flat_ids: np.ndarray, num_tokens: int) -> np.ndarray:
+        """_gather_mapped_rows, logged per request with
+        VLLM_PLE_DISK_OFFLOAD_PROFILE. Serves the whole-table disk lane and the
+        cascade's disk tier alike."""
+        if not self._profile_disk_gathers:
+            return self._gather_mapped_rows(flat_ids)
+        faults_before = resource.getrusage(resource.RUSAGE_SELF)
+        started = time.perf_counter()
+        rows = self._gather_mapped_rows(flat_ids)
+        wall_ms = (time.perf_counter() - started) * 1000.0
+        faults_after = resource.getrusage(resource.RUSAGE_SELF)
+        logger.info(
+            "PLE disk mmap gather: tokens=%d rows=%d wall=%.3f ms "
+            "major_faults=%d minor_faults=%d",
+            num_tokens,
+            flat_ids.size,
+            wall_ms,
+            faults_after.ru_majflt - faults_before.ru_majflt,
+            faults_after.ru_minflt - faults_before.ru_minflt,
+        )
+        return rows
+
     def _disk_embedding_lookup(
         self,
         ngram_ids: torch.Tensor,
@@ -1711,34 +1736,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         """Gather mapped FP8 shard rows in logical-ID order (whole table)."""
         if output.dtype not in (torch.uint8, torch.float8_e4m3fn):
             raise RuntimeError("PLE disk lookup currently requires FP8 output")
-        profile = envs.VLLM_PLE_DISK_OFFLOAD_PROFILE
-        if profile:
-            faults_before = resource.getrusage(resource.RUSAGE_SELF)
-            started = time.perf_counter()
         flat_ids = ngram_ids.reshape(-1).numpy()
         if flat_ids.size == 0:
             return
-        if self._disk_row_kernel is not None:
-            self._disk_row_kernel.apply(ngram_ids, output.view(torch.uint8))
-            if self._release_disk_pages:
-                for index in np.unique(flat_ids // self._disk_shard_size):
-                    shard = self._disk_shards[int(index)]
-                    assert shard is not None
-                    self._release_mapped_pages(shard)
-        else:
-            rows = self._gather_mapped_rows(flat_ids)
-            output.view(torch.uint8).reshape(-1, self.head_dim).numpy()[:] = rows
-        if profile:
-            faults_after = resource.getrusage(resource.RUSAGE_SELF)
-            logger.info(
-                "PLE disk mmap gather: tokens=%d rows=%d wall=%.3f ms "
-                "major_faults=%d minor_faults=%d",
-                ngram_ids.shape[0],
-                flat_ids.size,
-                (time.perf_counter() - started) * 1000.0,
-                faults_after.ru_majflt - faults_before.ru_majflt,
-                faults_after.ru_minflt - faults_before.ru_minflt,
-            )
+        rows = self._profiled_gather(flat_ids, ngram_ids.shape[0])
+        output.view(torch.uint8).reshape(-1, self.head_dim).numpy()[:] = rows
 
     def forward_impl(  # type: ignore[override]
         self,
