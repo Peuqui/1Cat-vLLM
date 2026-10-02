@@ -819,6 +819,7 @@ def _make_disk_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     # Off unless a test maps real file-backed shards: releasing the pages of
     # anonymous memory would destroy it.
     module._release_disk_pages = False
+    module._profile_disk_gathers = False
     module._disk_shard_size = 4
     module._disk_shard_boundaries = torch.tensor([4], dtype=torch.int64)
     module.head_dim = 2
@@ -2004,3 +2005,31 @@ def test_cascade_worker_reads_the_disk_tier_from_the_mapped_shards(
     assert torch.equal(served[on_disk], raw[ids.reshape(-1)][on_disk])
     # Rows the ranks hold themselves are not read, and not written either.
     assert served[~on_disk].eq(0x7F).all()
+
+
+def test_cascade_disk_tier_profiles_each_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The profile switch covers the cascade's disk tier, not only the
+    # whole-table disk lane: one line per request with what it read.
+    set_lazy_env(monkeypatch, "VLLM_PLE_DISK_OFFLOAD_PROFILE", "1")
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    raw = _fill_worker_shards(layer)
+    rows, heads = raw.shape[0], layer.ngram_heads
+    resident = rows // 2
+    layer.bind_remote_placements(
+        [PLERemotePlacement(tp_start=0, tp_end=rows, local_rows=resident)]
+    )
+    logged: list[tuple[str, tuple[object, ...]]] = []
+    monkeypatch.setattr(
+        ple_module.logger, "info", lambda message, *args: logged.append((message, args))
+    )
+
+    tokens = 9
+    ids = torch.randint(0, rows, (tokens, heads))
+    output = torch.empty((tokens, layer.embedding_dim), dtype=torch.uint8)
+    layer._remote_lookup(ids, output.view(torch.float8_e4m3fn))
+
+    gathers = [args for message, args in logged if "disk mmap gather" in message]
+    assert len(gathers) == 1
+    assert gathers[0][:2] == (tokens, int((ids >= resident).sum()))
