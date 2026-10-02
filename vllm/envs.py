@@ -817,6 +817,7 @@ if TYPE_CHECKING:
     VLLM_PLE_DISK_OFFLOAD_NUM_THREADS: int = 0
     VLLM_PLE_DISK_OFFLOAD_PROFILE: bool = False
     VLLM_PLE_DISK_RELEASE_PAGES: bool = False
+    VLLM_PLE_DISK_ROW_CACHE_GIB: float | None = None
     VLLM_PLE_OFFLOAD_AUTO_NUMA: bool = True
     VLLM_PLE_OFFLOAD_PREFAULT: bool = True
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
@@ -4827,6 +4828,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # mapped, which saves the re-mapping on repeated reads.
     "VLLM_PLE_DISK_RELEASE_PAGES": lambda: (
         os.getenv("VLLM_PLE_DISK_RELEASE_PAGES", "False").lower() in ("true", "1")
+    ),
+    # Host memory in GiB the PLE offload worker keeps for the disk's hot rows
+    # (disk lane and cascade disk tier). A row read from the checkpoint stays
+    # while it keeps being used, so frequent n-grams stop touching the disk.
+    # Counted against the host share like VLLM_QWEN4EXP_PLE_HOST_GIB, on top of
+    # it. Unset or 0: no cache.
+    "VLLM_PLE_DISK_ROW_CACHE_GIB": lambda: (
+        None
+        if os.getenv("VLLM_PLE_DISK_ROW_CACHE_GIB", "").strip() == ""
+        else float(os.getenv("VLLM_PLE_DISK_ROW_CACHE_GIB", "0"))
     ),
     # Keep the latency-critical PLE lookup process on the NUMA node local to
     # its first visible GPU. This changes CPU placement only; allocations use
