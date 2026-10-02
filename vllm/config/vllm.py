@@ -3196,9 +3196,13 @@ class VllmConfig:
 
         # complete the remaining process.
         self.compilation_config.post_init_cudagraph_sizes()
-        from vllm.sm70_profiles.acceleration import log_and_validate
+        # The acceleration report describes a served model; helper configs
+        # without one (tests, the PLE offload worker's single-rank world) have
+        # nothing to report and would fail on model_config attributes.
+        if self.model_config is not None:
+            from vllm.sm70_profiles.acceleration import log_and_validate
 
-        log_and_validate(self)
+            log_and_validate(self)
 
     def _set_compile_ranges(self):
         """
