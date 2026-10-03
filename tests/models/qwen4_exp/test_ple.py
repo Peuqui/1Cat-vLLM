@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -1742,7 +1743,7 @@ def test_one_worker_buffer_merges_into_every_rank_bit_identically(
         raw[index * shard_size : (index + 1) * shard_size].view(torch.float8_e4m3fn)
         for index in range(len(worker._disk_shards))
     ]
-    _retain_shard_views(worker)
+    worker._retain_disk_shard_views()
 
     scale = torch.tensor([0.0371], dtype=torch.float16, device="cuda")
     monkeypatch.setattr(ple_module, "tensor_model_parallel_all_reduce", lambda t: t)
@@ -1876,16 +1877,6 @@ def test_pinned_host_ple_merge_stays_bit_identical_under_inductor(
         assert torch.equal(compiled(ids, remote), table[ids])
 
 
-def _retain_shard_views(layer: Qwen4ExpNGramEmbedding) -> None:
-    """Keep the shard views load_weights retains for the gathers."""
-    layer._disk_shard_arrays = [
-        shard.view(torch.uint8).numpy() for shard in layer._disk_shards
-    ]
-    layer._disk_shard_pointers = [
-        array.ctypes.data for array in layer._disk_shard_arrays
-    ]
-
-
 def _fill_worker_shards(layer: Qwen4ExpNGramEmbedding) -> torch.Tensor:
     """Give the worker mapped-looking shards and return the whole raw table."""
     rows, dim = layer.ngram_embedding.org_vocab_size, layer.head_dim
@@ -1896,7 +1887,7 @@ def _fill_worker_shards(layer: Qwen4ExpNGramEmbedding) -> torch.Tensor:
         raw[index * shard_size : (index + 1) * shard_size].view(torch.float8_e4m3fn)
         for index in range(len(layer._disk_shards))
     ]
-    _retain_shard_views(layer)
+    layer._retain_disk_shard_views()
     return raw
 
 
@@ -1946,7 +1937,7 @@ def _map_worker_shards_from_file(
         layer._disk_shards = [
             checkpoint.get_tensor(f"shard_{index}") for index in range(shards)
         ]
-    _retain_shard_views(layer)
+    layer._retain_disk_shard_views()
     layer._disk_mapped_paths.add(path)
     return raw, path
 
@@ -1979,6 +1970,104 @@ def test_disk_gather_keeps_its_pages_mapped_by_default(monkeypatch, tmp_path) ->
     ids = torch.randint(0, raw.shape[0], (512,)).numpy()
     assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
     assert _mapped_rss_kib(path) > resident_before
+
+
+def test_disk_gather_unmaps_what_fault_around_mapped(monkeypatch, tmp_path) -> None:
+    # A read fault maps the cached neighbours of its page along (fault-around).
+    # On kernel 7.0 releasing only the row's own page left 32 of 36 KiB mapped;
+    # the release covers the page tables the rows lie in.
+    runtime = VllmConfig()
+    runtime.kernel_config.ple_disk_release_pages = True
+    monkeypatch.setattr(ple_module, "get_current_vllm_config_or_none", lambda: runtime)
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    raw, path = _map_worker_shards_from_file(layer, monkeypatch, tmp_path)
+    shard = layer._disk_shards[0]
+    ple_module._advise_random_file_access(shard)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+    # Read the neighbouring pages one at a time and unmap them again: they stay
+    # cached as single pages, ready to be mapped along with the target's.
+    rows_per_page = os.sysconf("SC_PAGE_SIZE") // layer.head_dim
+    target = layer._disk_shard_size // 2
+    for offset in range(-8, 9):
+        if offset:
+            int(layer._disk_shard_arrays[0][target + offset * rows_per_page, 0])
+    ple_module._madvise_mapped_tensor(shard, ple_module._MADV_DONTNEED)
+    resident_before = _mapped_rss_kib(path)
+
+    ids = np.array([target])
+    assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+    assert _mapped_rss_kib(path) <= resident_before
+
+
+def test_disk_gather_releases_page_tables_not_whole_shards(
+    monkeypatch, tmp_path
+) -> None:
+    # Unmapping each touched shard on every decode step walked hundreds of
+    # megabytes of page tables; the release stays within the rows' tables.
+    runtime = VllmConfig()
+    runtime.kernel_config.ple_disk_release_pages = True
+    monkeypatch.setattr(ple_module, "get_current_vllm_config_or_none", lambda: runtime)
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    table_span = ple_module._page_table_span()
+    shard_size = 3 * table_span // layer.head_dim
+    raw, _ = _map_worker_shards_from_file(
+        layer, monkeypatch, tmp_path, shard_size=shard_size
+    )
+    released: list[int] = []
+    madvise = ple_module._madvise
+
+    def recording_madvise(address: int, length: int, advice: int) -> None:
+        if advice == ple_module._MADV_DONTNEED:
+            released.append(length)
+        madvise(address, length, advice)
+
+    monkeypatch.setattr(ple_module, "_madvise", recording_madvise)
+    ids = np.array([5, shard_size + 7, 2 * shard_size - 3])
+    assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+    assert released
+    assert max(released) <= table_span
+    assert sum(released) <= 2 * table_span * ids.size
+
+
+@pytest.mark.parametrize("count", [17, 300])
+def test_disk_gather_requests_every_page_before_reading(
+    monkeypatch, tmp_path, count: int
+) -> None:
+    # All pages of a request are asked for at once, on the decode and the
+    # prefill route, so the disk serves the misses together.
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    raw, _ = _map_worker_shards_from_file(layer, monkeypatch, tmp_path)
+    requested: list[tuple[int, int]] = []
+    madvise = ple_module._madvise
+
+    def recording_madvise(address: int, length: int, advice: int) -> None:
+        if advice == ple_module._MADV_WILLNEED:
+            requested.append((address, length))
+        madvise(address, length, advice)
+
+    monkeypatch.setattr(ple_module, "_madvise", recording_madvise)
+    ids = np.random.default_rng(count).choice(raw.shape[0], count, replace=False)
+    assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+    shard_indices, local_rows = np.divmod(ids, layer._disk_shard_size)
+    starts = layer._disk_shard_pointers[shard_indices] + local_rows * layer.head_dim
+    for start in starts.tolist():
+        end = start + layer.head_dim
+        assert any(span <= start and end <= span + n for span, n in requested)
+
+
+def test_row_page_spans_merge_pages_and_follow_page_crossings() -> None:
+    page = os.sysconf("SC_PAGE_SIZE")
+    base = 1000 * page
+    # The second row crosses into the next page, so the first two pages merge.
+    addresses = np.array([base + 10, base + page - 8, base + 5 * page])
+    assert ple_module._row_page_spans(addresses, 16) == [
+        (base, 2 * page),
+        (base + 5 * page, page),
+    ]
 
 
 def test_cascade_worker_reads_the_disk_tier_from_the_mapped_shards(
