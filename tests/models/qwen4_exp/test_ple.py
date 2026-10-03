@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -36,6 +37,7 @@ from vllm.models.qwen4_exp.common.ple import (
     ple_disk_mask,
     total_host_bytes,
 )
+from vllm.models.qwen4_exp.common.ple_row_cache import PLERowCache
 from vllm.models.qwen4_exp.nvidia.ple_layer import (
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPinnedHostEmbedding,
@@ -312,22 +314,45 @@ def test_configured_host_share_is_checked_once_before_the_ranks_start(
     monkeypatch.setattr(ple_common, "total_host_bytes", lambda: 30 * gib)
     # 30 GiB host, 7.5 GiB reserve: two ranks of 6 GiB need 19.5 GiB available.
     monkeypatch.setattr(ple_common, "available_host_bytes", lambda: int(19.5 * gib))
-    check_ple_host_share(ple_config, ranks_sharing_host=2)
+    check_ple_host_share(ple_config, ranks_sharing_host=2, row_cache_bytes=0)
     monkeypatch.setattr(ple_common, "available_host_bytes", lambda: 19 * gib)
     with pytest.raises(ValueError, match="asks for 6.0 GiB .* at most 5.75 GiB"):
-        check_ple_host_share(ple_config, ranks_sharing_host=2)
+        check_ple_host_share(ple_config, ranks_sharing_host=2, row_cache_bytes=0)
     # A smaller reserve makes room again.
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "4")
-    check_ple_host_share(ple_config, ranks_sharing_host=2)
+    check_ple_host_share(ple_config, ranks_sharing_host=2, row_cache_bytes=0)
 
     # Nothing to check: models without PLE, a derived share, an unknown host.
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
-    check_ple_host_share(SimpleNamespace(), ranks_sharing_host=2)
+    check_ple_host_share(SimpleNamespace(), ranks_sharing_host=2, row_cache_bytes=0)
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", None)
-    check_ple_host_share(ple_config, ranks_sharing_host=2)
+    check_ple_host_share(ple_config, ranks_sharing_host=2, row_cache_bytes=0)
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", "6")
     monkeypatch.setattr(ple_common, "available_host_bytes", lambda: None)
-    check_ple_host_share(ple_config, ranks_sharing_host=2)
+    check_ple_host_share(ple_config, ranks_sharing_host=2, row_cache_bytes=0)
+
+
+def test_disk_row_cache_counts_against_the_host_share(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gib = 1024**3
+    ple_config = SimpleNamespace(ple_layer_ids=[1])
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
+    monkeypatch.setattr(ple_common, "total_host_bytes", lambda: 30 * gib)
+    monkeypatch.setattr(ple_common, "available_host_bytes", lambda: int(19.5 * gib))
+    # The cache comes on top of the ranks' shares: two ranks of 6 GiB fit in
+    # 19.5 GiB available beside a 7.5 GiB reserve, not with 1 GiB of cache.
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", "6")
+    with pytest.raises(ValueError, match="at most 5.5 GiB.*1.0 GiB for the disk"):
+        check_ple_host_share(ple_config, ranks_sharing_host=2, row_cache_bytes=gib)
+    # Without a host share the cache is checked on its own, as on a cascade
+    # that keeps nothing in pinned host memory.
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", "0")
+    check_ple_host_share(ple_config, ranks_sharing_host=2, row_cache_bytes=12 * gib)
+    with pytest.raises(ValueError, match="row_cache_gib asks for 12.5 GiB"):
+        check_ple_host_share(
+            ple_config, ranks_sharing_host=2, row_cache_bytes=int(12.5 * gib)
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
@@ -627,6 +652,7 @@ def test_cap_host_budget_shares_the_host_between_ranks() -> None:
         available_bytes=20 * gib,
         reserve_bytes=int(7.5 * gib),
         ranks_sharing_host=2,
+        row_cache_bytes=0,
     )
     assert share == int(12.5 * gib) // 2
     # A budget below the share passes untouched.
@@ -636,6 +662,7 @@ def test_cap_host_budget_shares_the_host_between_ranks() -> None:
             available_bytes=20 * gib,
             reserve_bytes=int(7.5 * gib),
             ranks_sharing_host=2,
+            row_cache_bytes=0,
         )
         == 2 * gib
     )
@@ -646,13 +673,26 @@ def test_cap_host_budget_shares_the_host_between_ranks() -> None:
             available_bytes=6 * gib,
             reserve_bytes=8 * gib,
             ranks_sharing_host=2,
+            row_cache_bytes=0,
         )
         == 0
     )
     with pytest.raises(ValueError):
         cap_host_budget_bytes(
-            budget_bytes=gib, available_bytes=gib, reserve_bytes=0, ranks_sharing_host=0
+            budget_bytes=gib,
+            available_bytes=gib,
+            reserve_bytes=0,
+            ranks_sharing_host=0,
+            row_cache_bytes=0,
         )
+    # The offload worker's row cache leaves the ranks that much less.
+    assert cap_host_budget_bytes(
+        budget_bytes=int(7.09 * gib),
+        available_bytes=20 * gib,
+        reserve_bytes=int(7.5 * gib),
+        ranks_sharing_host=2,
+        row_cache_bytes=int(2.5 * gib),
+    ) == (5 * gib)
 
 
 def test_ple_host_reserve_defaults_to_a_quarter_of_the_host(
@@ -819,6 +859,8 @@ def _make_disk_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     # Off unless a test maps real file-backed shards: releasing the pages of
     # anonymous memory would destroy it.
     module._release_disk_pages = False
+    module._profile_disk_gathers = False
+    module._disk_row_cache = None
     module._disk_shard_size = 4
     module._disk_shard_boundaries = torch.tensor([4], dtype=torch.int64)
     module.head_dim = 2
@@ -1739,7 +1781,7 @@ def test_one_worker_buffer_merges_into_every_rank_bit_identically(
         raw[index * shard_size : (index + 1) * shard_size].view(torch.float8_e4m3fn)
         for index in range(len(worker._disk_shards))
     ]
-    _retain_shard_views(worker)
+    worker._retain_disk_shard_views()
 
     scale = torch.tensor([0.0371], dtype=torch.float16, device="cuda")
     monkeypatch.setattr(ple_module, "tensor_model_parallel_all_reduce", lambda t: t)
@@ -1873,16 +1915,6 @@ def test_pinned_host_ple_merge_stays_bit_identical_under_inductor(
         assert torch.equal(compiled(ids, remote), table[ids])
 
 
-def _retain_shard_views(layer: Qwen4ExpNGramEmbedding) -> None:
-    """Keep the shard views load_weights retains for the gathers."""
-    layer._disk_shard_arrays = [
-        shard.view(torch.uint8).numpy() for shard in layer._disk_shards
-    ]
-    layer._disk_shard_pointers = [
-        array.ctypes.data for array in layer._disk_shard_arrays
-    ]
-
-
 def _fill_worker_shards(layer: Qwen4ExpNGramEmbedding) -> torch.Tensor:
     """Give the worker mapped-looking shards and return the whole raw table."""
     rows, dim = layer.ngram_embedding.org_vocab_size, layer.head_dim
@@ -1893,7 +1925,7 @@ def _fill_worker_shards(layer: Qwen4ExpNGramEmbedding) -> torch.Tensor:
         raw[index * shard_size : (index + 1) * shard_size].view(torch.float8_e4m3fn)
         for index in range(len(layer._disk_shards))
     ]
-    _retain_shard_views(layer)
+    layer._retain_disk_shard_views()
     return raw
 
 
@@ -1943,7 +1975,7 @@ def _map_worker_shards_from_file(
         layer._disk_shards = [
             checkpoint.get_tensor(f"shard_{index}") for index in range(shards)
         ]
-    _retain_shard_views(layer)
+    layer._retain_disk_shard_views()
     layer._disk_mapped_paths.add(path)
     return raw, path
 
@@ -1978,6 +2010,104 @@ def test_disk_gather_keeps_its_pages_mapped_by_default(monkeypatch, tmp_path) ->
     assert _mapped_rss_kib(path) > resident_before
 
 
+def test_disk_gather_unmaps_what_fault_around_mapped(monkeypatch, tmp_path) -> None:
+    # A read fault maps the cached neighbours of its page along (fault-around).
+    # On kernel 7.0 releasing only the row's own page left 32 of 36 KiB mapped;
+    # the release covers the page tables the rows lie in.
+    runtime = VllmConfig()
+    runtime.kernel_config.ple_disk_release_pages = True
+    monkeypatch.setattr(ple_module, "get_current_vllm_config_or_none", lambda: runtime)
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    raw, path = _map_worker_shards_from_file(layer, monkeypatch, tmp_path)
+    shard = layer._disk_shards[0]
+    ple_module._advise_random_file_access(shard)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+    # Read the neighbouring pages one at a time and unmap them again: they stay
+    # cached as single pages, ready to be mapped along with the target's.
+    rows_per_page = os.sysconf("SC_PAGE_SIZE") // layer.head_dim
+    target = layer._disk_shard_size // 2
+    for offset in range(-8, 9):
+        if offset:
+            int(layer._disk_shard_arrays[0][target + offset * rows_per_page, 0])
+    ple_module._madvise_mapped_tensor(shard, ple_module._MADV_DONTNEED)
+    resident_before = _mapped_rss_kib(path)
+
+    ids = np.array([target])
+    assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+    assert _mapped_rss_kib(path) <= resident_before
+
+
+def test_disk_gather_releases_page_tables_not_whole_shards(
+    monkeypatch, tmp_path
+) -> None:
+    # Unmapping each touched shard on every decode step walked hundreds of
+    # megabytes of page tables; the release stays within the rows' tables.
+    runtime = VllmConfig()
+    runtime.kernel_config.ple_disk_release_pages = True
+    monkeypatch.setattr(ple_module, "get_current_vllm_config_or_none", lambda: runtime)
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    table_span = ple_module._page_table_span()
+    shard_size = 3 * table_span // layer.head_dim
+    raw, _ = _map_worker_shards_from_file(
+        layer, monkeypatch, tmp_path, shard_size=shard_size
+    )
+    released: list[int] = []
+    madvise = ple_module._madvise
+
+    def recording_madvise(address: int, length: int, advice: int) -> None:
+        if advice == ple_module._MADV_DONTNEED:
+            released.append(length)
+        madvise(address, length, advice)
+
+    monkeypatch.setattr(ple_module, "_madvise", recording_madvise)
+    ids = np.array([5, shard_size + 7, 2 * shard_size - 3])
+    assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+    assert released
+    assert max(released) <= table_span
+    assert sum(released) <= 2 * table_span * ids.size
+
+
+@pytest.mark.parametrize("count", [17, 300])
+def test_disk_gather_requests_every_page_before_reading(
+    monkeypatch, tmp_path, count: int
+) -> None:
+    # All pages of a request are asked for at once, on the decode and the
+    # prefill route, so the disk serves the misses together.
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    raw, _ = _map_worker_shards_from_file(layer, monkeypatch, tmp_path)
+    requested: list[tuple[int, int]] = []
+    madvise = ple_module._madvise
+
+    def recording_madvise(address: int, length: int, advice: int) -> None:
+        if advice == ple_module._MADV_WILLNEED:
+            requested.append((address, length))
+        madvise(address, length, advice)
+
+    monkeypatch.setattr(ple_module, "_madvise", recording_madvise)
+    ids = np.random.default_rng(count).choice(raw.shape[0], count, replace=False)
+    assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+    shard_indices, local_rows = np.divmod(ids, layer._disk_shard_size)
+    starts = layer._disk_shard_pointers[shard_indices] + local_rows * layer.head_dim
+    for start in starts.tolist():
+        end = start + layer.head_dim
+        assert any(span <= start and end <= span + n for span, n in requested)
+
+
+def test_row_page_spans_merge_pages_and_follow_page_crossings() -> None:
+    page = os.sysconf("SC_PAGE_SIZE")
+    base = 1000 * page
+    # The second row crosses into the next page, so the first two pages merge.
+    addresses = np.array([base + 10, base + page - 8, base + 5 * page])
+    assert ple_module._row_page_spans(addresses, 16) == [
+        (base, 2 * page),
+        (base + 5 * page, page),
+    ]
+
+
 def test_cascade_worker_reads_the_disk_tier_from_the_mapped_shards(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2002,3 +2132,93 @@ def test_cascade_worker_reads_the_disk_tier_from_the_mapped_shards(
     assert torch.equal(served[on_disk], raw[ids.reshape(-1)][on_disk])
     # Rows the ranks hold themselves are not read, and not written either.
     assert served[~on_disk].eq(0x7F).all()
+
+
+def test_cascade_disk_tier_profiles_each_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The profile switch covers the cascade's disk tier, not only the
+    # whole-table disk lane: one line per request with what it read.
+    set_lazy_env(monkeypatch, "VLLM_PLE_DISK_OFFLOAD_PROFILE", "1")
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    raw = _fill_worker_shards(layer)
+    rows, heads = raw.shape[0], layer.ngram_heads
+    resident = rows // 2
+    layer.bind_remote_placements(
+        [PLERemotePlacement(tp_start=0, tp_end=rows, local_rows=resident)]
+    )
+    logged: list[tuple[str, tuple[object, ...]]] = []
+    monkeypatch.setattr(
+        ple_module.logger, "info", lambda message, *args: logged.append((message, args))
+    )
+
+    tokens = 9
+    ids = torch.randint(0, rows, (tokens, heads))
+    output = torch.empty((tokens, layer.embedding_dim), dtype=torch.uint8)
+    layer._remote_lookup(ids, output.view(torch.float8_e4m3fn))
+
+    gathers = [args for message, args in logged if "disk mmap gather" in message]
+    assert len(gathers) == 1
+    assert gathers[0][:2] == (tokens, int((ids >= resident).sum()))
+
+
+def test_cascade_worker_keeps_a_row_cache_only_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = VllmConfig()
+    monkeypatch.setattr(ple_module, "get_current_vllm_config_or_none", lambda: runtime)
+    assert _make_cascade_worker_embedding(monkeypatch)._disk_row_cache is None
+    runtime.kernel_config.ple_disk_row_cache_gib = 0.001
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    cache = layer._disk_row_cache
+    assert cache is not None
+    expected = PLERowCache(int(0.001 * 1024**3), layer.head_dim)
+    assert cache.capacity_rows == expected.capacity_rows > 0
+
+
+def test_disk_gather_serves_repeated_rows_from_the_row_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Cached rows are the checkpoint's bytes and never reach the disk again.
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    raw = _fill_worker_shards(layer)
+    layer._disk_row_cache = PLERowCache(1 << 20, layer.head_dim)
+    read_rows: list[int] = []
+    read_mapped_rows = layer._read_mapped_rows
+
+    def counting_read(flat_ids: np.ndarray) -> np.ndarray:
+        read_rows.append(flat_ids.size)
+        return read_mapped_rows(flat_ids)
+
+    monkeypatch.setattr(layer, "_read_mapped_rows", counting_read)
+    shuffled = np.random.default_rng(0).permutation(raw.shape[0])
+    # Disjoint ids for the decode and the prefill route.
+    for ids in (shuffled[:40], shuffled[40:340]):
+        count = ids.size
+        read_rows.clear()
+        assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+        assert sum(read_rows) == count
+        read_rows.clear()
+        assert np.array_equal(layer._gather_mapped_rows(ids), raw.numpy()[ids])
+        assert read_rows == []
+
+
+def test_disk_gather_profile_counts_the_cached_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_lazy_env(monkeypatch, "VLLM_PLE_DISK_OFFLOAD_PROFILE", "1")
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    raw = _fill_worker_shards(layer)
+    layer._disk_row_cache = PLERowCache(1 << 20, layer.head_dim)
+    logged: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        ple_module.logger,
+        "info",
+        lambda message, *args: logged.append(args)
+        if "disk mmap gather" in message
+        else None,
+    )
+    ids = np.arange(0, raw.shape[0], 7)
+    layer._profiled_gather(ids, num_tokens=3)
+    layer._profiled_gather(ids, num_tokens=3)
+    assert [args[:3] for args in logged] == [(3, ids.size, 0), (3, ids.size, ids.size)]

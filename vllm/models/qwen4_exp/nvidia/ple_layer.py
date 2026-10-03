@@ -3,6 +3,7 @@
 """Qwen4Exp position-learning enhancement layers."""
 
 import ctypes
+import functools
 import math
 import os
 import resource
@@ -94,11 +95,13 @@ from ..common.ple import (
     plan_ple_placement,
     ple_cascade_configured,
     ple_disk_mask,
+    ple_disk_row_cache_bytes,
     ple_host_budget_bytes,
     ple_host_reserve_bytes,
     ple_vram_reserve_bytes,
     total_host_bytes,
 )
+from ..common.ple_row_cache import PLERowCache
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -106,6 +109,7 @@ _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
 _MADV_RANDOM = 1
+_MADV_WILLNEED = 3
 _MADV_DONTNEED = 4
 
 logger = init_logger(__name__)
@@ -140,21 +144,100 @@ def _advise_random_file_access(tensor: torch.Tensor) -> str:
     return mapped_path
 
 
+@functools.cache
+def _libc() -> ctypes.CDLL:
+    # Loaded once: the disk tier advises pages on every decode step.
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    libc.madvise.restype = ctypes.c_int
+    return libc
+
+
+@functools.cache
+def _page_size() -> int:
+    return os.sysconf("SC_PAGE_SIZE")
+
+
+@functools.cache
+def _page_table_span() -> int:
+    """Bytes one page table maps: the most a single read fault maps at once.
+
+    A fault maps neighbouring cached pages along (fault-around) or a whole
+    large folio, but never beyond the page table of the faulting address.
+    """
+    page_size = _page_size()
+    return page_size * (page_size // np.dtype(np.int64).itemsize)
+
+
+def _madvise(address: int, length: int, advice: int) -> None:
+    if _libc().madvise(address, length, advice):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
 def _madvise_mapped_tensor(tensor: torch.Tensor, advice: int) -> None:
     """Apply one madvise value to the pages a mapped CPU tensor covers."""
-    page_size = os.sysconf("SC_PAGE_SIZE")
+    page_size = _page_size()
     address = tensor.data_ptr()
     byte_count = tensor.numel() * tensor.element_size()
     aligned_address = address - address % page_size
     aligned_end = (address + byte_count + page_size - 1) // page_size * page_size
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.madvise(
-        ctypes.c_void_p(aligned_address),
-        ctypes.c_size_t(aligned_end - aligned_address),
-        advice,
-    ):
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error))
+    _madvise(aligned_address, aligned_end - aligned_address, advice)
+
+
+def _row_page_spans(addresses: np.ndarray, row_bytes: int) -> list[tuple[int, int]]:
+    """The (address, length) spans of the pages rows at these addresses lie on.
+
+    Adjacent pages merge into one span, so advising the spans touches every
+    page once, however many of the rows share it.
+    """
+    if addresses.size == 0:
+        return []
+    page_size = _page_size()
+    first = addresses // page_size
+    last = (addresses + (row_bytes - 1)) // page_size
+    pages_per_row = (row_bytes + page_size - 2) // page_size + 1
+    pages = np.unique(
+        np.concatenate([(first + k)[first + k <= last] for k in range(pages_per_row)])
+    )
+    breaks = np.flatnonzero(np.diff(pages) != 1) + 1
+    starts = pages[np.concatenate(([0], breaks))]
+    ends = pages[np.concatenate((breaks - 1, [pages.size - 1]))] + 1
+    return list(
+        zip((starts * page_size).tolist(), ((ends - starts) * page_size).tolist())
+    )
+
+
+def _fault_spans(
+    addresses: np.ndarray,
+    row_bytes: int,
+    lower: np.ndarray,
+    upper: np.ndarray,
+) -> list[tuple[int, int]]:
+    """The (address, length) spans reading rows at these addresses can map.
+
+    Every page table a row lies in, clipped to the row's own [lower, upper)
+    so the span stays inside its mapping. Unmapping these leaves nothing the
+    reads mapped behind, while touching a few page tables instead of whole
+    shards.
+    """
+    if addresses.size == 0:
+        return []
+    table_span = _page_table_span()
+    starts = (
+        np.concatenate((addresses, addresses + (row_bytes - 1)))
+        // table_span
+        * table_span
+    )
+    low = np.maximum(starts, np.concatenate((lower, lower)))
+    high = np.minimum(starts + table_span, np.concatenate((upper, upper)))
+    spans = np.unique(np.stack((low, high), axis=1), axis=0)
+    return [(int(start), int(end - start)) for start, end in spans.tolist()]
+
+
+def _advise_spans(spans: list[tuple[int, int]], advice: int) -> None:
+    for address, length in spans:
+        _madvise(address, length, advice)
 
 
 @triton.jit
@@ -714,24 +797,27 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             parallel.data_parallel_size_local
         )
         host_reserve = ple_host_reserve_bytes(host_total)
+        row_cache = ple_disk_row_cache_bytes(get_current_vllm_config().kernel_config)
         capped = cap_host_budget_bytes(
             budget_bytes=budget,
             available_bytes=host_available,
             reserve_bytes=host_reserve,
             ranks_sharing_host=ranks,
+            row_cache_bytes=row_cache,
         )
         if capped == budget:
             return budget
         logger.warning(
             "Qwen4Exp PLE host budget cut from %s to %s: %s host memory "
-            "available, %s kept in reserve, shared by %d tensor-parallel ranks. "
-            "The rest of the table stays on the device or goes to the disk "
-            "tier; if the requested context no longer fits, the KV allocator "
-            "reports the reachable max_model_len.",
+            "available, %s kept in reserve, %s for the disk row cache, shared by "
+            "%d tensor-parallel ranks. The rest of the table stays on the device "
+            "or goes to the disk tier; if the requested context no longer fits, "
+            "the KV allocator reports the reachable max_model_len.",
             format_gib(budget),
             format_gib(capped),
             format_gib(host_available),
             format_gib(host_reserve),
+            format_gib(row_cache),
             ranks,
         )
         return capped
@@ -1111,7 +1197,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         )
         self._disk_shards: list[torch.Tensor | None] = []
         self._disk_shard_arrays: list[np.ndarray] = []
-        self._disk_shard_pointers: list[int] = []
+        self._disk_shard_pointers = np.empty(0, dtype=np.int64)
+        self._disk_shard_page_starts = np.empty(0, dtype=np.int64)
+        self._disk_shard_page_ends = np.empty(0, dtype=np.int64)
         self._disk_mapped_paths: set[str] = set()
         runtime = get_current_vllm_config_or_none()
         self._release_disk_pages = bool(
@@ -1119,6 +1207,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 getattr(runtime, "kernel_config", None), "ple_disk_release_pages", False
             )
         )
+        self._profile_disk_gathers = envs.VLLM_PLE_DISK_OFFLOAD_PROFILE
+        self._disk_row_cache: PLERowCache | None = None
         self._disk_executor: ThreadPoolExecutor | None = None
         if self._file_backed_shards:
             if quant_method is None:
@@ -1166,6 +1256,18 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 self.split_ngram_parts,
                 num_threads,
             )
+            row_cache_bytes = (
+                ple_disk_row_cache_bytes(runtime.kernel_config)
+                if runtime is not None
+                else 0
+            )
+            if row_cache_bytes:
+                self._disk_row_cache = PLERowCache(row_cache_bytes, self.head_dim)
+                logger.info(
+                    "Qwen4Exp PLE disk row cache: %s GiB for %d rows.",
+                    format_gib(row_cache_bytes),
+                    self._disk_row_cache.capacity_rows,
+                )
         elif _should_use_pinned_host_ple(config):
             if quant_method is None:
                 raise NotImplementedError(
@@ -1275,7 +1377,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             return
         # Read from the mapped checkpoint; only the ids that belong to the
         # disk tier are touched.
-        output_rows.numpy()[on_disk] = self._gather_mapped_rows(disk_ids)
+        output_rows.numpy()[on_disk] = self._profiled_gather(
+            disk_ids, ngram_ids.shape[0]
+        )
 
     @staticmethod
     def _shift_precompute(
@@ -1518,8 +1622,31 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             id_blocks.append(ids[request_indices, adjusted_columns])
         return torch.cat(id_blocks, dim=-1)
 
-    def _release_mapped_pages(self, shard: torch.Tensor) -> None:
-        """Unmap the pages of a file-backed shard this process has read.
+    def _retain_disk_shard_views(self) -> None:
+        """Keep byte views, base addresses and page bounds of the loaded shards.
+
+        The gathers index the views and compute row addresses from the bases,
+        so loading builds them once.
+        """
+        self._disk_shard_arrays = [
+            shard.view(torch.uint8).numpy()
+            for shard in self._disk_shards
+            if shard is not None
+        ]
+        self._disk_shard_pointers = np.array(
+            [array.ctypes.data for array in self._disk_shard_arrays], dtype=np.int64
+        )
+        page_size = _page_size()
+        ends = self._disk_shard_pointers + np.array(
+            [array.nbytes for array in self._disk_shard_arrays], dtype=np.int64
+        )
+        self._disk_shard_page_starts = (
+            self._disk_shard_pointers // page_size * page_size
+        )
+        self._disk_shard_page_ends = (ends + page_size - 1) // page_size * page_size
+
+    def _release_rows(self, shard_indices: np.ndarray, addresses: np.ndarray) -> None:
+        """Unmap the checkpoint pages reading these rows has mapped.
 
         Only with kernel_config.ple_disk_release_pages. The pages stay in the page
         cache, so reading them again is a cheap minor fault, but a mapped page
@@ -1527,27 +1654,57 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         1.9 GiB of the checkpoint after twelve disk-tier requests while the
         kernel swapped other processes out (2026-09-23). The shards are
         private file mappings nobody writes, so the file still holds every
-        byte.
+        byte. A read fault maps cached neighbours along (fault-around) or a
+        whole large folio, but never beyond its page table, so the page tables
+        of the rows are released. Unmapping the whole shards instead walked
+        hundreds of megabytes of page tables per shard on every decode step.
 
         Only file-backed shards may be released: on anonymous memory
         MADV_DONTNEED discards the contents. Loading records the mapped file
         of every shard it accepts (_advise_random_file_access refuses others).
         """
         if self._release_disk_pages and self._disk_mapped_paths:
-            _madvise_mapped_tensor(shard, _MADV_DONTNEED)
+            spans = _fault_spans(
+                addresses,
+                self.head_dim,
+                self._disk_shard_page_starts[shard_indices],
+                self._disk_shard_page_ends[shard_indices],
+            )
+            _advise_spans(spans, _MADV_DONTNEED)
 
     def _gather_mapped_rows(self, flat_ids: np.ndarray) -> np.ndarray:
+        """Serve the given PLE rows, from the row cache where it holds them.
+
+        Shared by the whole-table disk lane and by the cascade's disk tier.
+        Without kernel_config.ple_disk_row_cache_gib every row is read from the mapped
+        checkpoint.
+        """
+        cache = self._disk_row_cache
+        if cache is None:
+            return self._read_mapped_rows(flat_ids)
+        rows = np.empty((flat_ids.size, self.head_dim), dtype=np.uint8)
+        missed = cache.lookup(flat_ids, rows)
+        if missed.any():
+            missed_ids = flat_ids[missed]
+            read = self._read_mapped_rows(missed_ids)
+            rows[missed] = read
+            cache.insert(missed_ids, read)
+        return rows
+
+    def _read_mapped_rows(self, flat_ids: np.ndarray) -> np.ndarray:
         """Read the given PLE rows from the mapped checkpoint shards.
 
-        Short requests copy their rows straight from the retained mappings;
-        longer ones read sorted unique ids per shard, which keeps the mmap
-        reads local, and read the shards in parallel where a thread pool is
-        configured. Shared by the whole-table disk lane and by the cascade's
-        disk tier.
+        The pages of all rows are requested before the first copy, so the disk
+        serves a request's missing pages together instead of one page fault
+        after the other. Short requests copy their rows straight from the
+        retained mappings; longer ones read sorted unique ids per shard, which
+        keeps the mmap reads local, and read the shards in parallel where a
+        thread pool is configured.
         """
         if any(shard is None for shard in self._disk_shards):
             raise RuntimeError("PLE disk lookup started before every shard was loaded")
         shard_size = self._disk_shard_size
+        row_bytes = self.head_dim
 
         # Decode moves only a few dozen rows. Per-shard NumPy dispatch and the
         # thread pool cost more than copying these FP8 rows from their retained
@@ -1561,22 +1718,16 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     f"[{min_id}, {max_id}] for "
                     f"{self.ngram_embedding.org_vocab_size} rows"
                 )
-            rows = np.empty((flat_ids.size, self.head_dim), dtype=np.uint8)
-            row_bytes = self.head_dim
+            shard_indices, local_rows = np.divmod(flat_ids, shard_size)
+            addresses = (
+                self._disk_shard_pointers[shard_indices] + local_rows * row_bytes
+            )
+            _advise_spans(_row_page_spans(addresses, row_bytes), _MADV_WILLNEED)
+            rows = np.empty((flat_ids.size, row_bytes), dtype=np.uint8)
             rows_ptr = rows.ctypes.data
-            touched_shards: set[int] = set()
-            for output_row, row_id in enumerate(flat_ids.tolist()):
-                shard_index, local_row = divmod(row_id, shard_size)
-                ctypes.memmove(
-                    rows_ptr + output_row * row_bytes,
-                    self._disk_shard_pointers[shard_index] + local_row * row_bytes,
-                    row_bytes,
-                )
-                touched_shards.add(shard_index)
-            for shard_index in touched_shards:
-                shard = self._disk_shards[shard_index]
-                assert shard is not None
-                self._release_mapped_pages(shard)
+            for output_row, address in enumerate(addresses.tolist()):
+                ctypes.memmove(rows_ptr + output_row * row_bytes, address, row_bytes)
+            self._release_rows(shard_indices, addresses)
             return rows
 
         sorted_ids, inverse = np.unique(flat_ids, return_inverse=True)
@@ -1600,11 +1751,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
         def gather_shard(task: tuple[int, int, int]) -> None:
             shard_index, start, end = task
-            shard = self._disk_shards[shard_index]
-            assert shard is not None
             local_ids = sorted_ids[start:end] - shard_index * shard_size
+            addresses = self._disk_shard_pointers[shard_index] + local_ids * row_bytes
+            _advise_spans(_row_page_spans(addresses, row_bytes), _MADV_WILLNEED)
             sorted_output[start:end] = self._disk_shard_arrays[shard_index][local_ids]
-            self._release_mapped_pages(shard)
+            self._release_rows(np.full(local_ids.size, shard_index), addresses)
 
         executor = getattr(self, "_disk_executor", None)
         if executor is None or len(tasks) == 1:
@@ -1615,6 +1766,31 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 pass
         return np.take(sorted_output, inverse, axis=0)
 
+    def _profiled_gather(self, flat_ids: np.ndarray, num_tokens: int) -> np.ndarray:
+        """_gather_mapped_rows, logged per request with
+        VLLM_PLE_DISK_OFFLOAD_PROFILE. Serves the whole-table disk lane and the
+        cascade's disk tier alike."""
+        if not self._profile_disk_gathers:
+            return self._gather_mapped_rows(flat_ids)
+        cache = self._disk_row_cache
+        hits_before = cache.hits if cache is not None else 0
+        faults_before = resource.getrusage(resource.RUSAGE_SELF)
+        started = time.perf_counter()
+        rows = self._gather_mapped_rows(flat_ids)
+        wall_ms = (time.perf_counter() - started) * 1000.0
+        faults_after = resource.getrusage(resource.RUSAGE_SELF)
+        logger.info(
+            "PLE disk mmap gather: tokens=%d rows=%d cached=%d wall=%.3f ms "
+            "major_faults=%d minor_faults=%d",
+            num_tokens,
+            flat_ids.size,
+            cache.hits - hits_before if cache is not None else 0,
+            wall_ms,
+            faults_after.ru_majflt - faults_before.ru_majflt,
+            faults_after.ru_minflt - faults_before.ru_minflt,
+        )
+        return rows
+
     def _disk_embedding_lookup(
         self,
         ngram_ids: torch.Tensor,
@@ -1623,26 +1799,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         """Gather mapped FP8 shard rows in logical-ID order (whole table)."""
         if output.dtype not in (torch.uint8, torch.float8_e4m3fn):
             raise RuntimeError("PLE disk lookup currently requires FP8 output")
-        profile = envs.VLLM_PLE_DISK_OFFLOAD_PROFILE
-        if profile:
-            faults_before = resource.getrusage(resource.RUSAGE_SELF)
-            started = time.perf_counter()
         flat_ids = ngram_ids.reshape(-1).numpy()
         if flat_ids.size == 0:
             return
-        rows = self._gather_mapped_rows(flat_ids)
+        rows = self._profiled_gather(flat_ids, ngram_ids.shape[0])
         output.view(torch.uint8).reshape(-1, self.head_dim).numpy()[:] = rows
-        if profile:
-            faults_after = resource.getrusage(resource.RUSAGE_SELF)
-            logger.info(
-                "PLE disk mmap gather: tokens=%d rows=%d wall=%.3f ms "
-                "major_faults=%d minor_faults=%d",
-                ngram_ids.shape[0],
-                flat_ids.size,
-                (time.perf_counter() - started) * 1000.0,
-                faults_after.ru_majflt - faults_before.ru_majflt,
-                faults_after.ru_minflt - faults_before.ru_minflt,
-            )
 
     def forward_impl(  # type: ignore[override]
         self,
@@ -1841,14 +2002,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 raise RuntimeError(
                     f"PLE disk offload did not load shards: {missing_shards}"
                 )
-            self._disk_shard_arrays = [
-                shard.view(torch.uint8).numpy()
-                for shard in self._disk_shards
-                if shard is not None
-            ]
-            self._disk_shard_pointers = [
-                array.ctypes.data for array in self._disk_shard_arrays
-            ]
+            self._retain_disk_shard_views()
             mapped_gib = (
                 sum(
                     shard.numel() * shard.element_size()
