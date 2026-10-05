@@ -1182,6 +1182,49 @@ def test_no_spec_tokens_scheduled_for_prefill_chunks():
     assert len(output.scheduled_spec_decode_tokens[req.request_id]) == num_spec_tokens
 
 
+def test_sync_pp_spec_decode_waits_for_in_flight_step():
+    """Sync scheduling under PP keeps several steps in flight, and a step's drafts
+    reach the scheduler before its sampled token. A request must not be
+    scheduled again in that window: it would carry the drafts without the token
+    they follow (draft_len rows for draft_len drafts)."""
+    num_spec_tokens = 3
+    scheduler = create_scheduler(
+        num_speculative_tokens=num_spec_tokens,
+        pipeline_parallel_size=2,
+        async_scheduling=False,
+    )
+    req = create_requests(num_requests=1, num_tokens=16)[0]
+    scheduler.add_request(req)
+
+    def model_output(sampled: list[int]) -> ModelRunnerOutput:
+        return ModelRunnerOutput(
+            req_ids=[req.request_id],
+            req_id_to_index={req.request_id: 0},
+            sampled_token_ids=[sampled],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+
+    prefill = scheduler.schedule()
+    scheduler.update_from_output(prefill, model_output([42]))
+
+    # A plain decode step goes into the pipeline; its drafts arrive before its
+    # sampled token.
+    decode = scheduler.schedule()
+    assert decode.num_scheduled_tokens[req.request_id] == 1
+    scheduler.update_draft_token_ids(DraftTokenIds([req.request_id], [[1, 2, 3]]))
+
+    while_in_flight = scheduler.schedule()
+    assert req.request_id not in while_in_flight.num_scheduled_tokens
+    assert req.request_id not in while_in_flight.scheduled_spec_decode_tokens
+
+    scheduler.update_from_output(decode, model_output([43]))
+    after = scheduler.schedule()
+    assert after.num_scheduled_tokens[req.request_id] == 1 + num_spec_tokens
+    assert after.scheduled_spec_decode_tokens[req.request_id] == [1, 2, 3]
+
+
 def test_scheduler_stats_waiting_queues():
     """Test that scheduler stats correctly report waiting and skipped_waiting queues."""
     # Create scheduler with limited capacity so we can have waiting requests
