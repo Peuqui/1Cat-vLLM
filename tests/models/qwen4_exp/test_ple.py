@@ -862,6 +862,10 @@ def _make_disk_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     module._release_disk_pages = False
     module._profile_disk_gathers = False
     module._disk_row_cache = None
+    # No engine config around the module: the default row-gather policy, nothing
+    # to record the admission in.
+    module._kernel_config = None
+    module._disk_row_gather = True
     module._disk_shard_size = 4
     module._disk_shard_boundaries = torch.tensor([4], dtype=torch.int64)
     module.head_dim = 2
