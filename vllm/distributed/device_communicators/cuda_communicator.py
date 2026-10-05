@@ -206,6 +206,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.ring_comm = Sm70RingCommunicator(
             self.cpu_group, self.device, self.unique_name, use_custom_allreduce
         )
+        self.host_reduce_comm = None
+        if "tp" in self.unique_name and self.world_size == 2:
+            from .sm70_host_reduce import Sm70HostReduceCommunicator
+
+            self.host_reduce_comm = Sm70HostReduceCommunicator(
+                self.cpu_group, self.device, self.unique_name
+            )
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
 
@@ -284,6 +291,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         all_potential_ar_backends = [
             "NCCL_SYMM_MEM",
             "SM70_RING",
+            "SM70_HOST_REDUCE",
             "QUICK_REDUCE",
             "FLASHINFER",
             "CUSTOM",
@@ -309,6 +317,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         if self.ring_comm.status["enabled"]:
             enabled_ar_backends.append("SM70_RING")
+        if (
+            self.host_reduce_comm is not None
+            and self.host_reduce_comm.status["enabled"]
+        ):
+            enabled_ar_backends.append("SM70_HOST_REDUCE")
         if (
             self.pynccl_comm is not None
             and not self.pynccl_comm.disabled
@@ -346,6 +359,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if ring_out is not None:
             _trace_all_reduce_path(self, "sm70_ring", input_)
             return ring_out
+        if self.host_reduce_comm is not None:
+            host_out = self.host_reduce_comm.all_reduce(input_)
+            if host_out is not None:
+                _trace_all_reduce_path(self, "sm70_host_reduce", input_)
+                return host_out
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
@@ -661,6 +679,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ring_comm = getattr(self, "ring_comm", None)
         if ring_comm is not None:
             ring_comm.close()
+        host_reduce_comm = getattr(self, "host_reduce_comm", None)
+        if host_reduce_comm is not None:
+            host_reduce_comm.close()
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
