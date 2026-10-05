@@ -292,6 +292,11 @@ class Sm70Fp8Config:
     """Mirror the native shared flag; its host API does not accept config yet."""
     gated_silu: bool | None = None
     """Prepare the existing fused gate/up epilogue."""
+    small_shape_tuning: bool | None = None
+    """Time the native kernel candidates for each new small shape (M <= 16) and
+    keep the fastest. Off by default: the candidates are close enough that timing
+    noise decides, so kernel choice and rounding change from boot to boot, and
+    each new shape stalls its first request for seconds."""
     explicit_enables: tuple[str, ...] = Field(default=(), init=False)
     """Retain the legacy error for an explicit route with missing native ops."""
     resolved: bool = Field(default=False, init=False)
@@ -352,6 +357,16 @@ class Sm70Fp8Config:
             ):
                 self.qpn8_pp2_tp4 = self.qpn8
         self.explicit_enables = tuple(explicit)
+        if self.small_shape_tuning is None:
+            name = "VLLM_SM70_FP8_TUNE_SMALL_SHAPES"
+            if envs.is_set(name):
+                logger.warning_once(
+                    "%s is deprecated; use kernel_config.sm70_fp8.small_shape_tuning.",
+                    name,
+                )
+            self.small_shape_tuning = (
+                envs.VLLM_SM70_FP8_TUNE_SMALL_SHAPES if envs.is_set(name) else False
+            )
         self.force_marlin = envs.force_sm70_marlin()
         self.legacy_grouped_bmm_decode = envs.VLLM_SM70_FP8_GROUPED_BMM_DECODE
         self.legacy_prefill_fast_selector = envs.VLLM_SM70_FP8_PREFILL_FAST_SELECTOR
