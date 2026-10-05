@@ -644,6 +644,18 @@ class Scheduler(SchedulerInterface):
                 continue
 
             if (
+                not self.scheduler_config.async_scheduling
+                and request.spec_token_ids
+                and request.num_in_flight_tokens > 0
+            ):
+                # Sync scheduling under PP keeps several batches in flight. The
+                # drafts of a request's in-flight step arrive before its sampled
+                # token, so scheduling it again would send the drafts without the
+                # token they follow. Wait until that step's output is applied.
+                req_index += 1
+                continue
+
+            if (
                 request.num_output_placeholders > 0
                 # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
                 # Since output placeholders are also included in the computed tokens

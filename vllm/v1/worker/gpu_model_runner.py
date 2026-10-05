@@ -1646,6 +1646,9 @@ class GPUModelRunner(
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
+        # Sync scheduling under PP with spec decode: the drafts each non-last rank
+        # fed in its previous step, to restore the accepted ones (see _update_states).
+        self._pp_sync_prev_drafts: dict[str, list[int]] = {}
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -2337,6 +2340,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._pp_sync_prev_drafts.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -2548,6 +2552,7 @@ class GPUModelRunner(
                 if not req_data.new_token_ids:
                     # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
                     new_token_ids: list[int] = []
+                    tokens_to_add = new_token_ids
                 else:
                     # Non-async scheduling with PP: The scheduler sends
                     # sampled token ids back because there's no direct communication
@@ -2558,13 +2563,28 @@ class GPUModelRunner(
                     num_new_tokens = (
                         num_computed_tokens + len(new_token_ids) - req_state.num_tokens
                     )
+                    # The scheduler sends tokens from num_computed_tokens on. The
+                    # drafts accepted in the previous step come before them and
+                    # this rank only fed them as drafts; they are a prefix of
+                    # those drafts.
+                    num_accepted_drafts = num_new_tokens - len(new_token_ids)
+                    tokens_to_add = new_token_ids
+                    if num_accepted_drafts > 0:
+                        prev_drafts = self._pp_sync_prev_drafts.get(req_id, [])
+                        assert len(prev_drafts) >= num_accepted_drafts
+                        tokens_to_add = (
+                            prev_drafts[:num_accepted_drafts] + new_token_ids
+                        )
                     if num_new_tokens == 1:
                         # Avoid slicing list in most common case.
-                        req_state.output_token_ids.append(new_token_ids[-1])
+                        req_state.output_token_ids.append(tokens_to_add[-1])
                     elif num_new_tokens > 0:
                         req_state.output_token_ids.extend(
-                            new_token_ids[-num_new_tokens:]
+                            tokens_to_add[-num_new_tokens:]
                         )
+                    self._pp_sync_prev_drafts[req_id] = list(
+                        scheduled_spec_tokens.get(req_id, ())
+                    )
             if num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure, or output_token_ids was inflated by the optimistic
@@ -2631,7 +2651,7 @@ class GPUModelRunner(
                     if new_token_ids:
                         # Add new_token_ids to token_ids_cpu.
                         num_new_tokens = end_token_index - start_token_index
-                        tokens_to_append = new_token_ids[-num_new_tokens:]
+                        tokens_to_append = tokens_to_add[-num_new_tokens:]
                         self.input_batch.token_ids_cpu[
                             req_index, start_token_index:end_token_index
                         ] = tokens_to_append
