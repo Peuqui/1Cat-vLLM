@@ -564,6 +564,19 @@ class Sm70RingConfig:
 
 
 @config
+class HostReduceConfig:
+    """Two-rank FP16 all-reduce through pinned host memory for GPU pairs without
+    peer access; exact, the same bits as NCCL's two-rank sum."""
+
+    enabled: bool = True
+    """Admit the operator for two-rank groups whose GPUs NCCL cannot connect
+    peer to peer."""
+
+    max_bytes: int = Field(default=262144, gt=0, le=4194304, multiple_of=16)
+    """Largest payload; larger all-reduces stay on NCCL."""
+
+
+@config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
@@ -685,6 +698,10 @@ class KernelConfig:
 
     hc_ll_shard: bool = True
     """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
+
+    host_reduce: HostReduceConfig = Field(default_factory=HostReduceConfig)
+    """Two-rank host-memory all-reduce policy, resolved from peer access."""
+
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )
@@ -946,6 +963,8 @@ class KernelConfig:
             "qsa_host_kv_reason",
             # Host-side cache of the PLE offload worker; no graph depends on it.
             "ple_disk_row_cache_gib",
+            # Collective transport chosen outside the compiled graph.
+            "host_reduce",
         }
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")
