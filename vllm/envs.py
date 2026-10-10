@@ -4738,8 +4738,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "defaults are listed below."
         ),
         category="configuration",
-        declared_default="True",
-        effective_default="True",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
         user_visible=False,
