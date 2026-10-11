@@ -687,13 +687,16 @@ class Scheduler(SchedulerInterface):
 
             if (
                 not self.scheduler_config.async_scheduling
-                and request.spec_token_ids
                 and request.num_in_flight_tokens > 0
+                and request.num_computed_tokens >= request.num_tokens
             ):
-                # Sync scheduling under PP keeps several batches in flight. The
-                # drafts of a request's in-flight step arrive before its sampled
-                # token, so scheduling it again would send the drafts without the
-                # token they follow. Wait until that step's output is applied.
+                # Sync scheduling under PP keeps several batches in flight. A
+                # decoding request's computed tokens already count its in-flight
+                # step, drafts included, while its sampled token is not applied
+                # yet: drafts that arrive first would go out without the token
+                # they follow, and fewer or no drafts (a confidence cut) would
+                # give a negative count. Wait until that step's output is applied.
+                # Prefill chunks still pipeline (computed < num_tokens).
                 req_index += 1
                 continue
 
