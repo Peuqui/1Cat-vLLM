@@ -52,6 +52,16 @@ class DSparkSpeculator(DFlashSpeculator):
                 "DSpark confidence-scheduled verification is not supported by "
                 "Model Runner V2; set VLLM_USE_V2_MODEL_RUNNER=0 to use it."
             )
+        # DSpark consumes the target aux states combined to hidden_size by
+        # main_proj, not DeepSeek-V4 MTP's hc_mult-wide residual for which the
+        # base class widens hidden_size: size the staging buffers to the drafter.
+        self.hidden_size = self.draft_model_config.get_hidden_size()
+        self.hidden_states = torch.zeros(
+            self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
+        )
+        self.inputs_embeds = torch.zeros(
+            self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
+        )
         # The anchor is the first prediction: N query positions per request.
         self.sample_from_anchor = True
         self.num_query_per_req = self.draft_block
