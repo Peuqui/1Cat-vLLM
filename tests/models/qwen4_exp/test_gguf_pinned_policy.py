@@ -105,6 +105,8 @@ def test_connector_only_skips_requests_for_owned_local_decode(
     connector = SimpleNamespace(
         _all_pinned_decode=pinned,
         _launch=lambda *a: calls.append(a),
+        early_prefill=False,
+        _host_result_regions={},
     )
     monkeypatch.setattr(module.envs, "VLLM_SM70_QWEN38_HYBRID_PLE", False)
     module.PleOffloadConnector.prepare_forward(
