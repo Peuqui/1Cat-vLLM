@@ -20,11 +20,22 @@ FULL CUDA graph. Follows vllm-project/vllm's MRV2 DSparkSpeculator.
 from typing import Any
 
 import torch
+import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import get_pp_group
+from vllm.logger import init_logger
+from vllm.model_executor.models.shared_weights import (
+    LEGACY_DRAFT_WEIGHTS,
+    share_embeddings,
+    share_lm_head,
+)
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dflash.utils import get_parallel_draft_model
+
+logger = init_logger(__name__)
 
 
 class DSparkSpeculator(DFlashSpeculator):
@@ -57,6 +68,37 @@ class DSparkSpeculator(DFlashSpeculator):
             .repeat_interleave(self.max_num_reqs)
             .view(self.draft_block, self.max_num_reqs)
         )
+
+    def load_draft_model(
+        self,
+        target_model: nn.Module,
+        target_attn_layer_names: set[str],
+    ) -> nn.Module:
+        model = get_parallel_draft_model(self.vllm_config, "dspark_head")
+        target_language_model = (
+            target_model.get_language_model()
+            if hasattr(target_model, "get_language_model")
+            else target_model
+        )
+        # The DeepSeek-V4 drafter loads its own copy of the target embedding
+        # from the checkpoint. With pipeline parallelism the target embedding
+        # lives on the first stage, so the drafter keeps that copy: the same
+        # contract as the V1 proposer.
+        share_embeddings(
+            model,
+            target_language_model,
+            LEGACY_DRAFT_WEIGHTS,
+            pp_size=get_pp_group().world_size,
+            log=logger,
+        )
+        share_lm_head(
+            model,
+            target_language_model,
+            target_language_model,
+            LEGACY_DRAFT_WEIGHTS,
+            log=logger,
+        )
+        return model
 
     def _precompute_context_kv(
         self,
