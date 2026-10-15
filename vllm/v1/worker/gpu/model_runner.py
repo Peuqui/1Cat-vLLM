@@ -706,6 +706,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if warmed:
             logger.info_once("SM70 V2 auxiliary kernel warmup finished: %s", warmed)
 
+    def _speculator_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Hidden state fed to the drafter.
+
+        The target may override it (DeepSeek V4 MTP needs the pre-hc_head
+        residual) with a persistent buffer sized at max_num_batched_tokens,
+        sliced to the active token count that propose() expects. Targets
+        return no buffer for other draft methods (e.g. DSpark).
+        """
+        get_override = getattr(self.model, "get_mtp_target_hidden_states", None)
+        override = get_override() if get_override is not None else None
+        if override is None:
+            return hidden_states
+        return override[: hidden_states.shape[0]]
+
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
     def _dummy_run(
@@ -789,14 +803,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     ),
                 )
 
-            # Let the target override the hidden state fed to the drafter
-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
-            # target returns a persistent buffer sized at max_num_batched_tokens;
-            # slice to the active token count that propose() expects.
-            spec_hidden_states = hidden_states
-            if hasattr(self.model, "get_mtp_target_hidden_states"):
-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            spec_hidden_states = self._speculator_hidden_states(hidden_states)
             self.speculator.propose(
                 input_batch=input_batch,
                 attn_metadata=attn_metadata,
@@ -1899,14 +1906,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             requires_host_token_state = bool(
                 getattr(self.speculator, "requires_host_token_state", False)
             )
-            # Let the target override the hidden state fed to the drafter
-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
-            # target returns a persistent buffer sized at max_num_batched_tokens;
-            # slice to the active token count that propose() expects.
-            spec_hidden_states = hidden_states
-            if hasattr(self.model, "get_mtp_target_hidden_states"):
-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            spec_hidden_states = self._speculator_hidden_states(hidden_states)
             mtp_draft_start = self._step_profiler.start_context(mtp_profile_ctx)
             if self._ple_draft_ring is not None:
                 # The committed state now ends at each request's bonus token.
