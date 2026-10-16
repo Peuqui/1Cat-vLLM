@@ -50,7 +50,7 @@ def get_eagle3_aux_layers_from_config(
         if target_layer_ids:
             layer_ids = [i + 1 for i in target_layer_ids]
     if not layer_ids:
-        # DSpark config uses zero-based decoder-layer IDs, like DFlash.
+        # DSpark config uses zero-based decoder-layer IDs.
         dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
         if dspark_layer_ids:
             layer_ids = [i + 1 for i in dspark_layer_ids]

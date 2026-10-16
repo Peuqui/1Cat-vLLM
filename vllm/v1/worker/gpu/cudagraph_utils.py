@@ -668,11 +668,11 @@ class ModelCudaGraphManager(CudaGraphManager):
             # The smallest captured bucket that covers the live context.
             if cpu_upper_bounds.device.type == "cpu" and cpu_upper_bounds.numel():
                 upper = int(cpu_upper_bounds.max())
-                for variant in variants:
-                    bucket = variant.attention_context_bucket
+                for bucket_desc in variants:
+                    bucket = bucket_desc.attention_context_bucket
                     assert bucket is not None
-                    if 0 < upper <= bucket and variant in self.graphs:
-                        return variant
+                    if 0 < upper <= bucket and bucket_desc in self.graphs:
+                        return bucket_desc
             return desc
         short = self._qsa_short_graphs.get(desc)
         if (
