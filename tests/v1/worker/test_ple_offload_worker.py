@@ -1155,8 +1155,8 @@ class _ConfigBoundLocalTablesPleLayer(_WeightLoadingPleLayer):
     """Keeps local tables only while the engine config is current.
 
     The Qwen4Exp cascade reads ``kernel_config.ple_disk_cascade_active`` from
-    the current config, which the worker sets around construction and loading
-    but not around ``execute_model``.
+    the current config, which the GPU worker sets around construction and
+    loading but not around the forward.
     """
 
     config_current = True
@@ -1164,6 +1164,19 @@ class _ConfigBoundLocalTablesPleLayer(_WeightLoadingPleLayer):
     @classmethod
     def offload_keeps_local_tables(cls) -> bool:
         return cls.config_current
+
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        del args, kwargs
+        # Ids below 5 are resident; the worker serves the rest.
+        remote = self.wait_offloaded_output(hidden_states, input_ids.shape[0])
+        ids = input_ids.unsqueeze(-1)
+        return torch.where(ids < 5, ids, remote)
 
 
 def test_ple_layer_merges_local_tables_outside_the_engine_config(
@@ -1176,11 +1189,16 @@ def test_ple_layer_merges_local_tables_outside_the_engine_config(
     layer = _ConfigBoundLocalTablesPleLayer()
     assert layer.weight.shape == (2,)
 
-    # The forward has to merge the tables the constructor built, even though
-    # the classmethod answers differently once the config is gone. Waiting for
-    # the worker's buffer instead would read rows nobody wrote.
-    monkeypatch.setattr(_ConfigBoundLocalTablesPleLayer, "config_current", False)
+    # The worker writes only the slots of the ids it serves (5 and 6); the
+    # resident slot keeps what the buffer held.
+    worker_buffer = torch.tensor([[0], [5], [6]])
+    monkeypatch.setattr(
+        layer, "wait_offloaded_output", lambda hidden, num_tokens: worker_buffer
+    )
     layer._is_cpu_offloaded = True
+    # The forward has to merge the tables the constructor built, even though
+    # the classmethod answers differently once the config is gone.
+    monkeypatch.setattr(_ConfigBoundLocalTablesPleLayer, "config_current", False)
     output = layer(torch.zeros(3), torch.tensor([4, 5, 6]))
     assert torch.equal(output, torch.tensor([[4], [5], [6]]))
 
