@@ -1269,6 +1269,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         self._disk_row_gather = bool(
             getattr(self._kernel_config, "ple_disk_row_gather", True)
         )
+        self._disk_prefetch_window_bytes = (
+            getattr(self._kernel_config, "ple_disk_prefetch_window_kib", 0) << 10
+        )
         self._profile_disk_gathers = envs.VLLM_PLE_DISK_OFFLOAD_PROFILE
         self._disk_row_cache: PLERowCache | None = None
         self._disk_executor: ThreadPoolExecutor | None = None
@@ -1828,11 +1831,12 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     def _read_mapped_rows(self, flat_ids: np.ndarray) -> np.ndarray:
         """Read the given PLE rows from the mapped checkpoint shards.
 
-        The native row gather requests a request's missing pages together and
-        copies the rows. Without it, short requests copy their rows straight
-        from the retained mappings; longer ones read sorted unique ids per
-        shard, which keeps the mmap reads local, and read the shards in
-        parallel where a thread pool is configured.
+        The native row gather copies the rows in address order and requests
+        missing pages a bounded window ahead of the copy. Without it, short
+        requests copy their rows straight from the retained mappings; longer
+        ones read sorted unique ids per shard, which keeps the mmap reads
+        local, and read the shards in parallel where a thread pool is
+        configured.
         """
         if any(shard is None for shard in self._disk_shards):
             raise RuntimeError("PLE disk lookup started before every shard was loaded")
@@ -2241,6 +2245,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 file_backed=bool(self._disk_mapped_paths),
                 enabled=self._disk_row_gather,
                 cache_bytes=getattr(self._kernel_config, "ple_row_cache_mib", 0) << 20,
+                prefetch_window_bytes=self._disk_prefetch_window_bytes,
             )
             if self._kernel_config is not None:
                 self._kernel_config.ple_disk_row_readers[self.layer_name] = (
