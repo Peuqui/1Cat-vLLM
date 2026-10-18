@@ -1151,6 +1151,40 @@ def test_ple_layer_keeping_local_tables_initializes_and_merges_itself(
     assert _LocalTablesPleLayer.get_target_device() == torch.device("cpu")
 
 
+class _ConfigBoundLocalTablesPleLayer(_WeightLoadingPleLayer):
+    """Keeps local tables only while the engine config is current.
+
+    The Qwen4Exp cascade reads ``kernel_config.ple_disk_cascade_active`` from
+    the current config, which the worker sets around construction and loading
+    but not around ``execute_model``.
+    """
+
+    config_current = True
+
+    @classmethod
+    def offload_keeps_local_tables(cls) -> bool:
+        return cls.config_current
+
+
+def test_ple_layer_merges_local_tables_outside_the_engine_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_lazy_env(monkeypatch, "VLLM_PLE_CPU_OFFLOAD", "1")
+    set_lazy_env(monkeypatch, "VLLM_SM70_QWEN38_HYBRID_PLE", None)
+    monkeypatch.setattr(ple_offload_layer, "is_offload_process", lambda: False)
+
+    layer = _ConfigBoundLocalTablesPleLayer()
+    assert layer.weight.shape == (2,)
+
+    # The forward has to merge the tables the constructor built, even though
+    # the classmethod answers differently once the config is gone. Waiting for
+    # the worker's buffer instead would read rows nobody wrote.
+    monkeypatch.setattr(_ConfigBoundLocalTablesPleLayer, "config_current", False)
+    layer._is_cpu_offloaded = True
+    output = layer(torch.zeros(3), torch.tensor([4, 5, 6]))
+    assert torch.equal(output, torch.tensor([[4], [5], [6]]))
+
+
 def test_ple_offload_runner_binds_remote_placements_per_layer() -> None:
     bound: dict[str, list[object]] = {}
 
