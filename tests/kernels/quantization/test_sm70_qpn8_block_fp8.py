@@ -222,6 +222,34 @@ def test_volta_turbomind_copy_follows_decode_rows(
     assert hasattr(layer, "_sm70_block_fp8_turbomind_packed_weight") == copy
 
 
+@pytest.mark.parametrize("m", [1, 6, 8])
+def test_turing_decode_keeps_the_packed_gemm(default_vllm_config, m):
+    # Up to M=8 the packed m8n8k4 GEMM is faster than the tensor-core GEMM on
+    # most projection shapes, so Turing decode keeps it, bit for bit.
+    if torch.cuda.get_device_capability()[0:2] != (7, 5):
+        pytest.skip("the tensor-core GEMM runs on Turing only")
+    from vllm import _sm70_ops as ops
+
+    layer, _ = _layer(1536, 4096)
+    kernel = QPN8Fp8BlockScaledMMLinearKernel(_config(1536, 4096))
+    kernel.process_weights_after_loading(layer)
+    assert layer._qpn8_sm75_mma
+    x = torch.randn(m, 4096, device="cuda", dtype=torch.float16) * 0.1
+    expected = torch.empty((m, 1536), device="cuda", dtype=torch.float16)
+    split_k, accumulator_chains, prefetch_codes = layer._qpn8_cfg
+    ops.fp8_qpn8_gemm_sm70_out(
+        expected,
+        x,
+        layer._sm70_block_fp8_qpn8_packed_codes,
+        layer._sm70_block_fp8_qpn8_packed_scales,
+        split_k,
+        accumulator_chains,
+        True,
+        prefetch_codes,
+    )
+    torch.testing.assert_close(kernel.apply_weights(layer, x), expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(("n", "k"), [(1536, 4096), (5120, 3072), (17408, 5120)])
 @pytest.mark.parametrize("m", [9, 16, 17, 40, 64, 100, 300, 2048])
 def test_turing_large_m_runs_the_tensor_core_gemm(default_vllm_config, n, k, m):

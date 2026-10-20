@@ -7,9 +7,9 @@ The kernel admits static E4M3 weights with 128 x 128 scales, aligned positive
 N/K, and FP16 activations/output on Volta and Turing. KernelConfig owns the
 policy; no model identity or parallel layout limits this admission.
 
-M=0 returns an empty output. Turing runs M=1..512 through an m16n8k8
-tensor-core GEMM that decodes the packed codes on the fly; Volta runs
-M=1..8 through the packed m8n8k4 GEMM. Volta retains its TurboMind layout for
+M=0 returns an empty output. M=1..8 runs through the packed m8n8k4 GEMM;
+Turing runs M=9..512 through an m16n8k8 tensor-core GEMM that decodes the
+packed codes on the fly. Volta retains its TurboMind layout for
 larger M, avoiding a full dense reconstruction on short prefills, when decode
 can exceed M=8 or kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill
 asks for it. Larger M otherwise uses invocation-private dense scratch for the
@@ -44,9 +44,12 @@ from vllm.platforms import current_platform
 
 # Block-scale QPN8 GEMM supports M up to this bound; larger M uses a fallback.
 _QPN8_MAX_M = 8
-# Turing's tensor-core GEMM on the packed codes runs M up to this bound; above
-# it the dense reconstruction + cuBLAS is faster (Quadro RTX 8000, Qwen3.8-27B
-# TP2 projections, 20.10.2026: 0.83-1.06x at M=512, 1.15-1.75x at M>=1024).
+# Turing's tensor-core GEMM on the packed codes runs M above _QPN8_MAX_M up to
+# this bound. Up to M=8 the packed m8n8k4 GEMM is faster on most projection
+# shapes (CUDA-graph replay, Quadro RTX 8000, 20.10.2026: the tensor-core GEMM
+# took 1.01-1.28x its time on 10 of 13 DeepSeek-V4 and Qwen3.8-27B shapes,
+# 0.78-1.02x on the other three, and 0.16-0.60x at M=16..64); above this bound
+# the dense reconstruction + cuBLAS is faster (1.15-1.75x at M>=1024).
 _SM75_MMA_MAX_M = 512
 logger = init_logger(__name__)
 
@@ -80,16 +83,6 @@ def _qpn8_native_linear(
     out = x.new_empty((x.shape[0], n_dim))
     if x.shape[0] == 0:
         return out
-    if sm75_mma and x.shape[0] <= _SM75_MMA_MAX_M:
-        call_native(
-            sm70_ops.fp8_qpn8_mma_sm75_out,
-            native_policy,
-            out,
-            x,
-            codes,
-            group_scales,
-        )
-        return out
     if x.shape[0] <= _QPN8_MAX_M:
         call_native(
             sm70_ops.fp8_qpn8_gemm_sm70_out,
@@ -102,6 +95,16 @@ def _qpn8_native_linear(
             accumulator_chains,
             True,
             prefetch_codes,
+        )
+        return out
+    if sm75_mma and x.shape[0] <= _SM75_MMA_MAX_M:
+        call_native(
+            sm70_ops.fp8_qpn8_mma_sm75_out,
+            native_policy,
+            out,
+            x,
+            codes,
+            group_scales,
         )
         return out
     if fallback_weight is not None:
@@ -274,8 +277,9 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
             layer._qpn8_fallback_q_ld = int(metadata[1].item())
         if layer._qpn8_sm75_mma:
             logger.info_once(
-                "Block FP8 QPN8 on SM75: M=1..512 uses the tensor-core GEMM on "
-                "the packed codes, larger M the FP16 prefill."
+                "Block FP8 QPN8 on SM75: M=1..8 uses the packed decode GEMM, "
+                "M=9..512 the tensor-core GEMM on the packed codes, larger M "
+                "the FP16 prefill."
             )
         elif hasattr(layer, "_qpn8_fallback_k_ld"):
             logger.info_once(
