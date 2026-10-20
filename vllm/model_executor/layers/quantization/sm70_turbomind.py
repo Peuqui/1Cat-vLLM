@@ -671,7 +671,9 @@ class FP8QPN8LinearState:
         self.prefetch_codes = prefetch_codes
 
 
-def fp8_qpn8_launch_config(k: int) -> tuple[int, int, bool]:
+def fp8_qpn8_launch_config(
+    k: int, n: int, device: torch.device
+) -> tuple[int, int, bool]:
     """Split-K, accumulator chains and code prefetch for a QPN8 GEMM.
 
     The dispatcher admits split-K up to 16; the measured Qwen3.8 shapes use
@@ -680,8 +682,55 @@ def fp8_qpn8_launch_config(k: int) -> tuple[int, int, bool]:
     groups = k // QPN2_GROUP_SIZE
     for split_k in (16, 12, 8):
         if groups % split_k == 0:
-            return split_k, 2, False
+            return fp8_qpn8_occupancy_split_k(k, n, split_k, 16, device), 2, False
     raise RuntimeError(f"no QPN8 launch configuration for K={k}")
+
+
+# One CTA of the M <= 8 QPN8 GEMM covers this many output columns.
+_QPN8_COLUMNS_PER_CTA = 32
+# Below this K, split-K 32 leaves each warp too few groups to pay for it.
+_QPN8_SPLIT32_MIN_K = 4096
+
+
+def fp8_qpn8_occupancy_split_k(
+    k: int, n: int, split_k: int, max_split_k: int, device: torch.device
+) -> int:
+    """Fit the split-K of the M <= 8 QPN8 GEMM to the device's occupancy.
+
+    A CTA runs ``split_k`` warps along K (32 * split_k threads). Measured in
+    CUDA graphs on V100 and RTX 8000 at M = 1..8: with no more CTAs than SMs
+    each SM holds at most one CTA, and for K >= 4096 split-K 32 doubles its
+    warps (up to 28 % faster on V100 and 21 % on RTX 8000, at most 2 %
+    slower). Where a split-16 CTA fills half an SM (Turing, 1024 threads per
+    SM) and the grid spills into a second wave that keeps fewer than half the
+    SMs busy, split-K 8 fits it into one wave (3-27 % faster); with 2048
+    threads per SM (Volta) split-K 8 is slower there.
+    """
+    properties = torch.cuda.get_device_properties(device)
+    sms = properties.multi_processor_count
+    ctas_per_sm_at = {
+        split: properties.max_threads_per_multi_processor // (32 * split)
+        for split in (8, 16)
+    }
+    ctas = n // _QPN8_COLUMNS_PER_CTA
+    groups = k // QPN2_GROUP_SIZE
+    if (
+        max_split_k >= 32
+        and ctas <= sms
+        and k >= _QPN8_SPLIT32_MIN_K
+        and groups % 32 == 0
+    ):
+        return 32
+    spill = ctas - sms * ctas_per_sm_at[16]
+    if (
+        split_k == 16
+        and ctas_per_sm_at[16] <= 2
+        and 0 < spill < sms // 2
+        and ctas <= sms * ctas_per_sm_at[8]
+        and groups % 8 == 0
+    ):
+        return 8
+    return split_k
 
 
 def prepare_fp8_qpn8_dense_linear(
@@ -714,7 +763,9 @@ def prepare_fp8_qpn8_dense_linear(
     layer.register_buffer(
         "_sm70_turing_fp8_packed_scales", group_scales, persistent=False
     )
-    split_k, accumulator_chains, prefetch_codes = fp8_qpn8_launch_config(k)
+    split_k, accumulator_chains, prefetch_codes = fp8_qpn8_launch_config(
+        k, n, codes.device
+    )
     setattr(
         layer,
         FP8_QPN8_STATE_ATTR,
