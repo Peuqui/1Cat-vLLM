@@ -326,39 +326,38 @@ def test_fp8_scratch_is_owned_by_each_invocation(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("sms", "threads", "k", "n", "split_k", "max_split_k", "expected"),
+    ("sms", "threads", "k", "n", "split_k", "expected"),
     [
-        # RTX 8000: at most one CTA per SM; a long K doubles its warps.
-        (72, 1024, 4096, 512, 16, 32, 32),
-        (72, 1024, 4096, 1024, 16, 32, 32),
-        # A short K keeps the split, and so does a caller capped at 16.
-        (72, 1024, 1024, 1024, 16, 32, 16),
-        (72, 1024, 4096, 1024, 16, 16, 16),
-        # 160 CTAs spill 16 past the 144 split-16 slots: one wave at split 8.
-        (72, 1024, 3072, 5120, 16, 16, 8),
-        (72, 1024, 8704, 5120, 16, 32, 8),
+        # RTX 8000, 160 CTAs spill 16 past the 144 split-16 slots: one wave at
+        # split 8.
+        (72, 1024, 3072, 5120, 16, 8),
+        (72, 1024, 8704, 5120, 16, 8),
         # 224 CTAs keep 80 in the second wave, so split 16 stays.
-        (72, 1024, 5120, 7168, 16, 16, 16),
+        (72, 1024, 5120, 7168, 16, 16),
+        # Grids within one wave keep their split, small ones included.
+        (72, 1024, 4096, 512, 16, 16),
+        (72, 1024, 4096, 1024, 16, 16),
+        (72, 1024, 1024, 4096, 16, 16),
+        # Only split 16 is narrowed.
+        (72, 1024, 1536, 5376, 12, 12),
         # V100: 320 split-16 slots hold 160 CTAs, split 8 loses on spills.
-        (80, 2048, 3072, 5120, 16, 16, 16),
-        (80, 2048, 4096, 10752, 16, 32, 16),
-        (80, 2048, 4096, 1024, 16, 32, 32),
+        (80, 2048, 3072, 5120, 16, 16),
+        (80, 2048, 4096, 10752, 16, 16),
+        (80, 2048, 4096, 1024, 16, 16),
     ],
 )
 def test_qpn8_split_k_follows_device_occupancy(
-    monkeypatch, sms, threads, k, n, split_k, max_split_k, expected
+    monkeypatch, sms, threads, k, n, split_k, expected
 ):
     from vllm.model_executor.layers.quantization import sm70_turbomind as tm
 
     properties = NS(multi_processor_count=sms, max_threads_per_multi_processor=threads)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: properties)
     device = torch.device("cuda", 0)
-    assert tm.fp8_qpn8_occupancy_split_k(k, n, split_k, max_split_k, device) == expected
+    assert tm.fp8_qpn8_occupancy_split_k(k, n, split_k, device) == expected
 
 
-def test_qpn8_per_tensor_launch_keeps_split_k_within_dispatch(monkeypatch):
-    # The per-tensor dispatcher runs M = 9..32 kernels that admit split-K 16
-    # at most, so the lone-CTA split-K 32 never reaches it.
+def test_qpn8_per_tensor_launch_config_follows_occupancy(monkeypatch):
     from vllm.model_executor.layers.quantization import sm70_turbomind as tm
 
     properties = NS(multi_processor_count=72, max_threads_per_multi_processor=1024)

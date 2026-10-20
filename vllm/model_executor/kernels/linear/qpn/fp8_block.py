@@ -300,9 +300,8 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
         split_k, accumulator_chains, prefetch_codes = _sm70_fp8_qpn8_config(
             k_dim, n_dim, False
         )
-        # Only M <= 8 runs the packed GEMM here, and it admits split-K 32.
         layer._qpn8_cfg = (
-            fp8_qpn8_occupancy_split_k(k_dim, n_dim, split_k, 32, codes.device),
+            fp8_qpn8_occupancy_split_k(k_dim, n_dim, split_k, codes.device),
             accumulator_chains,
             prefetch_codes,
         )

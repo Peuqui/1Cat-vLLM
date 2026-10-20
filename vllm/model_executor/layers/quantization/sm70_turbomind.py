@@ -682,29 +682,27 @@ def fp8_qpn8_launch_config(
     groups = k // QPN2_GROUP_SIZE
     for split_k in (16, 12, 8):
         if groups % split_k == 0:
-            return fp8_qpn8_occupancy_split_k(k, n, split_k, 16, device), 2, False
+            return fp8_qpn8_occupancy_split_k(k, n, split_k, device), 2, False
     raise RuntimeError(f"no QPN8 launch configuration for K={k}")
 
 
 # One CTA of the M <= 8 QPN8 GEMM covers this many output columns.
 _QPN8_COLUMNS_PER_CTA = 32
-# Below this K, split-K 32 leaves each warp too few groups to pay for it.
-_QPN8_SPLIT32_MIN_K = 4096
 
 
 def fp8_qpn8_occupancy_split_k(
-    k: int, n: int, split_k: int, max_split_k: int, device: torch.device
+    k: int, n: int, split_k: int, device: torch.device
 ) -> int:
     """Fit the split-K of the M <= 8 QPN8 GEMM to the device's occupancy.
 
-    A CTA runs ``split_k`` warps along K (32 * split_k threads). Measured in
-    CUDA graphs on V100 and RTX 8000 at M = 1..8: with no more CTAs than SMs
-    each SM holds at most one CTA, and for K >= 4096 split-K 32 doubles its
-    warps (up to 28 % faster on V100 and 21 % on RTX 8000, at most 2 %
-    slower). Where a split-16 CTA fills half an SM (Turing, 1024 threads per
-    SM) and the grid spills into a second wave that keeps fewer than half the
-    SMs busy, split-K 8 fits it into one wave (3-27 % faster); with 2048
-    threads per SM (Volta) split-K 8 is slower there.
+    A CTA runs ``split_k`` warps along K (32 * split_k threads). Where a
+    split-16 CTA fills half an SM (Turing, 1024 threads per SM) and the grid
+    spills into a second wave that keeps fewer than half the SMs busy,
+    split-K 8 fits it into one wave (3-27 % faster in CUDA graphs on RTX 8000
+    at M = 1..8); with 2048 threads per SM (Volta) split-K 8 is slower there.
+    Split-K 32 for grids with no more CTAs than SMs was faster in isolation as
+    well, but on DeepSeek-V4 it gave no measurable step gain and lowered the
+    sampled draft acceptance in all eight comparisons, so it is not used.
     """
     properties = torch.cuda.get_device_properties(device)
     sms = properties.multi_processor_count
@@ -714,13 +712,6 @@ def fp8_qpn8_occupancy_split_k(
     }
     ctas = n // _QPN8_COLUMNS_PER_CTA
     groups = k // QPN2_GROUP_SIZE
-    if (
-        max_split_k >= 32
-        and ctas <= sms
-        and k >= _QPN8_SPLIT32_MIN_K
-        and groups % 32 == 0
-    ):
-        return 32
     spill = ctas - sms * ctas_per_sm_at[16]
     if (
         split_k == 16
