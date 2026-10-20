@@ -7,13 +7,13 @@ The kernel admits static E4M3 weights with 128 x 128 scales, aligned positive
 N/K, and FP16 activations/output on Volta and Turing. KernelConfig owns the
 policy; no model identity or parallel layout limits this admission.
 
-M=0 returns an empty output. M=1..8 uses packed GEMM. Volta retains its
-TurboMind layout for larger M, avoiding a full dense reconstruction on short
-prefills, when decode can exceed M=8 or
-kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill asks for it.
-Turing, and Volta without that second layout, use invocation-private
-dense scratch for the existing FP16 prefill operator. Native arithmetic is
-unchanged.
+M=0 returns an empty output. Turing runs M=1..512 through an m16n8k8
+tensor-core GEMM that decodes the packed codes on the fly; Volta runs
+M=1..8 through the packed m8n8k4 GEMM. Volta retains its TurboMind layout for
+larger M, avoiding a full dense reconstruction on short prefills, when decode
+can exceed M=8 or kernel_config.sm70_fp8.block_qpn8_volta_turbomind_prefill
+asks for it. Larger M otherwise uses invocation-private dense scratch for the
+FP16 prefill operator.
 """
 
 from collections.abc import Sequence
@@ -44,6 +44,10 @@ from vllm.platforms import current_platform
 
 # Block-scale QPN8 GEMM supports M up to this bound; larger M uses a fallback.
 _QPN8_MAX_M = 8
+# Turing's tensor-core GEMM on the packed codes runs M up to this bound; above
+# it the dense reconstruction + cuBLAS is faster (Quadro RTX 8000, Qwen3.8-27B
+# TP2 projections, 20.10.2026: 0.83-1.06x at M=512, 1.15-1.75x at M>=1024).
+_SM75_MMA_MAX_M = 512
 logger = init_logger(__name__)
 
 
@@ -53,7 +57,7 @@ logger = init_logger(__name__)
     schema="(Tensor x, Tensor codes, Tensor group_scales, int split_k, "
     "int accumulator_chains, bool prefetch_codes, Tensor? fallback_weight=None, "
     "Tensor? fallback_scales=None, int fallback_k_ld=0, int fallback_q_ld=0, "
-    "str[]? native_policy=None) -> Tensor",
+    "str[]? native_policy=None, bool sm75_mma=False) -> Tensor",
 )
 def _qpn8_native_linear(
     x: torch.Tensor,
@@ -67,6 +71,7 @@ def _qpn8_native_linear(
     fallback_k_ld: int = 0,
     fallback_q_ld: int = 0,
     native_policy: list[str] | None = None,
+    sm75_mma: bool = False,
 ) -> torch.Tensor:
     # The M decision stays inside the opaque op: a compiled graph covers a
     # dynamic M range, so a Python branch traced at small M would be reused
@@ -74,6 +79,16 @@ def _qpn8_native_linear(
     k_dim, n_dim = codes.shape
     out = x.new_empty((x.shape[0], n_dim))
     if x.shape[0] == 0:
+        return out
+    if sm75_mma and x.shape[0] <= _SM75_MMA_MAX_M:
+        call_native(
+            sm70_ops.fp8_qpn8_mma_sm75_out,
+            native_policy,
+            out,
+            x,
+            codes,
+            group_scales,
+        )
         return out
     if x.shape[0] <= _QPN8_MAX_M:
         call_native(
@@ -130,6 +145,7 @@ def _qpn8_native_linear_fake(
     fallback_k_ld=0,
     fallback_q_ld=0,
     native_policy=None,
+    sm75_mma=False,
 ):
     return x.new_empty((x.shape[0], codes.shape[1]))
 
@@ -181,15 +197,15 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
         n, k = config.weight_shape
         if n <= 0 or k <= 0 or n % 128 or k % 128:
             return False, f"requires positive N,K divisible by 128, got ({n},{k})"
-        missing = [
-            name
-            for name in (
-                "fp8_qpn8_prepare_sm70",
-                "fp8_qpn8_gemm_sm70_out",
-                "fp8_qpn8_prefill_sm70_out",
-            )
-            if not hasattr(torch.ops._C, name)
+        required = [
+            "fp8_qpn8_prepare_sm70",
+            "fp8_qpn8_gemm_sm70_out",
+            "fp8_qpn8_prefill_sm70_out",
         ]
+        capability = current_platform.get_device_capability()
+        if capability is not None and capability.to_int() == 75:
+            required.append("fp8_qpn8_mma_sm75_out")
+        missing = [name for name in required if not hasattr(torch.ops._C, name)]
         if missing:
             return False, f"missing native operators: {missing}"
         return True, None
@@ -238,7 +254,8 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
         layer.register_buffer(
             "_sm70_block_fp8_qpn8_packed_scales", group_scales, persistent=False
         )
-        capability = current_platform.get_device_capability()
+        capability = current_platform.get_device_capability(codes.device.index)
+        layer._qpn8_sm75_mma = capability is not None and capability.to_int() == 75
         if (
             capability is not None
             and capability.to_int() in (70, 72)
@@ -255,7 +272,12 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
             )
             layer._qpn8_fallback_k_ld = int(metadata[0].item())
             layer._qpn8_fallback_q_ld = int(metadata[1].item())
-        if hasattr(layer, "_qpn8_fallback_k_ld"):
+        if layer._qpn8_sm75_mma:
+            logger.info_once(
+                "Block FP8 QPN8 on SM75: M=1..512 uses the tensor-core GEMM on "
+                "the packed codes, larger M the FP16 prefill."
+            )
+        elif hasattr(layer, "_qpn8_fallback_k_ld"):
             logger.info_once(
                 "Block FP8 QPN8 native GEMM supports M=1..8; larger M uses a "
                 "second, TurboMind-packed copy of each weight. Set "
@@ -303,6 +325,7 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
             getattr(layer, "_qpn8_fallback_k_ld", 0),
             getattr(layer, "_qpn8_fallback_q_ld", 0),
             self.native_ops.arguments,
+            layer._qpn8_sm75_mma,
         )
         if bias is not None:
             y = y + bias

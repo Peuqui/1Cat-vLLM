@@ -220,3 +220,30 @@ def test_volta_turbomind_copy_follows_decode_rows(
         layer
     )
     assert hasattr(layer, "_sm70_block_fp8_turbomind_packed_weight") == copy
+
+
+@pytest.mark.parametrize(("n", "k"), [(1536, 4096), (5120, 3072), (17408, 5120)])
+@pytest.mark.parametrize("m", [9, 16, 17, 40, 64, 100, 300, 2048])
+def test_turing_large_m_runs_the_tensor_core_gemm(default_vllm_config, n, k, m):
+    # Above M=8 Turing decodes the packed codes inside an m16n8k8 GEMM instead
+    # of reconstructing the whole FP16 weight on every call. Its B operand is
+    # the dense reconstruction bit for bit; only the FP32 summation differs.
+    if torch.cuda.get_device_capability()[0:2] != (7, 5):
+        pytest.skip("the tensor-core GEMM runs on Turing only")
+    from vllm import _sm70_ops as ops
+
+    layer, _ = _layer(n, k)
+    kernel = QPN8Fp8BlockScaledMMLinearKernel(_config(n, k))
+    kernel.process_weights_after_loading(layer)
+    assert layer._qpn8_sm75_mma
+    codes = layer._sm70_block_fp8_qpn8_packed_codes
+    dense = torch.empty(codes.shape, device="cuda", dtype=torch.float16)
+    ops.fp8_qpn8_dequantize_sm70_out(
+        dense, codes, layer._sm70_block_fp8_qpn8_packed_scales
+    )
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.1
+    y = kernel.apply_weights(layer, x)
+    expected = x.double() @ dense.double()
+    error = ((y.double() - expected).norm() / expected.norm()).item()
+    cublas_error = (torch.mm(x, dense).double() - expected).norm() / expected.norm()
+    assert error < 2 * cublas_error.item() + 1e-6
