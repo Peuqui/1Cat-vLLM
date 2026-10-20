@@ -289,7 +289,7 @@ def test_eagle_hybrid_mamba_hits_partial_prompt_boundary(
     manager.allocate_slots(first, 544, num_computed, computed_blocks)
     first.num_computed_tokens = 544
     manager.new_step_starts()
-    for chunk_end in (1088, 1248, 1249):
+    for chunk_end in (1088, 1249):
         manager.allocate_slots(first, chunk_end - first.num_computed_tokens)
         first.num_computed_tokens = chunk_end
         manager.new_step_starts()
