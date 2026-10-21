@@ -1414,6 +1414,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             #   2*(192*128)*(64*1024) = 3gb
             # (assuming 192 QK head dim, 128 heads, and fp16)
             64 * 1024,
+            # No request holds more context than max_model_len; hybrid models
+            # raise the attention page to the mamba state page (GLM-5.3-Flash:
+            # 8576 tokens), so four pages alone would ask for 34k tokens.
+            scheduler_config.max_num_seqs * model_config.max_model_len,
         )
 
         # Enforce that we enough for at least 1 page per request

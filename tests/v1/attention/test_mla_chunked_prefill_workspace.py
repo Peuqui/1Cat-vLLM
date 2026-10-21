@@ -36,3 +36,11 @@ def test_workspace_holds_the_batch_contexts(max_model_len, max_num_seqs, expecte
     config = _config(max_model_len, max_num_seqs)
     size = MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(config)
     assert size == expected
+
+
+def test_hybrid_pages_do_not_outgrow_the_context():
+    # GLM-5.3-Flash: the attention page grows to the mamba page, 8576 tokens;
+    # four pages would exceed the one request's 16k context.
+    config = _config(16384, 1, block_size=8576)
+    size = MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(config)
+    assert size == 16384
