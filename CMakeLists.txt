@@ -821,7 +821,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     _h3_w8a16_C DESTINATION vllm LANGUAGE CUDA
     SOURCES "csrc/sm70_turbomind/ops/h3_w8a16.cu"
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
-    ARCHITECTURES "${SM70_FAMILY_CUDA_ARCHITECTURES}"
+    ARCHITECTURES ${SM70_FAMILY_CUDA_ARCHITECTURES}
     LIBRARIES CUDA::cublas CUDA::cublasLt "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)
   define_extension_target(
@@ -829,7 +829,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     SOURCES "flashinfer-sm70/csrc/h3_noncausal_sm70.cu"
     INCLUDE_DIRECTORIES "${CMAKE_CURRENT_LIST_DIR}/flashinfer-sm70/include"
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
-    ARCHITECTURES "${SM70_FAMILY_CUDA_ARCHITECTURES}"
+    ARCHITECTURES ${SM70_FAMILY_CUDA_ARCHITECTURES}
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)
   define_extension_target(
@@ -839,35 +839,35 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
       "${CUTLASS_INCLUDE_DIR}"
       "${cutlass_SOURCE_DIR}/examples/41_fused_multi_head_attention"
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
-    ARCHITECTURES "${SM70_FAMILY_CUDA_ARCHITECTURES}"
+    ARCHITECTURES ${SM70_FAMILY_CUDA_ARCHITECTURES}
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)
   define_extension_target(
     _sm70_qsa_indexer_C DESTINATION vllm LANGUAGE CUDA
     SOURCES "csrc/sm70_turbomind/ops/qsa_indexer_sm70.cu"
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
-    ARCHITECTURES "${SM70_FAMILY_CUDA_ARCHITECTURES}"
+    ARCHITECTURES ${SM70_FAMILY_CUDA_ARCHITECTURES}
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)
   define_extension_target(
     _sm70_router_C DESTINATION vllm LANGUAGE CUDA
     SOURCES "csrc/sm70_turbomind/ops/sm70_router.cu"
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
-    ARCHITECTURES "${SM70_FAMILY_CUDA_ARCHITECTURES}"
+    ARCHITECTURES ${SM70_FAMILY_CUDA_ARCHITECTURES}
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)
   define_extension_target(
     _sm70_qsa_device_C DESTINATION vllm LANGUAGE CUDA
     SOURCES "csrc/sm70_turbomind/ops/qsa_device_history_sm70.cu"
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
-    ARCHITECTURES "${SM70_FAMILY_CUDA_ARCHITECTURES}"
+    ARCHITECTURES ${SM70_FAMILY_CUDA_ARCHITECTURES}
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)
   define_extension_target(
     _sm70_exact_reduce_C DESTINATION vllm LANGUAGE CUDA
     SOURCES "csrc/sm70_turbomind/ops/exact_row_reduce.cu"
     COMPILE_FLAGS ${VLLM_GPU_FLAGS} "--fmad=false"
-    ARCHITECTURES "${SM70_FAMILY_CUDA_ARCHITECTURES}"
+    ARCHITECTURES ${SM70_FAMILY_CUDA_ARCHITECTURES}
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)
   define_extension_target(
@@ -877,7 +877,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
       "${CUTLASS_INCLUDE_DIR}"
       "${cutlass_SOURCE_DIR}/examples/41_fused_multi_head_attention"
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
-    ARCHITECTURES "${SM70_FAMILY_CUDA_ARCHITECTURES}"
+    ARCHITECTURES ${SM70_FAMILY_CUDA_ARCHITECTURES}
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)
 endif()
