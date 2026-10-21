@@ -645,6 +645,18 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
     return out
 
 
+def _turing_fused_prefill_scores(q: torch.Tensor) -> bool:
+    """Whether Turing's fused tensor-core scorer takes this prefill chunk.
+
+    It computes scores, relu, head weights, head sum and key scales in one
+    kernel, so the [tokens * heads, keys] score tile of the cuBLAS route never
+    reaches memory. Its warps hold 32 heads each.
+    """
+    return q.shape[1] in (32, 64) and current_platform.is_device_capability(
+        (7, 5), device_id=q.device.index
+    )
+
+
 def sm70_indexer_prefill_logits(
     q: torch.Tensor,
     k_quant: torch.Tensor,
@@ -657,6 +669,15 @@ def sm70_indexer_prefill_logits(
     assert k_quant.ndim == 2 and k_quant.shape[1] == _INDEX_HEAD_DIM
     k_scales = k_scale_storage.view(torch.float32).reshape(-1)
     assert k_scales.shape[0] == k_quant.shape[0]
+
+    if policy.value("indexer_relu") and _turing_fused_prefill_scores(q):
+        out = torch.empty(
+            (q.shape[0], k_quant.shape[0]), dtype=torch.float32, device=q.device
+        )
+        torch.ops._C.indexer_prefill_scores_sm75(
+            out, q, weights, k_quant.view(torch.uint8), k_scales
+        )
+        return out
 
     if policy.value("indexer_relu") and policy.value("indexer_prefill_cublas"):
         return _prefill_logits_cublas(q, k_quant, k_scales, weights)
@@ -893,14 +914,18 @@ def _decode_cublas_blocker(
             and weights.dtype == torch.float32,
         ),
         (
-            "the shared key gather and one FP32 score tile within the indexer "
-            "workspace budget",
+            (
+                "the shared key gather and one FP32 score tile within the indexer "
+                "workspace budget"
+            ),
             lambda: _decode_score_tile_keys(max_seq_len, rows_per_request(), q.shape[1])
             > 0,
         ),
         (
-            f"a uint8 cache [blocks, block_size, {_INDEX_CACHE_BYTES}] with "
-            "contiguous blocks",
+            (
+                f"a uint8 cache [blocks, block_size, {_INDEX_CACHE_BYTES}] with "
+                "contiguous blocks"
+            ),
             lambda: cache.ndim == 3
             and cache.dtype == torch.uint8
             and cache.shape[1] > 0

@@ -124,6 +124,51 @@ def test_prefill_matches_the_reference_scoring_function(monkeypatch, use_cublas)
 
 
 @requires_sm70
+@pytest.mark.parametrize("weight_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_prefill_model_head_counts_match_the_reference(num_heads, weight_dtype):
+    """32 and 64 heads are the model head counts (16-head indexers pad to 32);
+    on Turing they take the fused tensor-core scorer. 37 queries and 1100 keys
+    leave a partial token group, a partial key tile and a second key range.
+    """
+    torch.manual_seed(20261021)
+    generator = torch.Generator().manual_seed(20261021)
+    num_queries, num_keys = 37, 1100
+
+    q, weights = _make_queries(num_queries, num_heads)
+    weights = weights.to(weight_dtype)
+    bits, values = _random_fp8_keys(num_keys, generator)
+    scales = torch.linspace(0.5, 2.0, num_keys, device="cuda", dtype=torch.float32)
+
+    actual = sm70_indexer_prefill_logits(
+        q, bits.view(torch.float8_e4m3fn), scales, weights
+    )
+    expected = _reference_index_logits(q, weights, values * scales[:, None])
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 5),
+    reason="requires a Turing GPU (SM75)",
+)
+def test_turing_prefill_takes_the_fused_scorer(monkeypatch):
+    def cublas_route(*args):
+        raise AssertionError("Turing must not stage scores through cuBLAS")
+
+    monkeypatch.setattr(sm70_indexer, "_prefill_logits_cublas", cublas_route)
+    generator = torch.Generator().manual_seed(20261021)
+    q, weights = _make_queries(512, 64)
+    bits, values = _random_fp8_keys(300, generator)
+    scales = torch.linspace(0.5, 2.0, 300, device="cuda", dtype=torch.float32)
+
+    actual = sm70_indexer_prefill_logits(
+        q, bits.view(torch.float8_e4m3fn), scales, weights
+    )
+    expected = _reference_index_logits(q, weights, values * scales[:, None])
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+@requires_sm70
 def test_prefill_relu_off_restores_the_factored_form(monkeypatch):
     """VLLM_SM70_INDEXER_RELU=0 keeps the old scoring reachable for A/B."""
     torch.manual_seed(20260819)

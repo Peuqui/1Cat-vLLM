@@ -326,6 +326,10 @@ void paged_prefill_attention_sm75(torch::Tensor out, torch::Tensor q,
                                   torch::Tensor block_table,
                                   int64_t max_seqlen_q, double softmax_scale);
 
+void indexer_prefill_scores_sm75(torch::Tensor out, torch::Tensor q,
+                                 torch::Tensor weights, torch::Tensor keys,
+                                 torch::Tensor key_scales);
+
 void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
                          torch::Tensor qscales, torch::Tensor gscales,
                          torch::Tensor perm, torch::Tensor gids,
