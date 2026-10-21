@@ -675,6 +675,11 @@ class FlashAttentionImpl(AttentionImpl):
             if vllm_config is not None
             else 0
         )
+        self.turing_prefill_min_query_len = (
+            vllm_config.attention_config.flash_attn_turing_prefill_min_query_len
+            if vllm_config is not None
+            else 0
+        )
 
     def _use_packed_gqa_verify(
         self,
@@ -701,6 +706,32 @@ class FlashAttentionImpl(AttentionImpl):
             and self.sinks is None
             and not is_quantized_kv_cache(self.kv_cache_dtype)
             and not self.batch_invariant_enabled
+        )
+
+    def _use_turing_prefill(
+        self, attn_metadata: FlashAttentionMetadata, query: torch.Tensor
+    ) -> bool:
+        """Whether this batch takes `paged_prefill_attention_sm75`.
+
+        Turing only (the query's own device): FA2's Turing build runs causal
+        head-dim-256 prefills over an fp16 paged cache at about a quarter of
+        the m16n8k8 rate, while newer cards have their own FA2 kernels.
+        """
+        return (
+            0 < self.turing_prefill_min_query_len <= attn_metadata.max_query_len
+            and self.head_size == 256
+            and attn_metadata.causal
+            and query.dtype == torch.float16
+            and self.vllm_flash_attn_version == 2
+            and self.sliding_window == (-1, -1)
+            and self.alibi_slopes is None
+            and self.sinks is None
+            and not self.logits_soft_cap
+            and not is_quantized_kv_cache(self.kv_cache_dtype)
+            and not self.batch_invariant_enabled
+            and current_platform.is_device_capability(
+                (7, 5), device_id=query.device.index
+            )
         )
 
     def forward(
@@ -843,6 +874,19 @@ class FlashAttentionImpl(AttentionImpl):
                     logits_soft_cap=self.logits_soft_cap,
                     max_num_splits=attn_metadata.max_num_splits,
                     fa_version=self.vllm_flash_attn_version,
+                )
+                return output
+            elif self._use_turing_prefill(attn_metadata, query):
+                torch.ops._C.paged_prefill_attention_sm75(
+                    output[:num_actual_tokens],
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    self.scale,
                 )
                 return output
             else:
