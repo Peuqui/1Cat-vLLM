@@ -3,24 +3,22 @@
 """The setting that hands Volta and Turing routes to Triton tensor-core kernels."""
 
 import pytest
-import torch
 
 from vllm.config.kernel import KernelConfig
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
-from vllm.triton_utils import sm7x
+from vllm.triton_utils import mma_probe
 
-DEVICE = torch.device("cuda", 3)
+DEVICE_INDEX = 3
 ON = KernelConfig(triton_sm7x_tensor_cores=True)
 
 
 def _device(monkeypatch, capability: int) -> None:
     def device_capability(device_id: int | None = None) -> DeviceCapability:
-        assert device_id == DEVICE.index
+        assert device_id == DEVICE_INDEX
         return DeviceCapability(capability // 10, capability % 10)
 
-    monkeypatch.setattr(
-        sm7x.current_platform, "get_device_capability", device_capability
-    )
+    monkeypatch.setattr(current_platform, "get_device_capability", device_capability)
 
 
 def _compiler(monkeypatch, lowers: bool) -> list[int]:
@@ -30,14 +28,14 @@ def _compiler(monkeypatch, lowers: bool) -> list[int]:
         probed.append(capability)
         return lowers
 
-    monkeypatch.setattr(sm7x, "lowers_dot_to_mma", probe)
+    monkeypatch.setattr(mma_probe, "lowers_dot_to_mma", probe)
     return probed
 
 
 def test_off_by_default_without_probing(monkeypatch):
     _device(monkeypatch, 75)
     probed = _compiler(monkeypatch, lowers=False)
-    assert not sm7x.triton_sm7x_tensor_cores(KernelConfig(), DEVICE)
+    assert not KernelConfig().use_triton_sm7x_tensor_cores(DEVICE_INDEX)
     assert probed == []
 
 
@@ -45,7 +43,7 @@ def test_off_by_default_without_probing(monkeypatch):
 def test_on_with_tensor_core_triton(monkeypatch, capability):
     _device(monkeypatch, capability)
     probed = _compiler(monkeypatch, lowers=True)
-    assert sm7x.triton_sm7x_tensor_cores(ON, DEVICE)
+    assert ON.use_triton_sm7x_tensor_cores(DEVICE_INDEX)
     assert probed == [capability]
 
 
@@ -54,19 +52,19 @@ def test_on_with_fma_triton_stops(monkeypatch, capability):
     _device(monkeypatch, capability)
     _compiler(monkeypatch, lowers=False)
     with pytest.raises(RuntimeError, match=f"lowers tl.dot to FMA on sm_{capability}"):
-        sm7x.triton_sm7x_tensor_cores(ON, DEVICE)
+        ON.use_triton_sm7x_tensor_cores(DEVICE_INDEX)
 
 
 def test_other_architectures_keep_their_routes(monkeypatch):
     _device(monkeypatch, 80)
     probed = _compiler(monkeypatch, lowers=True)
-    assert not sm7x.triton_sm7x_tensor_cores(ON, DEVICE)
+    assert not ON.use_triton_sm7x_tensor_cores(DEVICE_INDEX)
     assert probed == []
 
 
 def test_probe_sees_mma_where_every_triton_emits_it():
     # Ampere's fp16 tl.dot is MMA in any Triton; Volta and Turing depend on the build.
-    assert sm7x.lowers_dot_to_mma(80)
+    assert mma_probe.lowers_dot_to_mma(80)
 
 
 def test_setting_changes_the_compilation_hash():
