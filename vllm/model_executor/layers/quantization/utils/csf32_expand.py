@@ -194,34 +194,41 @@ def _csf32_expand_kernel(
     GROUPS: tl.constexpr,
     PROJECTIONS: tl.constexpr,
 ):
+    # One program per group and tile row (4 block rows = 128 matrix rows); it
+    # walks the row's tile pairs, so the row bases are loaded once and each
+    # program writes whole 128-byte raster runs.
     slot = tl.program_id(0)
     if tl.load(goff_ptr + slot) >= num_slots:
         return
     expert = tl.load(gids_ptr + slot).to(tl.int64)
-    tile_id = tl.program_id(1)
-    tiles_per_matrix: tl.constexpr = (ROWS // 128) * (GROUPS // 4)
-    projection = tile_id // tiles_per_matrix
-    tile = tile_id % tiles_per_matrix
-    matrix = expert * PROJECTIONS + projection
+    row_tile = tl.program_id(1)
+    projection = row_tile // (ROWS // 128)
+    tile_row = row_tile % (ROWS // 128)
     tile_pairs: tl.constexpr = GROUPS // 4
+    matrix = expert * PROJECTIONS + projection
 
     e = tl.arange(0, 512)
     at = e // 64
     field = e % 64
     r = field // 2
     c = field % 2
-    block = tile * 8 + at
-    block_row = (tile // tile_pairs) * 4 + at % 4
-    pair = (tile % tile_pairs) * 2 + at // 4
-    row = block_row * 32 + r
-    code = tl.load(codes_ptr + matrix * (ROWS * GROUPS // 2) + block * 32 + field // 2)
-    nibble = (code.to(tl.int32) >> (4 * (field % 2))) & 0xF
-    base = tl.load(bases_ptr + matrix * ROWS + row).to(tl.int32)
-    value = (base + nibble).to(tl.uint8)
-
+    block_row = tile_row * 4 + at % 4
+    base = tl.load(bases_ptr + matrix * ROWS + block_row * 32 + r).to(tl.int32)
+    entry = tl.load(entries_ptr + r)
     out_tile = projection * (ROWS // 32) + block_row
-    index = (out_tile * GROUPS + pair * 2 + c) * 32 + tl.load(entries_ptr + r)
-    tl.store(out_ptr + expert * out_expert_stride + index, value)
+    out_row = out_ptr + expert * out_expert_stride + out_tile * GROUPS * 32 + entry
+    codes_row = (
+        codes_ptr
+        + matrix * (ROWS * GROUPS // 2)
+        + (tile_row * tile_pairs * 8 + at) * 32
+        + field // 2
+    )
+    shift = 4 * (field % 2)
+    for tile_pair in range(tile_pairs):
+        code = tl.load(codes_row + tile_pair * 8 * 32)
+        value = (base + ((code.to(tl.int32) >> shift) & 0xF)).to(tl.uint8)
+        pair = tile_pair * 2 + at // 4
+        tl.store(out_row + (pair * 2 + c) * 32, value)
 
 
 @triton.jit
@@ -312,8 +319,12 @@ def expand_csf32_experts(
             "CSF expansion supports full tiles only (rows % 128, groups % 4)"
         )
     num_slots = gids.shape[0]
-    tiles = planes.projections * (planes.rows // 128) * (planes.groups // 4)
-    _csf32_expand_kernel[(num_slots, tiles)](
+    # There are never more groups than experts: launching all S = tokens x top_k
+    # group rows made the prefill launch mostly empty programs (14x the work
+    # for 512 tokens x top-8 against 288 experts).
+    group_rows = min(num_slots, out.shape[0])
+    row_tiles = planes.projections * (planes.rows // 128)
+    _csf32_expand_kernel[(group_rows, row_tiles)](
         out,
         out.stride(0),
         gids,
@@ -326,7 +337,7 @@ def expand_csf32_experts(
         GROUPS=planes.groups,
         PROJECTIONS=planes.projections,
     )
-    _csf32_exceptions_kernel[(num_slots, planes.projections)](
+    _csf32_exceptions_kernel[(group_rows, planes.projections)](
         out,
         out.stride(0),
         gids,
