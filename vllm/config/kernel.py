@@ -699,6 +699,13 @@ class KernelConfig:
     - "exllama": Use Exllama mixed-precision kernels
     - "emulation": Use slow dequant-to-BF16 emulation (for testing only)"""
 
+    triton_sm7x_tensor_cores: bool = False
+    """The installed Triton lowers ``tl.dot`` to tensor cores on Volta
+    (mma.m8n8k4) and Turing (mma.m16n8k8), so SM70-family routes run their
+    Triton kernels instead of cuBLAS or hand-written ones. Stock Triton lowers
+    ``tl.dot`` to FMA before SM80; each architecture is verified against the
+    installed compiler on first use and a mismatch stops the engine."""
+
     sm70_packed_topk_gather: bool = True
     """Gather SM70 TP2/TP4 compact candidates in one lossless message."""
 
