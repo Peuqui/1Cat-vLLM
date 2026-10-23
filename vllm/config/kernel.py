@@ -626,7 +626,15 @@ class HostReduceConfig:
     peer to peer."""
 
     max_bytes: int = Field(default=262144, gt=0, le=4194304, multiple_of=16)
-    """Largest payload; larger all-reduces stay on NCCL."""
+    """Largest payload of the kernel mode (decode)."""
+
+    copy_engine_max_bytes: int = Field(default=0, ge=0, multiple_of=16)
+    """Largest payload of the copy-engine mode for prefill-sized all-reduces:
+    the copy engines move both tensors through the host buffer, ordered by
+    stream memory operations, so no SM polls host memory and computation on
+    other streams keeps its speed. Eager calls only; it pins four slots of
+    this size in shared host memory. 0 leaves payloads above max_bytes on
+    NCCL."""
 
 
 @config
