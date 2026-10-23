@@ -794,6 +794,12 @@ class KernelConfig:
     host_reduce: HostReduceConfig = Field(default_factory=HostReduceConfig)
     """Two-rank host-memory all-reduce policy, resolved from peer access."""
 
+    tp_prefill_overlap_min_tokens: int = Field(default=0, ge=0)
+    """Prefill batches of at least this many tokens run as two interleaved
+    halves on a tensor-parallel engine without pipeline stages: while one half
+    all-reduces on a side stream, the other half computes. 0 keeps batches
+    whole. Every collective in the model's forward must be an all-reduce."""
+
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )
@@ -1154,6 +1160,8 @@ class KernelConfig:
             "ple_disk_row_cache_gib",
             # Collective transport chosen outside the compiled graph.
             "host_reduce",
+            # Micro-batch interleaving around the same compiled graph.
+            "tp_prefill_overlap_min_tokens",
         }
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")
