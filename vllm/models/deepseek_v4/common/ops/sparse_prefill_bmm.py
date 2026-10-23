@@ -15,26 +15,60 @@ the same precision.
 """
 
 import math
+from typing import NamedTuple
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, tldevice, triton
 
 WorkspaceSpec = tuple[tuple[int, ...], torch.dtype]
 
-# Query tokens attended per pass. The buffers grow with this number, not with
-# the prefill chunk: at 64 heads and 640 keys they take 110 MiB for 128 tokens,
-# and a 256-token chunk reserving twice the former 140 MiB ran the V100 stages
-# of a pipeline out of memory. A second pass costs two more BLAS calls per layer.
+# Query tokens the gather route attends per pass. The buffers grow with this
+# number, not with the prefill chunk: at 64 heads and 640 keys they take 110 MiB
+# for 128 tokens, and a 256-token chunk reserving twice the former 140 MiB ran
+# the V100 stages of a pipeline out of memory. A second pass costs two more
+# BLAS calls per layer.
 MAX_TOKENS_PER_PASS = 128
 
 # Slots one gather program copies: eight 1 KiB rows of a 512-wide fp16 key.
 _GATHER_SLOTS = 8
 
-# Tiles of the tensor-core route, one pair for V100 and RTX 8000 (64 heads, 64
-# and 128 query tokens, 640 and 1152 slots); every program covers all heads.
-_TC_SCORES_SLOTS, _TC_SCORES_DIMS, _TC_SCORES_WARPS, _TC_SCORES_STAGES = 128, 64, 8, 2
-_TC_PV_DIMS, _TC_PV_SLOTS, _TC_PV_WARPS, _TC_PV_STAGES = 256, 32, 8, 1
+
+class _TcTiles(NamedTuple):
+    """Passes and tiles of the tensor-core route; every program covers all
+    heads of its token."""
+
+    tokens_per_pass: int
+    scores_slots: int
+    scores_dims: int
+    scores_warps: int
+    scores_stages: int
+    pv_dims: int
+    pv_slots: int
+    pv_warps: int
+    pv_stages: int
+
+
+def _tc_tiles(device: torch.device) -> _TcTiles:
+    """Measured per architecture on whole 1020-token chunks with 64 heads and
+    640 and 1152 slots, neighbouring tokens selecting mostly the same keys as
+    DeepSeek-V4's top-k plus window does (23.10.2026).
+
+    Turing takes a chunk in one pass: 2.45 -> 2.19 ms at 640 slots and
+    4.21 -> 3.86 ms at 1152, for 432 MiB of scores and probabilities, which
+    its 48 GiB cards hold. Volta keeps 128-token passes: one pass would save
+    13 % but cost 378 MiB more on its 32 GiB pipeline stages. No swept tile
+    beat these on either card."""
+    if current_platform.is_device_capability((7, 5), device_id=device.index):
+        return _TcTiles(1024, 128, 64, 8, 2, 256, 32, 8, 1)
+    return _TcTiles(MAX_TOKENS_PER_PASS, 128, 64, 8, 2, 256, 32, 8, 1)
+
+
+def tokens_per_pass(tensor_cores: bool, device: torch.device) -> int:
+    """Query tokens one pass of the route attends on ``device``; its buffers
+    are sized for this many."""
+    return _tc_tiles(device).tokens_per_pass if tensor_cores else MAX_TOKENS_PER_PASS
 
 
 def sparse_prefill_bmm_workspace_specs(
@@ -43,12 +77,13 @@ def sparse_prefill_bmm_workspace_specs(
     head_dim: int,
     width: int,
     dtype: torch.dtype,
+    device: torch.device,
     tensor_cores: bool = False,
 ) -> list[WorkspaceSpec]:
-    """Buffers of `sparse_attn_prefill_bmm`, in its argument order, or with
-    ``tensor_cores`` of `sparse_attn_prefill_tensor_cores`, which needs no
-    gathered keys."""
-    num_tokens = min(num_tokens, MAX_TOKENS_PER_PASS)
+    """Buffers of `sparse_attn_prefill_bmm` on ``device``, in its argument
+    order, or with ``tensor_cores`` of `sparse_attn_prefill_tensor_cores`,
+    which needs no gathered keys."""
+    num_tokens = min(num_tokens, tokens_per_pass(tensor_cores, device))
     scores_and_probs: list[WorkspaceSpec] = [
         ((num_tokens, num_heads, width), torch.float32),
         ((num_tokens, num_heads, width), dtype),
@@ -377,10 +412,11 @@ def sparse_attn_prefill_tensor_cores(
     specs with ``tensor_cores``."""
     total_tokens, width = indices.shape
     num_heads, head_dim = q.shape[1:]
-    if head_dim % _TC_SCORES_DIMS or head_dim % _TC_PV_DIMS:
+    tiles = _tc_tiles(q.device)
+    if head_dim % tiles.scores_dims or head_dim % tiles.pv_dims:
         raise ValueError(
-            f"tensor-core sparse prefill tiles {_TC_SCORES_DIMS} and "
-            f"{_TC_PV_DIMS} dimensions, got {head_dim}"
+            f"tensor-core sparse prefill tiles {tiles.scores_dims} and "
+            f"{tiles.pv_dims} dimensions, got {head_dim}"
         )
     if kv.stride(-1) != 1 or indices.stride(-1) != 1 or q.stride(-1) != 1:
         raise ValueError("tensor-core sparse prefill needs unit inner strides")
@@ -388,14 +424,14 @@ def sparse_attn_prefill_tensor_cores(
     block_h = max(16, triton.next_power_of_2(num_heads))
     unused = _unused_slots(indices, lengths)
 
-    for start in range(0, total_tokens, MAX_TOKENS_PER_PASS):
-        stop = min(start + MAX_TOKENS_PER_PASS, total_tokens)
+    for start in range(0, total_tokens, tiles.tokens_per_pass):
+        stop = min(start + tiles.tokens_per_pass, total_tokens)
         num_tokens = stop - start
         pass_scores = _fit(scores, (num_tokens, num_heads, width))
         pass_probs = _fit(probs, (num_tokens, num_heads, width))
         pass_q, pass_out = q[start:stop], output[start:stop]
         pass_indices, pass_unused = indices[start:stop], unused[start:stop]
-        _selected_scores_kernel[(triton.cdiv(width, _TC_SCORES_SLOTS), num_tokens)](
+        _selected_scores_kernel[(triton.cdiv(width, tiles.scores_slots), num_tokens)](
             pass_q,
             kv,
             pass_indices,
@@ -410,13 +446,13 @@ def sparse_attn_prefill_tensor_cores(
             width,
             BLOCK_H=block_h,
             D=head_dim,
-            BLOCK_SLOTS=_TC_SCORES_SLOTS,
-            BLOCK_D=_TC_SCORES_DIMS,
-            num_warps=_TC_SCORES_WARPS,
-            num_stages=_TC_SCORES_STAGES,
+            BLOCK_SLOTS=tiles.scores_slots,
+            BLOCK_D=tiles.scores_dims,
+            num_warps=tiles.scores_warps,
+            num_stages=tiles.scores_stages,
         )
         _sink_softmax(pass_scores, pass_unused, scale, attn_sink, pass_probs)
-        _selected_pv_kernel[(head_dim // _TC_PV_DIMS, num_tokens)](
+        _selected_pv_kernel[(head_dim // tiles.pv_dims, num_tokens)](
             pass_probs,
             kv,
             pass_indices,
@@ -430,8 +466,8 @@ def sparse_attn_prefill_tensor_cores(
             num_heads,
             width,
             BLOCK_H=block_h,
-            BLOCK_D=_TC_PV_DIMS,
-            BLOCK_SLOTS=_TC_PV_SLOTS,
-            num_warps=_TC_PV_WARPS,
-            num_stages=_TC_PV_STAGES,
+            BLOCK_D=tiles.pv_dims,
+            BLOCK_SLOTS=tiles.pv_slots,
+            num_warps=tiles.pv_warps,
+            num_stages=tiles.pv_stages,
         )
