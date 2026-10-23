@@ -1347,7 +1347,9 @@ def sm70_awq_warmup(worker: Worker) -> None:
             exported_records,
             device,
         )
-    if capture_runtime_config().value("freeze_tuning_after_warmup"):
+    if worker.vllm_config.kernel_config.sm70_runtime.value(
+        "freeze_tuning_after_warmup"
+    ):
         logger.info(
             "SM70 TurboMind tuning frozen after warmup: %d measured records "
             "reused for the service lifetime on device %s.",
