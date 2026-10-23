@@ -190,6 +190,13 @@ def _import_lut_bytes(device: torch.device, payload: bytes) -> int:
         return int(sm70_native_cache.import_cache(device_hint, str(path)))
 
 
+def _freeze_tuning_plan(device: torch.device) -> int:
+    """Import this device's measured plan back as its authoritative cache, so
+    later calls reuse it instead of measuring; returns the record count."""
+    payload, _ = _export_lut_bytes(device)
+    return 0 if payload is None else _import_lut_bytes(device, payload)
+
+
 def _run_coordinated_dense_warmup(
     warmup: Callable[[], Any],
     device: torch.device,
@@ -1338,5 +1345,12 @@ def sm70_awq_warmup(worker: Worker) -> None:
         logger.info(
             "Saved SM70 GEMM LUT (%d records) for device %s.",
             exported_records,
+            device,
+        )
+    if capture_runtime_config().value("freeze_tuning_after_warmup"):
+        logger.info(
+            "SM70 TurboMind tuning frozen after warmup: %d measured records "
+            "reused for the service lifetime on device %s.",
+            _freeze_tuning_plan(device),
             device,
         )

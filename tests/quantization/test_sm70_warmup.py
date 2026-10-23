@@ -736,3 +736,26 @@ def test_fp8_dynamic_tuning_skips_stale_lut_by_default(monkeypatch):
         has_fp8_dense=True,
         fp4_kinds=set(),
     )
+
+
+def test_freeze_imports_the_measured_plan_back(monkeypatch):
+    device = torch.device("cpu")
+    imported = []
+    monkeypatch.setattr(warmup, "_export_lut_bytes", lambda dev: (b"plan", 7))
+    monkeypatch.setattr(
+        warmup,
+        "_import_lut_bytes",
+        lambda dev, payload: imported.append((dev, payload)) or 7,
+    )
+    assert warmup._freeze_tuning_plan(device) == 7
+    assert imported == [(device, b"plan")]
+
+
+def test_freeze_without_export_support_imports_nothing(monkeypatch):
+    monkeypatch.setattr(warmup, "_export_lut_bytes", lambda dev: (None, 0))
+    monkeypatch.setattr(
+        warmup,
+        "_import_lut_bytes",
+        lambda dev, payload: pytest.fail("nothing to import"),
+    )
+    assert warmup._freeze_tuning_plan(torch.device("cpu")) == 0

@@ -542,11 +542,17 @@ turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
 turbomind::gemm::DispatchPolicy select_moe_dispatch_policy_impl(
     int device, int total_tokens, int n, int k, int num_experts, int group_size,
     cudaStream_t stream, TuneKeyKind kind, bool tune_enabled,
-    int max_tune_tokens) {
+    int max_tune_tokens, bool reuse_imported_cache) {
   const int tune_limit =
       max_tune_tokens >= 0 ? max_tune_tokens : moe_tune_max_tokens();
   if (!tune_enabled || total_tokens > tune_limit) {
     return turbomind::gemm::DispatchPolicy::kDefault;
+  }
+  // As for dense shapes: an imported (or frozen) plan is authoritative, so a
+  // shape it lacks takes the nearest measured one instead of a measurement
+  // on the request that brings it.
+  if (reuse_imported_cache && has_imported_cache(device)) {
+    return turbomind::gemm::DispatchPolicy::kReuse;
   }
 
   MoeTuneKey key{kind, device, total_tokens, n, k, num_experts, group_size};
@@ -607,7 +613,8 @@ turbomind::gemm::DispatchPolicy select_fp8_moe_dispatch_policy(
   }
   return select_moe_dispatch_policy_impl(
       device, total_tokens, n, k, num_experts, group_size, stream,
-      TuneKeyKind::kFp8Moe, fp8_tune_small_shapes_enabled());
+      TuneKeyKind::kFp8Moe, fp8_tune_small_shapes_enabled(), -1,
+      fp8_reuse_imported_cache_enabled());
 }
 
 turbomind::gemm::DispatchPolicy select_mxfp4_moe_dispatch_policy(
