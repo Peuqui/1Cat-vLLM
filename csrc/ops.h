@@ -324,7 +324,8 @@ void paged_prefill_attention_sm75(torch::Tensor out, torch::Tensor q,
                                   torch::Tensor cu_seqlens_q,
                                   torch::Tensor seqused_k,
                                   torch::Tensor block_table,
-                                  int64_t max_seqlen_q, double softmax_scale);
+                                  int64_t max_seqlen_q, double softmax_scale,
+                                  int64_t num_kv_splits);
 
 void indexer_prefill_scores_sm75(torch::Tensor out, torch::Tensor q,
                                  torch::Tensor weights, torch::Tensor keys,
