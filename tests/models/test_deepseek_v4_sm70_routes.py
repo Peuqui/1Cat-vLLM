@@ -475,10 +475,12 @@ def test_sm70_sparse_bmm_decode_takes_graph_workspace_buffers():
     splitk.assert_not_called()
     paged.assert_not_called()
     bmm.assert_called_once()
-    keys, scores, logits, probs = bmm.call_args.args[-4:]
+    # The fused sink softmax reads FP32 scores and writes the probabilities;
+    # the sink needs no extra column.
+    keys, scores, probs = bmm.call_args.args[-3:]
     assert keys.shape == (6, 128, 512)
-    assert scores.shape == (6, 64, 128)
-    assert logits.shape == probs.shape == (6, 64, 129)
+    assert scores.shape == probs.shape == (6, 64, 128)
+    assert scores.dtype == torch.float32 and probs.dtype == torch.float16
 
 
 def test_sm70_sparse_bmm_prefill_buffers_share_the_kv_workspace_request():
@@ -486,6 +488,7 @@ def test_sm70_sparse_bmm_prefill_buffers_share_the_kv_workspace_request():
 
     layer = MagicMock()
     layer.max_num_batched_tokens = 2048
+    layer.sparse_tensor_cores = False
     q = torch.empty((1, 64, 512), dtype=torch.float16)
     impl = sparse.DeepseekV4SM70SparseImpl
 
@@ -497,6 +500,11 @@ def test_sm70_sparse_bmm_prefill_buffers_share_the_kv_workspace_request():
     assert [shape for shape, _ in specs] == [
         (128, 640, 512),
         (128, 64, 640),
-        (128, 64, 641),
-        (128, 64, 641),
+        (128, 64, 640),
     ]
+    # The tensor-core matmuls read the selected rows through the indices, so
+    # no gathered keys.
+    layer.sparse_tensor_cores = True
+    with patch.object(sparse, "_bmm_blocker", return_value=None):
+        specs = impl._prefill_bmm_workspace_specs(layer, q, 640)
+    assert [shape for shape, _ in specs] == [(128, 64, 640), (128, 64, 640)]
