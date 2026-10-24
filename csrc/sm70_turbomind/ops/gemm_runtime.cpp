@@ -152,6 +152,8 @@ struct TurboMindRuntime : vllm::sm70::RuntimeResource {
   // measured batch size.
   std::unordered_set<MoeTuneKey, MoeTuneKeyHash> prefill_tuned_families;
   std::set<std::pair<int, uint64_t>> imported_cache_devices;
+  // Devices whose warmup plan is final: shapes it lacks are never measured.
+  std::set<std::pair<int, uint64_t>> frozen_tuning_devices;
   std::unordered_map<Sm70F16WeightCacheKey, Sm70F16WeightCacheEntry,
                      Sm70F16WeightCacheKeyHash>
       sm70_f16_weight_cache;
@@ -436,6 +438,13 @@ bool has_imported_cache(int device) {
          runtime().imported_cache_devices.end();
 }
 
+bool is_tuning_frozen(int device) {
+  std::lock_guard<std::mutex> lock(runtime().tune_mutex);
+  return runtime().frozen_tuning_devices.find(
+             {device, vllm::sm70::active_policy_key}) !=
+         runtime().frozen_tuning_devices.end();
+}
+
 turbomind::gemm::DispatchPolicy select_dense_dispatch_policy_impl(
     int device, int m, int n, int k, int group_size, cudaStream_t stream,
     TuneKeyKind kind, bool tune_enabled, bool reuse_imported_cache, int max_m) {
@@ -447,6 +456,13 @@ turbomind::gemm::DispatchPolicy select_dense_dispatch_policy_impl(
   }
   if (!tune_enabled) {
     return turbomind::gemm::DispatchPolicy::kDefault;
+  }
+  // After the warmup the plan is final: a shape it lacks takes the plan of the
+  // next larger measured one instead of a measurement on the request that
+  // brings it (the last prefill chunk has any size, so any size would be
+  // measured once).
+  if (is_tuning_frozen(device)) {
+    return turbomind::gemm::DispatchPolicy::kReuse;
   }
 
   DenseTuneKey key{kind, device, m, n, k, group_size};
@@ -542,16 +558,14 @@ turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
 turbomind::gemm::DispatchPolicy select_moe_dispatch_policy_impl(
     int device, int total_tokens, int n, int k, int num_experts, int group_size,
     cudaStream_t stream, TuneKeyKind kind, bool tune_enabled,
-    int max_tune_tokens, bool reuse_imported_cache) {
+    int max_tune_tokens) {
   const int tune_limit =
       max_tune_tokens >= 0 ? max_tune_tokens : moe_tune_max_tokens();
   if (!tune_enabled || total_tokens > tune_limit) {
     return turbomind::gemm::DispatchPolicy::kDefault;
   }
-  // As for dense shapes: an imported (or frozen) plan is authoritative, so a
-  // shape it lacks takes the nearest measured one instead of a measurement
-  // on the request that brings it.
-  if (reuse_imported_cache && has_imported_cache(device)) {
+  // Frozen after the warmup, as for dense shapes.
+  if (is_tuning_frozen(device)) {
     return turbomind::gemm::DispatchPolicy::kReuse;
   }
 
@@ -613,8 +627,7 @@ turbomind::gemm::DispatchPolicy select_fp8_moe_dispatch_policy(
   }
   return select_moe_dispatch_policy_impl(
       device, total_tokens, n, k, num_experts, group_size, stream,
-      TuneKeyKind::kFp8Moe, fp8_tune_small_shapes_enabled(), -1,
-      fp8_reuse_imported_cache_enabled());
+      TuneKeyKind::kFp8Moe, fp8_tune_small_shapes_enabled());
 }
 
 turbomind::gemm::DispatchPolicy select_mxfp4_moe_dispatch_policy(
@@ -899,4 +912,23 @@ int64_t sm70_gemm_export_cache(torch::Tensor device_hint,
 
   auto& gemm = vllm::awq_sm70::get_gemm(device);
   return gemm.Export(ofs);
+}
+
+int64_t sm70_gemm_freeze_tuning(torch::Tensor device_hint) {
+  TORCH_CHECK(device_hint.is_cuda(),
+              "sm70_gemm_freeze_tuning: device_hint must be CUDA.");
+  const int device = device_hint.get_device();
+  const uint64_t policy = vllm::sm70::active_policy_key;
+
+  auto& state = vllm::awq_sm70::runtime();
+  std::lock_guard<std::mutex> lock(state.tune_mutex);
+  state.frozen_tuning_devices.insert({device, policy});
+  int64_t measured = 0;
+  for (const auto& key : state.dense_tuned_shapes) {
+    measured += key.device == device && key.policy == policy;
+  }
+  for (const auto& key : state.moe_tuned_shapes) {
+    measured += key.device == device && key.policy == policy;
+  }
+  return measured;
 }

@@ -738,24 +738,42 @@ def test_fp8_dynamic_tuning_skips_stale_lut_by_default(monkeypatch):
     )
 
 
-def test_freeze_imports_the_measured_plan_back(monkeypatch):
+def test_freeze_makes_the_measured_plan_final(monkeypatch):
     device = torch.device("cpu")
-    imported = []
-    monkeypatch.setattr(warmup, "_export_lut_bytes", lambda dev: (b"plan", 7))
+    frozen = []
     monkeypatch.setattr(
-        warmup,
-        "_import_lut_bytes",
-        lambda dev, payload: imported.append((dev, payload)) or 7,
+        warmup.sm70_native_cache,
+        "freeze_tuning",
+        lambda hint: frozen.append(hint) or 7,
     )
     assert warmup._freeze_tuning_plan(device) == 7
-    assert imported == [(device, b"plan")]
+    assert len(frozen) == 1
+    assert frozen[0].device == device and frozen[0].numel() == 0
 
 
-def test_freeze_without_export_support_imports_nothing(monkeypatch):
-    monkeypatch.setattr(warmup, "_export_lut_bytes", lambda dev: (None, 0))
+def test_warmup_runs_inside_the_workers_config_context(monkeypatch):
+    # Outside the context the warmup captures default native policies, a
+    # partition the layers never dispatch in.
+    events = []
+    worker = SimpleNamespace(vllm_config=object())
+
+    class Context:
+        def __init__(self, config):
+            events.append(("enter", config))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            events.append(("exit", None))
+
+    monkeypatch.setattr(warmup, "set_current_vllm_config", Context)
     monkeypatch.setattr(
-        warmup,
-        "_import_lut_bytes",
-        lambda dev, payload: pytest.fail("nothing to import"),
+        warmup, "_sm70_awq_warmup", lambda w: events.append(("warmup", w))
     )
-    assert warmup._freeze_tuning_plan(torch.device("cpu")) == 0
+    warmup.sm70_awq_warmup(worker)
+    assert events == [
+        ("enter", worker.vllm_config),
+        ("warmup", worker),
+        ("exit", None),
+    ]

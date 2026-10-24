@@ -13,6 +13,7 @@ import torch
 
 from vllm import _sm70_ops as sm70_ops
 from vllm._sm70.policy import NativeBindings
+from vllm.config import set_current_vllm_config
 from vllm.config.sm70_moe import (
     capture_mxfp4_moe_config,
     capture_nvfp4_moe_config,
@@ -191,10 +192,11 @@ def _import_lut_bytes(device: torch.device, payload: bytes) -> int:
 
 
 def _freeze_tuning_plan(device: torch.device) -> int:
-    """Import this device's measured plan back as its authoritative cache, so
-    later calls reuse it instead of measuring; returns the record count."""
-    payload, _ = _export_lut_bytes(device)
-    return 0 if payload is None else _import_lut_bytes(device, payload)
+    """Make the plan measured during warmup final on this device: a shape it
+    lacks takes the plan of the next larger measured one instead of a
+    measurement on the request that brings it; returns the measured shapes."""
+    device_hint = torch.empty(0, dtype=torch.uint8, device=device)
+    return sm70_native_cache.freeze_tuning(device_hint)
 
 
 def _run_coordinated_dense_warmup(
@@ -1240,6 +1242,14 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
 
 
 def sm70_awq_warmup(worker: Worker) -> None:
+    # The warmup captures its native policies from the current vLLM config;
+    # outside this context they are the defaults, a policy partition the layers
+    # never dispatch in, so nothing measured here would reach the service.
+    with set_current_vllm_config(worker.vllm_config):
+        _sm70_awq_warmup(worker)
+
+
+def _sm70_awq_warmup(worker: Worker) -> None:
     if not worker.vllm_config.kernel_config.sm70_runtime.value("awq_warmup"):
         return
     if not hasattr(torch.ops._C, "awq_gemm_sm70_out"):
@@ -1351,8 +1361,8 @@ def sm70_awq_warmup(worker: Worker) -> None:
         "freeze_tuning_after_warmup"
     ):
         logger.info(
-            "SM70 TurboMind tuning frozen after warmup: %d measured records "
-            "reused for the service lifetime on device %s.",
+            "SM70 TurboMind tuning frozen after warmup: %d measured shapes "
+            "final for the service lifetime on device %s.",
             _freeze_tuning_plan(device),
             device,
         )

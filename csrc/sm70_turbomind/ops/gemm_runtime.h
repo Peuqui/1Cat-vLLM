@@ -83,7 +83,7 @@ turbomind::gemm::DispatchPolicy select_nvfp4_dense_dispatch_policy(
 turbomind::gemm::DispatchPolicy select_moe_dispatch_policy_impl(
     int device, int total_tokens, int n, int k, int num_experts, int group_size,
     cudaStream_t stream, TuneKeyKind kind, bool tune_enabled,
-    int max_tune_tokens = -1, bool reuse_imported_cache = false);
+    int max_tune_tokens = -1);
 
 turbomind::gemm::DispatchPolicy select_prefill_moe_dispatch_policy(
     int device, int total_tokens, int n, int k, int num_experts, int group_size,
