@@ -63,6 +63,13 @@ class Sm70RuntimeConfig:
     """Share the existing authoritative tensor-parallel tuning plan."""
     gemm_lut_path: str | None = None
     """Optional tuning-cache template; device/rank expansion remains worker-local."""
+    freeze_tuning_after_warmup: bool = False
+    """Make the plan TurboMind measured during warmup authoritative for the
+    service lifetime on this device (export and import it): later calls reuse
+    the measured plan of the nearest shape instead of measuring a new shape on
+    the first request that brings it (which made the first long DeepSeek-V4
+    prefills after a boot up to 2.2 s slower and the kernel choice depend on
+    the request order)."""
     errors: dict[str, str] = Field(default_factory=dict, init=False)
     """Deferred errors for options skipped by the original warmup gates."""
 

@@ -840,9 +840,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "paged_prefill_attention_sm75(Tensor(a!) out, Tensor q, Tensor k_cache, "
       "Tensor v_cache, Tensor cu_seqlens_q, Tensor seqused_k, "
-      "Tensor block_table, int max_seqlen_q, float softmax_scale) -> ()");
+      "Tensor block_table, int max_seqlen_q, float softmax_scale, "
+      "int num_kv_splits) -> ()");
   ops.impl("paged_prefill_attention_sm75", torch::kCUDA,
            &paged_prefill_attention_sm75);
+
+  // Lightning-indexer prefill scores (scores, relu, head weights, head sum and
+  // key scales in one pass) on Turing's m16n8k8 tensor cores.
+  ops.def(
+      "indexer_prefill_scores_sm75(Tensor(a!) out, Tensor q, Tensor weights, "
+      "Tensor keys, Tensor key_scales) -> ()");
+  ops.impl("indexer_prefill_scores_sm75", torch::kCUDA,
+           &indexer_prefill_scores_sm75);
 
   ops.def(
       "nvfp4_qpn2_gated_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
@@ -1094,6 +1103,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "native_policy=None ) -> int");
   ops.impl("sm70_gemm_export_cache", torch::kCUDA,
            vllm::sm70::with_policy(&sm70_gemm_export_cache));
+
+  ops.def(
+      "sm70_gemm_freeze_tuning(Tensor device_hint, str? "
+      "native_policy=None ) -> int");
+  ops.impl("sm70_gemm_freeze_tuning", torch::kCUDA,
+           vllm::sm70::with_policy(&sm70_gemm_freeze_tuning));
 
   ops.def(
       "awq_moe_build_strided_ptrs(Tensor tm_weights, Tensor tm_scales, "

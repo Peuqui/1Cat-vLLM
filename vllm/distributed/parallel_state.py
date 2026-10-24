@@ -758,6 +758,16 @@ class GroupCoordinator:
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
+        # Imported here: ubatching -> forward_context -> dp_utils -> this module.
+        from vllm.v1.worker.ubatching import (
+            dbo_overlaps_collectives,
+            dbo_run_collective_overlapped,
+        )
+
+        if dbo_overlaps_collectives():
+            return dbo_run_collective_overlapped(
+                self.device_communicator.all_reduce, input_
+            )
         return self.device_communicator.all_reduce(input_)
 
     def all_reduce_sum2(

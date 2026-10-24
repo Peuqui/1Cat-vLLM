@@ -35,6 +35,11 @@ from vllm.platforms import current_platform
 logger = init_logger(__name__)
 
 _SM70_FP8_PREFILL_DENSE_MIN_M = 3920
+# Grouped BMMs (DeepSeek-V4 wo_a) run as one TurboMind grouped GEMM up to this
+# many tokens per group, the decode and speculative verification sizes; one
+# launch per group reads each group's weights with a GEMM tile sized for
+# prefill (V100, 8 groups of 1024 x 4096 at 6 tokens: 195 µs vs 51 µs).
+SM70_FP8_GROUPED_DECODE_MAX_TOKENS = 16
 _SM70_FP8_EXACT_8K_PREFILL_M = 8000
 _SM70_FP8_EXACT_8K_PREFILL_SHAPES = {
     "in_proj_qkvz": (5120, 4096),
@@ -644,9 +649,6 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
             layer.sm70_fp8_q_ld = int(first_meta[1].item())
             if (
                 self.policy.legacy_grouped_bmm_decode
-                and group_count == 2
-                and rows_per_group == 1024
-                and int(layer.weight.shape[1]) == 4096
                 and hasattr(
                     torch.ops._C,
                     "fp8_moe_gemm_sm70_per_expert_dispatch_out",
@@ -666,13 +668,19 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
                 layer.register_buffer(
                     "sm70_fp8_bmm_grouped_ptrs_s", ptrs_s, persistent=False
                 )
+                # Row m - 1: group offsets for m tokens per group.
+                tokens = torch.arange(
+                    1,
+                    SM70_FP8_GROUPED_DECODE_MAX_TOKENS + 1,
+                    dtype=torch.int32,
+                    device=layer.weight.device,
+                )
+                groups = torch.arange(
+                    group_count + 1, dtype=torch.int32, device=layer.weight.device
+                )
                 layer.register_buffer(
                     "sm70_fp8_bmm_grouped_offsets",
-                    torch.arange(
-                        group_count + 1,
-                        dtype=torch.int32,
-                        device=layer.weight.device,
-                    ),
+                    tokens[:, None] * groups[None, :],
                     persistent=False,
                 )
                 layer.sm70_fp8_bmm_grouped_decode = True
@@ -1007,14 +1015,15 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
                 device=x.device,
                 dtype=x.dtype,
             )
+            tokens = x_grouped.shape[0]
             if (
                 getattr(layer, "sm70_fp8_bmm_grouped_decode", False)
-                and x_grouped.shape[0] == 1
+                and 0 < tokens <= SM70_FP8_GROUPED_DECODE_MAX_TOKENS
             ):
                 self.native_ops.fp8_moe_gemm_sm70_per_expert_dispatch_out(
-                    out_by_group.reshape(group_count, output_size),
-                    x_by_group.reshape(group_count, x.shape[-1]),
-                    layer.sm70_fp8_bmm_grouped_offsets,
+                    out_by_group.reshape(group_count * tokens, output_size),
+                    x_by_group.reshape(group_count * tokens, x.shape[-1]),
+                    layer.sm70_fp8_bmm_grouped_offsets[tokens - 1],
                     layer.sm70_fp8_bmm_grouped_ptrs_w,
                     layer.sm70_fp8_bmm_grouped_ptrs_s,
                     group_count,

@@ -347,7 +347,11 @@ def dequantize_and_gather_k_cache_triton(
     TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
 
     num_reqs = seq_lens.shape[0]
-    NUM_WORKERS = 128
+    # A prefill chunk gathers its request's whole compressed cache (37.5k rows
+    # at 150k context and ratio 4) and every worker walks its rows one by one:
+    # 128 workers left most SMs idle. 2048 two-warp workers reach the memory
+    # rate on V100 and RTX 8000 (18.75k rows: 532 -> 107 us and 616 -> 87 us).
+    NUM_WORKERS = 2048
     _dequantize_and_gather_k_kernel[(num_reqs, NUM_WORKERS)](
         out,
         out.stride(0),
@@ -369,6 +373,7 @@ def dequantize_and_gather_k_cache_triton(
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
         use_software_fp8=needs_software_fp8(),
+        num_warps=2,
     )
 
 

@@ -324,7 +324,12 @@ void paged_prefill_attention_sm75(torch::Tensor out, torch::Tensor q,
                                   torch::Tensor cu_seqlens_q,
                                   torch::Tensor seqused_k,
                                   torch::Tensor block_table,
-                                  int64_t max_seqlen_q, double softmax_scale);
+                                  int64_t max_seqlen_q, double softmax_scale,
+                                  int64_t num_kv_splits);
+
+void indexer_prefill_scores_sm75(torch::Tensor out, torch::Tensor q,
+                                 torch::Tensor weights, torch::Tensor keys,
+                                 torch::Tensor key_scales);
 
 void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
                          torch::Tensor qscales, torch::Tensor gscales,
@@ -523,6 +528,8 @@ int64_t sm70_gemm_import_cache(torch::Tensor device_hint,
 
 int64_t sm70_gemm_export_cache(torch::Tensor device_hint,
                                const std::string& path);
+
+int64_t sm70_gemm_freeze_tuning(torch::Tensor device_hint);
 
 std::vector<torch::Tensor> awq_moe_build_strided_ptrs(torch::Tensor tm_weights,
                                                       torch::Tensor tm_scales,

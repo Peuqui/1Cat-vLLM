@@ -18,7 +18,12 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-_OPS = ("host_reduce_open", "host_reduce_close", "host_reduce_out")
+_OPS = (
+    "host_reduce_open",
+    "host_reduce_close",
+    "host_reduce_out",
+    "host_reduce_copy_engine_out",
+)
 
 
 def _channel_mapping_report(path: str) -> str:
@@ -119,7 +124,10 @@ class HostReduceCommunicator:
         if reason is None:
             self._open()
         self.status.update(
-            enabled=reason is None, reason=reason, max_bytes=self.policy.max_bytes
+            enabled=reason is None,
+            reason=reason,
+            max_bytes=self.policy.max_bytes,
+            copy_engine_max_bytes=self.policy.copy_engine_max_bytes,
         )
         if cfg:
             cfg.kernel_config.collective_kernel_selections[name] = self.status
@@ -134,7 +142,10 @@ class HostReduceCommunicator:
         with torch.accelerator.device_index(self.device.index):
             try:
                 self.handle = torch.ops._C.host_reduce_open(
-                    paths[0], self.rank, self.policy.max_bytes
+                    paths[0],
+                    self.rank,
+                    self.policy.max_bytes,
+                    self.policy.copy_engine_max_bytes,
                 )
             except RuntimeError:
                 logger.error(
@@ -156,7 +167,8 @@ class HostReduceCommunicator:
         if tensor.device != self.device or not tensor.is_contiguous():
             return "requires_contiguous_local_cuda_input"
         nbytes = tensor.numel() * tensor.element_size()
-        if not 0 < nbytes <= self.policy.max_bytes or nbytes % 16:
+        largest = max(self.policy.max_bytes, self.policy.copy_engine_max_bytes)
+        if not 0 < nbytes <= largest or nbytes % 16:
             return "payload_outside_channel"
         if tensor.data_ptr() % 16:
             return "requires_16_byte_alignment"
@@ -166,7 +178,10 @@ class HostReduceCommunicator:
         if self.rejection_reason(tensor) is not None:
             return None
         output = torch.empty_like(tensor)
-        torch.ops._C.host_reduce_out(output, tensor, self.handle)
+        if tensor.numel() * tensor.element_size() <= self.policy.max_bytes:
+            torch.ops._C.host_reduce_out(output, tensor, self.handle)
+        else:
+            torch.ops._C.host_reduce_copy_engine_out(output, tensor, self.handle)
         return output
 
     def close(self) -> None:
