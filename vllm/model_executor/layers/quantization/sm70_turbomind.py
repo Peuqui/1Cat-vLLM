@@ -662,6 +662,7 @@ class FP8QPN8LinearState:
         split_k: int,
         accumulator_chains: int,
         prefetch_codes: bool,
+        sm75_mma: bool = False,
     ) -> None:
         self.codes = codes
         self.group_scales = group_scales
@@ -669,6 +670,9 @@ class FP8QPN8LinearState:
         self.split_k = split_k
         self.accumulator_chains = accumulator_chains
         self.prefetch_codes = prefetch_codes
+        # Turing's tensor-core GEMM serves M above 8 without rebuilding the
+        # FP16 weight; it takes row-group scales on N, K multiples of 128.
+        self.sm75_mma = sm75_mma
 
 
 def fp8_qpn8_launch_config(
@@ -823,6 +827,12 @@ def _prepare_fp8_qpn8_linear(
             split_k,
             accumulator_chains,
             prefetch_codes,
+            sm75_mma=(
+                scales.shape == (n, k // 32)
+                and n % 128 == 0
+                and k % 128 == 0
+                and torch.cuda.get_device_capability(weight.device) == (7, 5)
+            ),
         ),
     )
 
@@ -852,6 +862,7 @@ def apply_prepared_fp8_qpn8_linear(
         state.split_k,
         state.accumulator_chains,
         state.prefetch_codes,
+        state.sm75_mma,
     )
     if bias is not None:
         out.add_(bias)
