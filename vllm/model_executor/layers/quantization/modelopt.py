@@ -1944,6 +1944,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
         )
+        csf_experts: CsfScaleConsumer | None = None
         if self.csf_scales:
             experts = self.moe_kernel.fused_experts
             assert isinstance(experts, CsfScaleConsumer)  # checked in __init__
@@ -1951,10 +1952,11 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 layer.csf_w13_scales.finish(), layer.csf_w2_scales.finish()
             )
             del layer.csf_w13_scales, layer.csf_w2_scales
+            csf_experts = experts
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
-        if self.csf_scales:
+        if csf_experts is not None:
             # Projections served from packed planes no longer hold the shared raster.
-            w13_done, w2_done = experts.scale_rasters_released()
+            w13_done, w2_done = csf_experts.scale_rasters_released()
             if w13_done:
                 layer.csf_w13_raster = layer.csf_w13_raster.new_empty(0)
             if w2_done:
@@ -2820,14 +2822,15 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 return ModelOptNvFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4W4A16LinearMethod(self.w4a16_nvfp4_config)
-            if quant_algo == "MXFP8" and isinstance(layer, LinearBase):
-                # Built whenever quantized_layers names an MXFP8 layer.
+            if quant_algo == "MXFP8":
+                # Built whenever quantized_layers names an MXFP8 layer. An
+                # MXFP8 LM head is served like any MXFP8 linear: the model
+                # loader keeps its weight pair packed (see
+                # dequantize_mxfp8_weight_pairs).
                 assert self.mxfp8_config is not None
                 return ModelOptMxFp8LinearMethod(self.mxfp8_config)
-            # Layers not in quantized_layers stay unquantized, and so does an
-            # MXFP8 LM head: the model loader dequantizes both (see
-            # dequantize_mxfp8_weight_pairs). An LM head keeps its own
-            # UnquantizedEmbeddingMethod.
+            # Layers not in quantized_layers stay unquantized; an LM head
+            # keeps its own UnquantizedEmbeddingMethod.
             return UnquantizedLinearMethod() if isinstance(layer, LinearBase) else None
 
         if isinstance(layer, RoutedExperts):
