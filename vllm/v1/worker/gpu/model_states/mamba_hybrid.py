@@ -125,7 +125,7 @@ class MambaHybridModelState(DefaultModelState):
             and speculative_config is not None
             and speculative_config.method == "mtp"
             and device.type == "cuda"
-            and current_platform.is_device_capability(70)
+            and current_platform.is_device_capability_family(70)
         )
         if self._use_mtp4_common_gdn_metadata:
             logger.info_once("SM70 MTP shared GDN batch metadata fast path enabled.")
