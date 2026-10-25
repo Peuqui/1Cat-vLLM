@@ -1952,6 +1952,13 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             )
             del layer.csf_w13_scales, layer.csf_w2_scales
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+        if self.csf_scales:
+            # Projections served from packed planes no longer hold the shared raster.
+            w13_done, w2_done = experts.scale_rasters_released()
+            if w13_done:
+                layer.csf_w13_raster = layer.csf_w13_raster.new_empty(0)
+            if w2_done:
+                layer.csf_w2_raster = layer.csf_w2_raster.new_empty(0)
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
         w13_scale, w2_scale = self._block_scales(layer)
