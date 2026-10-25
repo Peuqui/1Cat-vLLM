@@ -485,6 +485,73 @@ def test_moe_qpn_mxfp4_mode_matches_the_checkpoint_scales(device, order, cols, t
         )
 
 
+@pytest.mark.parametrize(
+    "counts", [[300, 1, 33], [520, 0, 70, 9], [32, 32, 32], [257, 3]], ids=str
+)
+def test_moe_qpn_prefill_schedule_covers_every_row_of_every_group(
+    device, order, counts
+):
+    # Prefill shapes (more than 8 rows per expert on average) run the tile
+    # scheduler: groups of many 32-row chunks, a last chunk that is not full,
+    # bands that are not full and experts without rows must all land in place.
+    generator = torch.Generator().manual_seed(2)
+    experts, rows, cols = len(counts), 128, 256
+    tokens = sum(counts)
+    codes = torch.randint(0, 256, (experts, rows, cols // 2), generator=generator).to(
+        torch.uint8
+    )
+    scales = (
+        torch.randint(0, 8, (experts, rows, cols // 32), generator=generator) + 112
+    ).to(torch.uint8)
+    hidden = torch.randn(tokens, cols, generator=generator).to(torch.float16)
+
+    reference = torch.empty(tokens, rows)
+    start = 0
+    for e, count in enumerate(counts):
+        values = break_fp4_bytes(codes[e], torch.float32)
+        weight = values * _pow2(scales[e]).repeat_interleave(32, dim=1).float()
+        reference[start : start + count] = hidden[start : start + count].float() @ (
+            weight.T
+        )
+        start += count
+
+    rebased = scales.clone()
+    global_scale = rebase_e8m0_for_fp16(rebased)
+    w = codes.to(device)
+    s = rebased.to(device)
+    for e in range(experts):
+        qc, qs = qpn_prepack(w[e], s[e], 32, order)
+        w[e].view(-1).copy_(qc)
+        s[e].view(-1).copy_(qs)
+
+    # Compact routing: only experts with rows get a group, the rest is padding.
+    gids = torch.zeros(tokens, dtype=torch.int32)
+    goff = torch.full((tokens + 1,), tokens, dtype=torch.int32)
+    group, start = 0, 0
+    for e, count in enumerate(counts):
+        if count:
+            gids[group], goff[group] = e, start
+            group, start = group + 1, start + count
+    out = torch.empty((tokens, rows), dtype=torch.float16, device=device)
+    torch.ops._C.skinny_moe_qpn_sm70(
+        hidden.to(device),
+        w,
+        s,
+        global_scale.to(device),
+        torch.arange(tokens, dtype=torch.int32, device=device),
+        gids.to(device),
+        goff.to(device),
+        1,
+        out,
+        False,
+        tokens,
+        grouped_splitk(cols, order),
+        1,
+        order,
+    )
+    torch.testing.assert_close(out.float().cpu(), reference, rtol=2e-2, atol=2e-2)
+
+
 def _nvfp4_moe(generator, num_experts, hidden_size, intermediate):
     w13, s13, w2, s2 = [], [], [], []
     for _ in range(num_experts):
