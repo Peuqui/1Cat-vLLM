@@ -32,6 +32,7 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     break_fp4_bytes,
 )
+from vllm.model_executor.layers.quantization.utils.s5_scales import encode_s5
 from vllm.platforms import current_platform
 
 
@@ -552,6 +553,68 @@ def test_moe_qpn_prefill_schedule_covers_every_row_of_every_group(
     torch.testing.assert_close(out.float().cpu(), reference, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.parametrize(
+    "counts", [[1, 2, 1, 0], [5, 0, 0, 3], [300, 1, 33, 9], [32, 32, 32, 32]], ids=str
+)
+def test_moe_qpn_five_bit_scales_give_the_raster_result(device, order, counts):
+    # Decode shapes read the five-bit planes in place (m16n8k8), every other launch
+    # first writes the raster from them: both must equal the run on the raster the
+    # planes were encoded from, bit for bit.
+    generator = torch.Generator().manual_seed(3)
+    experts, rows, cols = len(counts), 128, 256
+    tokens = sum(counts)
+    codes, scales = [], []
+    for _ in range(experts):
+        c, sc = _nvfp4_expert(generator, rows, cols)
+        codes.append(c)
+        scales.append(sc)
+    w = torch.stack(codes).to(device)
+    raster = torch.empty(
+        experts, rows // 32 * (cols // 16) * 32, dtype=torch.uint8, device=device
+    )
+    for e in range(experts):
+        qc, qs = qpn_prepack(w[e], scales[e].to(device), 16, order)
+        w[e].view(-1).copy_(qc)
+        raster[e].copy_(qs.reshape(-1))
+    planes = encode_s5(raster, cols // 16)
+    gscales = (torch.rand(experts, generator=generator) * 0.2 + 0.05).to(device)
+    hidden = torch.randn(tokens, cols, generator=generator).to(torch.float16)
+
+    gids = torch.zeros(tokens, dtype=torch.int32)
+    goff = torch.full((tokens + 1,), tokens, dtype=torch.int32)
+    group, start = 0, 0
+    for e, count in enumerate(counts):
+        if count:
+            gids[group], goff[group] = e, start
+            group, start = group + 1, start + count
+
+    def run(scale_raster, five_bit):
+        out = torch.empty((tokens, rows), dtype=torch.float16, device=device)
+        extra = (planes.base, planes.nib, planes.hi) if five_bit else ()
+        torch.ops._C.skinny_moe_qpn_sm70(
+            hidden.to(device),
+            w,
+            scale_raster,
+            gscales,
+            torch.arange(tokens, dtype=torch.int32, device=device),
+            gids.to(device),
+            goff.to(device),
+            1,
+            out,
+            False,
+            tokens,
+            grouped_splitk(cols, order),
+            0,
+            order,
+            *extra,
+        )
+        return out
+
+    expected = run(raster, False)
+    scratch = torch.zeros_like(raster)  # the op writes the routed experts' rows
+    assert torch.equal(run(scratch, True), expected)
+
+
 def _nvfp4_moe(generator, num_experts, hidden_size, intermediate):
     w13, s13, w2, s2 = [], [], [], []
     for _ in range(num_experts):
@@ -588,6 +651,7 @@ def _skinny_experts(device, order, w13, s13, w2, s2, g1, g2):
     experts._w1_block_scales = s13
     experts._w2_block_scales = s2
     experts._csf_planes = None
+    experts._s5 = None
     experts._scale_caches = _ScaleCaches(
         g1=g1.tolist(),
         g2=g2.tolist(),
