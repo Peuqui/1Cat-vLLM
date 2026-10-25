@@ -489,12 +489,10 @@ def test_moe_qpn_mxfp4_mode_matches_the_checkpoint_scales(device, order, cols, t
 @pytest.mark.parametrize(
     "counts", [[300, 1, 33], [520, 0, 70, 9], [32, 32, 32], [257, 3]], ids=str
 )
-def test_moe_qpn_prefill_schedule_covers_every_row_of_every_group(
-    device, order, counts
-):
-    # Prefill shapes (more than 8 rows per expert on average) run the tile
-    # scheduler: groups of many 32-row chunks, a last chunk that is not full,
-    # bands that are not full and experts without rows must all land in place.
+def test_moe_qpn_multi_pass_groups_cover_every_row(device, order, counts):
+    # Prefill shapes (more than 8 rows per expert on average) take several passes
+    # per expert: groups of many 32-row passes, a last pass that is not full and
+    # experts without rows must all land in place.
     generator = torch.Generator().manual_seed(2)
     experts, rows, cols = len(counts), 128, 256
     tokens = sum(counts)
