@@ -14,6 +14,8 @@
 
 #include <torch/all.h>
 
+#include <cstdlib>
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -437,28 +439,22 @@ __global__ void __launch_bounds__(32 * SPLITK)
 // bit; only the tensor core's summation order differs.
 // ---------------------------------------------------------------------------
 
+// 36-float rows put the C fragment stores of a warp into 32 distinct banks.
+constexpr int kCsRow = 36;
+
+// One pass of the m16n8k8 grouped kernel: up to RB x 8 rows (slots first_slot..)
+// of one expert against the NT x 32 columns from tile0, over all of K. The pass
+// loop kernel (decode, and prefill without the tile scheduler) and the scheduled
+// kernel both run it, so the arithmetic is one piece of code.
 template <int SPLITK, int SCALE_MODE, int RB, int NT>
-__global__ void __launch_bounds__(32 * SPLITK) skinny_nvfp4_moe_m16n8k8(
+__device__ __forceinline__ void moe_m16n8k8_pass(
     const uint8_t* __restrict__ qcodes, const uint8_t* __restrict__ qscales,
     const float* __restrict__ gscales, const half* __restrict__ x,
-    half* __restrict__ y_slots, const int* __restrict__ perm,
-    const int* __restrict__ gids, const int* __restrict__ goff, int N, int K,
-    int topk, int x_slot_major) {
+    half* __restrict__ y_slots, const int* __restrict__ perm, int e, int tile0,
+    int first_slot, int rows, int N, int K, int topk, int x_slot_major,
+    const half** xrows, int* slots, float (*cs)[NT][8 * kCsRow]) {
   constexpr int ROWS = RB * 8;
-  // 36-float rows put the C fragment stores of a warp into 32 distinct banks.
-  constexpr int CS_ROW = 36;
-  __shared__ const half* xrows[ROWS];
-  __shared__ int slots[ROWS];
-  __shared__ float cs[SPLITK][NT][8 * CS_ROW];
-
-  const int grp = blockIdx.y;
-  const int beg = goff[grp];
-  const int cnt = goff[grp + 1] - beg;
-  if (cnt <= 0) return;  // block-uniform: padding group, no weight read
-  const int e = gids[grp];
-
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int tile0 = blockIdx.x * NT;
   const int row_group = lane >> 2;
   const int k_offset = (lane & 3) * 4;
   const int G = K >> 4, Gq = G / SPLITK;
@@ -471,119 +467,223 @@ __global__ void __launch_bounds__(32 * SPLITK) skinny_nvfp4_moe_m16n8k8(
   const uint32_t* sb = reinterpret_cast<const uint32_t*>(qscales) +
                        tile_index * SG * 8 + row_group;
   const half2 gm2 = __float2half2_rn(gscales[e] * 16384.f);
+  const int blocks = (rows + 7) / 8;
 
-  for (int base = 0; base < cnt; base += ROWS) {
-    const int rows = min(ROWS, cnt - base);
-    const int blocks = (rows + 7) / 8;
-    __syncthreads();  // previous pass done with slots/xrows/cs
-    if (threadIdx.x < ROWS) {
-      const int m = threadIdx.x;
-      const int slot = m < rows ? perm[beg + base + m] : 0;
-      slots[m] = slot;
-      xrows[m] = m < rows ? x + (size_t)(x_slot_major ? slot : slot / topk) * K
-                          : nullptr;
+  __syncthreads();  // previous pass done with slots/xrows/cs
+  if (threadIdx.x < ROWS) {
+    const int m = threadIdx.x;
+    const int slot = m < rows ? perm[first_slot + m] : 0;
+    slots[m] = slot;
+    xrows[m] =
+        m < rows ? x + (size_t)(x_slot_major ? slot : slot / topk) * K : nullptr;
+  }
+  __syncthreads();
+  const half* xr[RB];
+#pragma unroll
+  for (int bl = 0; bl < RB; bl++) xr[bl] = xrows[bl * 8 + row_group];
+
+  float c[NT][RB][2][4];
+#pragma unroll
+  for (int nt = 0; nt < NT; nt++)
+#pragma unroll
+    for (int bl = 0; bl < RB; bl++)
+#pragma unroll
+      for (int t = 0; t < 2; t++)
+#pragma unroll
+        for (int i = 0; i < 4; i++) c[nt][bl][t][i] = 0.f;
+
+  uint2 q_next[NT], a_next[RB];
+  uint32_t s_next[NT];
+  auto load_group = [&](int g) {
+#pragma unroll
+    for (int nt = 0; nt < NT; nt++) {
+      q_next[nt] = __ldcs(cb + ((size_t)nt * G + g) * 32);
+      s_next[nt] =
+          __ldg(sb + ((size_t)nt * SG +
+                      (SCALE_MODE == SCALE_MXFP4_E8M0_32 ? g >> 1 : g)) *
+                         8);
     }
-    __syncthreads();
-    const half* xr[RB];
 #pragma unroll
-    for (int bl = 0; bl < RB; bl++) xr[bl] = xrows[bl * 8 + row_group];
-
-    float c[NT][RB][2][4];
+    for (int bl = 0; bl < RB; bl++)
+      a_next[bl] =
+          xr[bl] ? *reinterpret_cast<const uint2*>(xr[bl] + g * 16 + k_offset)
+                 : make_uint2(0, 0);
+  };
+  load_group(g0);
+  for (int g = g0; g < gend; g++) {
+    uint2 q[NT], a[RB];
+    uint32_t s[NT];
 #pragma unroll
-    for (int nt = 0; nt < NT; nt++)
+    for (int nt = 0; nt < NT; nt++) {
+      q[nt] = q_next[nt];
+      s[nt] = s_next[nt];
+    }
 #pragma unroll
-      for (int bl = 0; bl < RB; bl++)
-#pragma unroll
-        for (int t = 0; t < 2; t++)
-#pragma unroll
-          for (int i = 0; i < 4; i++) c[nt][bl][t][i] = 0.f;
-
-    uint2 q_next[NT], a_next[RB];
-    uint32_t s_next[NT];
-    auto load_group = [&](int g) {
-#pragma unroll
-      for (int nt = 0; nt < NT; nt++) {
-        q_next[nt] = __ldcs(cb + ((size_t)nt * G + g) * 32);
-        s_next[nt] =
-            __ldg(sb + ((size_t)nt * SG +
-                        (SCALE_MODE == SCALE_MXFP4_E8M0_32 ? g >> 1 : g)) *
-                           8);
-      }
-#pragma unroll
-      for (int bl = 0; bl < RB; bl++)
-        a_next[bl] =
-            xr[bl] ? *reinterpret_cast<const uint2*>(xr[bl] + g * 16 + k_offset)
-                   : make_uint2(0, 0);
-    };
-    load_group(g0);
-    for (int g = g0; g < gend; g++) {
-      uint2 q[NT], a[RB];
-      uint32_t s[NT];
-#pragma unroll
-      for (int nt = 0; nt < NT; nt++) {
-        q[nt] = q_next[nt];
-        s[nt] = s_next[nt];
-      }
-#pragma unroll
-      for (int bl = 0; bl < RB; bl++) a[bl] = a_next[bl];
-      if (g + 1 < gend) load_group(g + 1);
+    for (int bl = 0; bl < RB; bl++) a[bl] = a_next[bl];
+    if (g + 1 < gend) load_group(g + 1);
 
 #pragma unroll
-      for (int nt = 0; nt < NT; nt++) {
-        // Word t holds A tile t: columns 16t + row_group (scale byte 2t) and
-        // 16t + row_group + 8 (scale byte 2t + 1), interleaved per MMA step.
+    for (int nt = 0; nt < NT; nt++) {
+      // Word t holds A tile t: columns 16t + row_group (scale byte 2t) and
+      // 16t + row_group + 8 (scale byte 2t + 1), interleaved per MMA step.
 #pragma unroll
-        for (int t = 0; t < 2; t++) {
-          const half2 s_lo = __hmul2(
-              decode_scale<SCALE_MODE>((uint8_t)(s[nt] >> (16 * t))), gm2);
-          const half2 s_hi = __hmul2(
-              decode_scale<SCALE_MODE>((uint8_t)(s[nt] >> (16 * t + 8))), gm2);
-          half2 v[4];
-          fp4x8_to_half2x4(t ? q[nt].y : q[nt].x, v);
-          v[0] = __hmul2(v[0], s_lo);
-          v[1] = __hmul2(v[1], s_hi);
-          v[2] = __hmul2(v[2], s_lo);
-          v[3] = __hmul2(v[3], s_hi);
-          const uint32_t* w = reinterpret_cast<const uint32_t*>(v);
+      for (int t = 0; t < 2; t++) {
+        const half2 s_lo = __hmul2(
+            decode_scale<SCALE_MODE>((uint8_t)(s[nt] >> (16 * t))), gm2);
+        const half2 s_hi = __hmul2(
+            decode_scale<SCALE_MODE>((uint8_t)(s[nt] >> (16 * t + 8))), gm2);
+        half2 v[4];
+        fp4x8_to_half2x4(t ? q[nt].y : q[nt].x, v);
+        v[0] = __hmul2(v[0], s_lo);
+        v[1] = __hmul2(v[1], s_hi);
+        v[2] = __hmul2(v[2], s_lo);
+        v[3] = __hmul2(v[3], s_hi);
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(v);
 #pragma unroll
-          for (int bl = 0; bl < RB; bl++) {
-            if (bl > 0 && bl >= blocks) break;  // block-uniform
-            mma_m16n8k8(c[nt][bl][t], w[0], w[1], a[bl].x);
-            mma_m16n8k8(c[nt][bl][t], w[2], w[3], a[bl].y);
-          }
+        for (int bl = 0; bl < RB; bl++) {
+          if (bl > 0 && bl >= blocks) break;  // block-uniform
+          mma_m16n8k8(c[nt][bl][t], w[0], w[1], a[bl].x);
+          mma_m16n8k8(c[nt][bl][t], w[2], w[3], a[bl].y);
         }
       }
     }
+  }
 
 #pragma unroll
-    for (int bl = 0; bl < RB; bl++) {
-      if (bl > 0 && bl >= blocks) break;  // block-uniform: barriers match
-      if (bl > 0) __syncthreads();        // previous block done reading cs
-      // C of A tile t: column 16t + row_group (+8 for i >= 2), row
-      // (lane & 3) * 2 + (i & 1) of this 8-row block.
+  for (int bl = 0; bl < RB; bl++) {
+    if (bl > 0 && bl >= blocks) break;  // block-uniform: barriers match
+    if (bl > 0) __syncthreads();        // previous block done reading cs
+    // C of A tile t: column 16t + row_group (+8 for i >= 2), row
+    // (lane & 3) * 2 + (i & 1) of this 8-row block.
 #pragma unroll
-      for (int nt = 0; nt < NT; nt++)
+    for (int nt = 0; nt < NT; nt++)
 #pragma unroll
-        for (int t = 0; t < 2; t++)
+      for (int t = 0; t < 2; t++)
 #pragma unroll
-          for (int i = 0; i < 4; i++) {
-            const int col = 16 * t + row_group + ((i & 2) ? 8 : 0);
-            const int row = (lane & 3) * 2 + (i & 1);
-            cs[warp][nt][row * CS_ROW + col] = c[nt][bl][t][i];
-          }
-      __syncthreads();
-      for (int idx = threadIdx.x; idx < NT * 256; idx += blockDim.x) {
-        const int nt = idx >> 8, row = (idx >> 5) & 7, col = idx & 31;
-        float v = 0.f;
+        for (int i = 0; i < 4; i++) {
+          const int col = 16 * t + row_group + ((i & 2) ? 8 : 0);
+          const int row = (lane & 3) * 2 + (i & 1);
+          cs[warp][nt][row * kCsRow + col] = c[nt][bl][t][i];
+        }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < NT * 256; idx += blockDim.x) {
+      const int nt = idx >> 8, row = (idx >> 5) & 7, col = idx & 31;
+      float v = 0.f;
 #pragma unroll
-        for (int split = 0; split < SPLITK; split++)
-          v += cs[split][nt][row * CS_ROW + col];
-        const int out_row = bl * 8 + row;
-        if (out_row < rows)
-          y_slots[(size_t)slots[out_row] * N + (size_t)(tile0 + nt) * 32 +
-                  col] = __float2half(v);
-      }
+      for (int split = 0; split < SPLITK; split++)
+        v += cs[split][nt][row * kCsRow + col];
+      const int out_row = bl * 8 + row;
+      if (out_row < rows)
+        y_slots[(size_t)slots[out_row] * N + (size_t)(tile0 + nt) * 32 + col] =
+            __float2half(v);
     }
+  }
+}
+
+// Grid (N / (32 NT), groups): a CTA owns one expert's column tiles and takes one
+// pass per RB x 8 rows, each re-reading the tile's weights.
+template <int SPLITK, int SCALE_MODE, int RB, int NT>
+__global__ void __launch_bounds__(32 * SPLITK) skinny_nvfp4_moe_m16n8k8(
+    const uint8_t* __restrict__ qcodes, const uint8_t* __restrict__ qscales,
+    const float* __restrict__ gscales, const half* __restrict__ x,
+    half* __restrict__ y_slots, const int* __restrict__ perm,
+    const int* __restrict__ gids, const int* __restrict__ goff, int N, int K,
+    int topk, int x_slot_major) {
+  constexpr int ROWS = RB * 8;
+  __shared__ const half* xrows[ROWS];
+  __shared__ int slots[ROWS];
+  __shared__ float cs[SPLITK][NT][8 * kCsRow];
+
+  const int grp = blockIdx.y;
+  const int beg = goff[grp];
+  const int cnt = goff[grp + 1] - beg;
+  if (cnt <= 0) return;  // block-uniform: padding group, no weight read
+  const int e = gids[grp];
+  for (int base = 0; base < cnt; base += ROWS)
+    moe_m16n8k8_pass<SPLITK, SCALE_MODE, RB, NT>(
+        qcodes, qscales, gscales, x, y_slots, perm, e, blockIdx.x * NT,
+        beg + base, min(ROWS, cnt - base), N, K, topk, x_slot_major, xrows,
+        slots, cs);
+}
+
+// Work items of the scheduled kernel: ceil(rows / ROWS) chunks of one group
+// times the column-tile CTAs; cum_items[g] is the first item of group g.
+// Padding groups have no rows and no items.
+__global__ void __launch_bounds__(256) moe_item_table(
+    const int* __restrict__ goff, int* __restrict__ cum_items, int num_groups,
+    int num_col_tiles, int rows_per_chunk) {
+  __shared__ int warp_sums[8];
+  __shared__ int carry;
+  if (threadIdx.x == 0) {
+    carry = 0;
+    cum_items[0] = 0;
+  }
+  __syncthreads();
+  for (int g0 = 0; g0 < num_groups; g0 += blockDim.x) {
+    const int g = g0 + threadIdx.x;
+    int items = 0;
+    if (g < num_groups) {
+      const int cnt = goff[g + 1] - goff[g];
+      items = (cnt + rows_per_chunk - 1) / rows_per_chunk * num_col_tiles;
+    }
+    int scan = items;  // inclusive scan: shuffles inside a warp, then the warps
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+      const int up = __shfl_up_sync(0xffffffffu, scan, d);
+      if (lane >= d) scan += up;
+    }
+    if (lane == 31) warp_sums[warp] = scan;
+    __syncthreads();
+    int before = 0;
+    for (int w = 0; w < warp; w++) before += warp_sums[w];
+    if (g < num_groups) cum_items[g + 1] = carry + before + scan;
+    __syncthreads();
+    if (threadIdx.x == blockDim.x - 1) carry += before + scan;
+    __syncthreads();
+  }
+}
+
+// Persistent kernel over the work items. Consecutive items are the chunks of one
+// column tile inside a band of band_height chunks, so the CTAs resident
+// together read each weight tile and each activation slice from DRAM once and
+// share them through L2; a CTA never loops over passes of the same tile.
+template <int SPLITK, int SCALE_MODE, int RB, int NT>
+__global__ void __launch_bounds__(32 * SPLITK)
+    skinny_nvfp4_moe_m16n8k8_scheduled(
+        const uint8_t* __restrict__ qcodes, const uint8_t* __restrict__ qscales,
+        const float* __restrict__ gscales, const half* __restrict__ x,
+        half* __restrict__ y_slots, const int* __restrict__ perm,
+        const int* __restrict__ gids, const int* __restrict__ goff,
+        const int* __restrict__ cum_items, int num_groups, int num_col_tiles,
+        int band_height, int N, int K, int topk, int x_slot_major) {
+  constexpr int ROWS = RB * 8;
+  __shared__ const half* xrows[ROWS];
+  __shared__ int slots[ROWS];
+  __shared__ float cs[SPLITK][NT][8 * kCsRow];
+
+  const int total = cum_items[num_groups];
+  for (int item = blockIdx.x; item < total; item += gridDim.x) {
+    // The group is the last one whose first item is not after this item.
+    int lo = 0, hi = num_groups;
+    while (lo + 1 < hi) {
+      const int mid = (lo + hi) >> 1;
+      if (cum_items[mid] <= item) lo = mid; else hi = mid;
+    }
+    const int beg = goff[lo];
+    const int cnt = goff[lo + 1] - beg;
+    const int chunks = (cnt + ROWS - 1) / ROWS;
+    const int local = item - cum_items[lo];
+    const int band_items = band_height * num_col_tiles;
+    const int band = local / band_items;
+    const int height = min(band_height, chunks - band * band_height);
+    const int in_band = local - band * band_items;
+    const int col = in_band / height;
+    const int base = (band * band_height + in_band - col * height) * ROWS;
+    moe_m16n8k8_pass<SPLITK, SCALE_MODE, RB, NT>(
+        qcodes, qscales, gscales, x, y_slots, perm, gids[lo], col * NT,
+        beg + base, min(ROWS, cnt - base), N, K, topk, x_slot_major, xrows,
+        slots, cs);
   }
 }
 
@@ -591,6 +691,49 @@ __global__ void __launch_bounds__(32 * SPLITK) skinny_nvfp4_moe_m16n8k8(
 // with W in per-expert QPN fragment order (see qpn_prepack).
 
 #undef SKINNY_MMA_8N8K4
+
+// Experiment switches (removed once the scheduler parameters are fixed):
+// VLLM_SM70_MOE_SCHED=0 runs the pass-loop kernel in prefill again,
+// VLLM_SM70_MOE_BAND sets the band height in chunks.
+int env_int(const char* name, int fallback) {
+  const char* value = std::getenv(name);
+  return value ? std::atoi(value) : fallback;
+}
+
+template <int SPLITK, int SCALE_MODE, int RB, int NT>
+void launch_m16n8k8_scheduled(const torch::Tensor& qcodes,
+                              const torch::Tensor& qscales,
+                              const torch::Tensor& gscales,
+                              const torch::Tensor& x, torch::Tensor& y_slots,
+                              const torch::Tensor& perm,
+                              const torch::Tensor& gids,
+                              const torch::Tensor& goff, int64_t topk,
+                              bool x_slot_major, int64_t groups,
+                              cudaStream_t stream) {
+  const int64_t N = y_slots.size(1), K = x.size(1);
+  const int num_col_tiles = static_cast<int>(N / (32 * NT));
+  auto cum_items = torch::empty({groups + 1}, x.options().dtype(torch::kInt));
+  moe_item_table<<<1, 256, 0, stream>>>(
+      goff.data_ptr<int>(), cum_items.data_ptr<int>(),
+      static_cast<int>(groups), num_col_tiles, RB * 8);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  auto kernel = skinny_nvfp4_moe_m16n8k8_scheduled<SPLITK, SCALE_MODE, RB, NT>;
+  int per_sm = 0;
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &per_sm, kernel, 32 * SPLITK, 0));
+  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  static const int band_height = env_int("VLLM_SM70_MOE_BAND", 8);
+  kernel<<<per_sm * sms, 32 * SPLITK, 0, stream>>>(
+      qcodes.data_ptr<uint8_t>(), qscales.data_ptr<uint8_t>(),
+      gscales.data_ptr<float>(),
+      reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),
+      perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(),
+      cum_items.data_ptr<int>(), static_cast<int>(groups), num_col_tiles,
+      band_height, static_cast<int>(N), static_cast<int>(K),
+      static_cast<int>(topk), x_slot_major ? 1 : 0);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 
 }  // namespace
 
@@ -697,6 +840,7 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
   auto stream = at::cuda::getCurrentCUDAStream();
   // Experts average more than one 8-row tile in prefill chunks.
   const bool prefill = (S + E - 1) / E > 8;
+  static const bool use_scheduler = env_int("VLLM_SM70_MOE_SCHED", 1) != 0;
 
   if (fragment_order == ORDER_M16N8K8) {
     // RTX 8000: four 8-row tiles per weight decode in prefill cut the GEMMs
@@ -712,12 +856,16 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
           perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
           (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
 
-#define LAUNCH_MOE_M16N8K8_S(SPv, SMv)   \
-  do {                                   \
-    if (prefill)                         \
-      LAUNCH_MOE_M16N8K8_R(SPv, SMv, 4); \
-    else                                 \
-      LAUNCH_MOE_M16N8K8_R(SPv, SMv, 1); \
+#define LAUNCH_MOE_M16N8K8_S(SPv, SMv)                                   \
+  do {                                                                   \
+    if (prefill && use_scheduler)                                        \
+      launch_m16n8k8_scheduled<SPv, SMv, 4, kColumnTiles>(               \
+          qcodes, qscales, gscales, x, y_slots, perm, gids, goff, topk,  \
+          x_slot_major, std::min(S, E), stream);                         \
+    else if (prefill)                                                    \
+      LAUNCH_MOE_M16N8K8_R(SPv, SMv, 4);                                 \
+    else                                                                 \
+      LAUNCH_MOE_M16N8K8_R(SPv, SMv, 1);                                 \
   } while (0)
 
 #define LAUNCH_MOE_M16N8K8(SPv)                       \
