@@ -114,7 +114,7 @@ def _skinny_moe_e8m0_m8n8k4_kernel(
     # most HIGH rows), each cut into BLOCK_M-row blocks in group order. Every
     # program derives it from goff itself; a separate list build cost about 80
     # small kernels per layer and chunk (1.6 s of a 150k-token prefill on a
-    # DeepSeek-V4 V100 stage).
+    # DeepSeek-V4 pre-Ampere stage).
     g = tl.arange(0, GROUPS_P2)
     g_ok = g < GROUPS
     sizes = tl.load(goff_ptr + g + 1, mask=g_ok, other=0) - tl.load(
