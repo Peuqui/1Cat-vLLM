@@ -276,7 +276,6 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
-    get_kv_quant_mode,
 )
 
 logger = init_logger(__name__)
@@ -975,15 +974,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             and self.kv_cache_dtype in {"fp8", "fp8_e4m3"}
             else None
         )
-        # The KV allocator shapes each layer's carrier by the codec its spec
-        # declares (AttentionSpec.layout_cache_dtype); an fp8 MLA cache must
-        # say so, or it is reshaped as a 16-bit cache of the wrong width.
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=kv_cache_dtype,
-            kv_quant_mode=get_kv_quant_mode(vllm_config.cache_config.cache_dtype),
             cache_dtype_str=vllm_config.cache_config.cache_dtype,
             model_version=model_version,
         )

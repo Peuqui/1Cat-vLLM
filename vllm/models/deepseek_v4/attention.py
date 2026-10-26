@@ -73,11 +73,7 @@ from vllm.v1.attention.backends.mla.indexer import (
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
-from vllm.v1.kv_cache_interface import (
-    KVCacheSpec,
-    MLAAttentionSpec,
-    get_kv_quant_mode,
-)
+from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 if TYPE_CHECKING:
     from vllm.models.deepseek_v4.nvidia.flashmla import (
@@ -846,14 +842,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             self.compress_ratio <= 1
         ):  # SWA part. Allocated separately as DeepseekV4SWACache.
             return None
-        # Declare the codec: the KV allocator shapes the carrier by it
-        # (AttentionSpec.layout_cache_dtype).
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=torch.uint8,
-            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             compress_ratio=self.compress_ratio,
             cache_dtype_str=self.kv_cache_dtype,
             alignment=576,  # NOTE: FlashMLA requires 576B alignment
