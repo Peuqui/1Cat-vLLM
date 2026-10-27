@@ -368,12 +368,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   set(VLLM_SM70_TURBOMIND_INCLUDE_DIRS "")
   cuda_archs_loose_intersection(SM70_TURBOMIND_ARCHS "7.0" "${CUDA_ARCHS}")
   if (SM70_TURBOMIND_ARCHS)
-    # The SM70 family runs on Turing too. Native sm_75 code is a few percent
-    # faster there than sm_70 code through binary compatibility (skinny MoE on
-    # an RTX 8000: 1-4 %, 10 % in one decode shape), so a 7.0 build ships both.
+    # The SM70 family runs on Turing through binary compatibility with sm_70
+    # code. Only kernels that need Turing instructions ship sm_75 code: the
+    # m16n8k8 skinny MoE (both images, below) and the sm_75-only sources.
     # TORCH_CUDA_ARCH_LIST stays 7.0: listing 7.5 there would also replace the
     # SM70 Marlin kernels with the generic ones (mixed Marlin build below).
-    set(SM70_FAMILY_ARCHS "7.0;7.5")
+    set(SM70_FAMILY_ARCHS "7.0")
     string(REPLACE "." "" SM70_FAMILY_CUDA_ARCHITECTURES "${SM70_FAMILY_ARCHS}")
     list(APPEND VLLM_EXT_SRC "csrc/sm70_ring_collectives.cu" "csrc/host_reduce.cu")
     set_gencode_flags_for_srcs(
@@ -457,6 +457,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     set_gencode_flags_for_srcs(
       SRCS "${VLLM_SM70_TURBOMIND_SRCS}"
       CUDA_ARCHS "${SM70_FAMILY_ARCHS}")
+    # The grouped skinny MoE runs m16n8k8 fragments on SM75; its sm_70 image
+    # stays for Volta (the flags append).
+    set_gencode_flags_for_srcs(
+      SRCS "${VLLM_SM70_TURBOMIND_ROOT}/ops/skinny_moe_qpn_sm70.cu"
+      CUDA_ARCHS "7.5")
     # Kernels built on the m16n8k8 MMA, which Volta lacks, ship sm_75 code
     # only; the dispatch reaches them only on SM75 devices.
     set(VLLM_SM75_TURBOMIND_SRCS
