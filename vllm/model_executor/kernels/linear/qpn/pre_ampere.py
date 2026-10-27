@@ -198,6 +198,7 @@ def _turing_fp8_qpn8_linear(
     scales: torch.Tensor,
     n: int,
     split_k: int,
+    decode_split_k: int,
     chains: int,
     prefetch: bool,
     sm75_mma: bool = False,
@@ -220,7 +221,12 @@ def _turing_fp8_qpn8_linear(
         x,
         codes,
         scales,
-        split_k,
+        # Chosen here, inside the opaque operation: a shape test in the caller
+        # would be traced once under torch.compile and kept for every M. The
+        # occupancy-fitted split was measured for the M <= 8 launch only; the
+        # M16 and M32 bodies take the table split (the native M=17..32
+        # candidate admits split-K 12 or 16).
+        decode_split_k if x.shape[0] <= tm.QPN8_OCCUPANCY_MAX_M else split_k,
         chains,
         prefetch,
         False,
@@ -234,6 +240,7 @@ def _turing_fp8_qpn8_linear_fake(
     scales: torch.Tensor,
     n: int,
     split_k: int,
+    decode_split_k: int,
     chains: int,
     prefetch: bool,
     sm75_mma: bool = False,

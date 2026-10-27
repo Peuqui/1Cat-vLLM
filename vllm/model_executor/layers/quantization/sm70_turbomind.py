@@ -676,12 +676,6 @@ class FP8QPN8LinearState:
         # FP16 weight; it takes row-group scales on N, K multiples of 128.
         self.sm75_mma = sm75_mma
 
-    def split_k_for(self, m: int) -> int:
-        """The occupancy-fitted split for the M <= 8 launch it was measured
-        on; the table split for the M16 and M32 bodies, whose native M=17..32
-        candidate only takes split-K 12 or 16."""
-        return self.decode_split_k if m <= QPN8_OCCUPANCY_MAX_M else self.split_k
-
 
 def fp8_qpn8_launch_config(k: int) -> tuple[int, int, bool]:
     """Split-K, accumulator chains and code prefetch for a QPN8 GEMM.
@@ -867,7 +861,8 @@ def apply_prepared_fp8_qpn8_linear(
         state.codes,
         state.group_scales,
         state.output_size,
-        state.split_k_for(reshaped_x.shape[0]),
+        state.split_k,
+        state.decode_split_k,
         state.accumulator_chains,
         state.prefetch_codes,
         state.sm75_mma,

@@ -313,14 +313,16 @@ def test_fp8_scratch_is_owned_by_each_invocation(monkeypatch):
     )
     x = torch.empty(9, 128, dtype=torch.float16)
     for _ in range(2):
-        qpn._turing_fp8_qpn8_linear(x, torch.empty(0), torch.empty(0), 32, 8, 2, False)
+        qpn._turing_fp8_qpn8_linear(
+            x, torch.empty(0), torch.empty(0), 32, 16, 8, 2, False
+        )
     workspaces = [tensor for tensor in allocations if tensor.shape == (128, 32)]
     assert len(workspaces) == 2
     assert dispatched == [tensor.data_ptr() for tensor in workspaces]
     assert dispatched[0] != dispatched[1]
     dispatched.clear()
     assert qpn._turing_fp8_qpn8_linear(
-        x[:0], torch.empty(0), torch.empty(0), 32, 8, 2, False
+        x[:0], torch.empty(0), torch.empty(0), 32, 16, 8, 2, False
     ).shape == (0, 32)
     assert dispatched == []
 
@@ -357,15 +359,30 @@ def test_qpn8_split_k_follows_device_occupancy(
     assert tm.fp8_qpn8_occupancy_split_k(k, n, split_k, device) == expected
 
 
-def test_qpn8_per_tensor_occupancy_split_only_up_to_m8():
+def test_qpn8_per_tensor_launch_config_is_the_table_split():
     from vllm.model_executor.layers.quantization import sm70_turbomind as tm
 
     assert tm.fp8_qpn8_launch_config(4096) == (16, 2, False)
     assert tm.fp8_qpn8_launch_config(576) == (12, 2, False)
+
+
+def test_qpn8_per_tensor_op_picks_the_split_by_m(monkeypatch):
+    from vllm import _sm70_ops as ops
+
     # RTX 8000, K 3072 / N 5120: split 8 fits the M <= 8 grid into one wave;
     # the M16 and M32 bodies keep the table split (M=17..32 takes 12 or 16).
-    state = tm.FP8QPN8LinearState(torch.empty(0), torch.empty(0), 5120, 16, 8, 2, False)
-    assert [state.split_k_for(m) for m in (1, 8, 9, 16, 17, 32)] == [
+    splits = []
+    monkeypatch.setattr(
+        ops,
+        "fp8_qpn8_dispatch_sm70_out",
+        lambda out, ptr, x, codes, scales, split_k, *rest: splits.append(split_k),
+    )
+    for m in (1, 8, 9, 16, 17, 32):
+        x = torch.empty(m, 128, dtype=torch.float16)
+        qpn._turing_fp8_qpn8_linear(
+            x, torch.empty(0), torch.empty(0), 32, 16, 8, 2, False
+        )
+    assert splits == [
         8,
         8,
         16,
