@@ -152,8 +152,8 @@ def test_volta_and_turing_select_triton_sparse_impl(minor):
     platform = MagicMock()
     platform.is_rocm.return_value = False
     platform.is_cuda.return_value = True
-    platform.is_device_capability_family.side_effect = lambda family: (
-        capability.to_int() // 10 == family // 10
+    platform.is_device_capability_family.side_effect = (
+        lambda family: capability.to_int() // 10 == family // 10
     )
     with patch.object(attention, "current_platform", platform):
         assert attention._select_v4_sparse_impl() is DeepseekV4SM70SparseImpl
@@ -504,11 +504,11 @@ def test_sm70_sparse_bmm_prefill_buffers_share_the_kv_workspace_request():
         (128, 64, 640),
     ]
     # The tensor-core matmuls read the selected rows through the indices, so
-    # no gathered keys; their pass size is the device's.
+    # no gathered keys, and one pass takes up to 1024 tokens.
     from vllm.models.deepseek_v4.common.ops.sparse_prefill_bmm import tokens_per_pass
 
     layer.sparse_tensor_cores = True
     with patch.object(sparse, "_bmm_blocker", return_value=None):
         specs = impl._prefill_bmm_workspace_specs(layer, q, 640)
-    per_pass = min(2048, tokens_per_pass(True, q.device))
+    per_pass = min(2048, tokens_per_pass(True))
     assert [shape for shape, _ in specs] == [(per_pass, 64, 640), (per_pass, 64, 640)]

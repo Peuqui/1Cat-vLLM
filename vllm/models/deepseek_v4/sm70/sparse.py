@@ -398,7 +398,6 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
             q.shape[-1],
             combined_topk,
             torch.float16,
-            q.device,
             tensor_cores=layer.sparse_tensor_cores,
         )
 

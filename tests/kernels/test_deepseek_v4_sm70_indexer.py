@@ -213,19 +213,33 @@ def test_turing_prefill_takes_the_fused_scorer(monkeypatch):
 
 @requires_tensor_core_triton
 @pytest.mark.parametrize("num_heads", [8, 32, 64])
-def test_tensor_core_triton_scores_without_native_routes(monkeypatch, num_heads):
-    """With tensor-core Triton one kernel scores on Volta and Turing alike: the
-    fused Turing scorer and the cuBLAS route stay untouched. Eight heads need
-    two tokens per MMA; 1100 keys cross the per-program key range.
+def test_tensor_core_triton_keeps_the_fused_turing_scorer(monkeypatch, num_heads):
+    """With tensor-core Triton the Triton kernel replaces the cuBLAS route; Turing
+    keeps its fused native scorer for 32 and 64 heads, the faster one there, and
+    takes the Triton kernel for other head counts. Eight heads need two tokens
+    per MMA; 1100 keys cross the per-program key range.
     """
 
-    def native_route(*args):
-        raise AssertionError("tensor-core Triton must not take a native route")
+    def forbidden(route):
+        def call(*args, **kwargs):
+            raise AssertionError(f"tensor-core Triton must not take {route} here")
 
-    monkeypatch.setattr(sm70_indexer, "_prefill_logits_cublas", native_route)
+        return call
+
     monkeypatch.setattr(
-        torch.ops._C, "indexer_prefill_scores_sm75", native_route, raising=False
+        sm70_indexer, "_prefill_logits_cublas", forbidden("the cuBLAS route")
     )
+    if torch.cuda.get_device_capability() == (7, 5) and num_heads in (32, 64):
+        monkeypatch.setattr(
+            sm70_indexer, "_prefill_scores_triton", forbidden("the Triton kernel")
+        )
+    else:
+        monkeypatch.setattr(
+            torch.ops._C,
+            "indexer_prefill_scores_sm75",
+            forbidden("the fused SM75 scorer"),
+            raising=False,
+        )
     generator = torch.Generator().manual_seed(20261022)
     q, weights = _make_queries(37, num_heads)
     bits, values = _random_fp8_keys(1100, generator)

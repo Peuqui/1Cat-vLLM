@@ -84,7 +84,6 @@ def test_sparse_attn_prefill_bmm_matches_reference(
             HEAD_DIM,
             width + 128,
             torch.float16,
-            q.device,
             tensor_cores=tensor_cores,
         )
     ]
@@ -94,9 +93,7 @@ def test_sparse_attn_prefill_bmm_matches_reference(
     expected = _reference(q, kv, indices, lengths, scale, attn_sink)
     assert torch.isfinite(output).all()
     assert not output[1].any()  # no keys: the sink takes all the weight
-    assert buffers[0].shape[0] == min(
-        num_tokens + 9, tokens_per_pass(tensor_cores, q.device)
-    )
+    assert buffers[0].shape[0] == min(num_tokens + 9, tokens_per_pass(tensor_cores))
     # The tensor-core route reads the selected rows itself: no gathered keys.
     assert len(buffers) == (2 if tensor_cores else 3)
     torch.testing.assert_close(output.double(), expected, atol=1e-3, rtol=1e-3)
@@ -104,13 +101,12 @@ def test_sparse_attn_prefill_bmm_matches_reference(
 
 @requires_tensor_core_triton
 @torch.inference_mode()
-def test_tensor_core_route_spans_several_passes_of_its_device():
-    # The pass size is the device's (Turing takes a whole 1024-token chunk):
-    # two full passes and a partial one match the BLAS route, which the
-    # reference test above covers.
+def test_tensor_core_route_spans_several_passes():
+    # Two full passes of the tensor-core route and a partial one match the BLAS
+    # route, which the reference test above covers.
     torch.manual_seed(1)
-    device = torch.device("cuda", torch.cuda.current_device())
-    num_tokens = 2 * tokens_per_pass(True, device) + 3
+    device = torch.device("cuda")
+    num_tokens = 2 * tokens_per_pass(True) + 3
     num_heads, width, num_kv = 64, 640, 900
     q = torch.randn((num_tokens, num_heads, HEAD_DIM), device=device).half()
     kv = (0.3 * torch.randn((num_kv, HEAD_DIM), device=device)).half()
@@ -131,7 +127,6 @@ def test_tensor_core_route_spans_several_passes_of_its_device():
                 HEAD_DIM,
                 width,
                 torch.float16,
-                device,
                 tensor_cores=tensor_cores,
             )
         ]
@@ -156,7 +151,7 @@ def test_prefill_retains_fp32_scores_before_softmax(tensor_cores: bool):
     buffers = [
         torch.empty(shape, device="cuda", dtype=dtype)
         for shape, dtype in sparse_prefill_bmm_workspace_specs(
-            1, 8, HEAD_DIM, 2, q.dtype, q.device, tensor_cores=tensor_cores
+            1, 8, HEAD_DIM, 2, q.dtype, tensor_cores=tensor_cores
         )
     ]
     output = torch.empty_like(q)

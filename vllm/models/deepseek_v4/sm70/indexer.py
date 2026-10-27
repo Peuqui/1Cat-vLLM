@@ -691,9 +691,9 @@ def _score_tile(turing: bool, num_heads: int) -> _ScoreTile:
     """Tile of `_prefill_index_scores_kernel`, measured on each architecture.
 
     Sweep of 216 tiles per card in CUDA graphs over 512-token chunks with 4.8k
-    to 76.8k keys (sweep_idx_table_{rtx,v100}, 22.10.2026). Turing is best at
-    2048 score elements per warp for 64 and 32 heads alike (within 0.2 %);
-    Volta has no such rule, so its two model head counts keep their own tile.
+    to 76.8k keys. Turing is best at 2048 score elements per warp for 64 and
+    32 heads alike (within 0.2 %); Volta has no such rule, so its two model
+    head counts keep their own tile.
     """
     if turing:
         return _ScoreTile(2, min(128, 2048 * 4 // (2 * num_heads)), 2048, False, 4, 1)
@@ -765,9 +765,11 @@ def sm70_indexer_prefill_logits(
 ) -> torch.Tensor:
     """Compute all prefill index scores; caller supplies causal row bounds.
 
-    With ``triton_tensor_cores`` (Triton lowers ``tl.dot`` to MMA on this card)
-    one Triton kernel scores on Volta and Turing alike; otherwise Turing takes
-    its fused native scorer and Volta the cuBLAS route.
+    Turing takes its fused native scorer for 32 and 64 heads, also with
+    ``triton_tensor_cores``: summed over long-context chunks it is faster there
+    than the Triton kernel. Otherwise ``triton_tensor_cores`` (Triton lowers
+    ``tl.dot`` to MMA on this card) selects the Triton kernel, and without it
+    the cuBLAS route or the per-head Triton kernel scores.
     """
     policy = sparse_policy()
     assert k_quant.dtype == torch.float8_e4m3fn
@@ -775,25 +777,27 @@ def sm70_indexer_prefill_logits(
     k_scales = k_scale_storage.view(torch.float32).reshape(-1)
     assert k_scales.shape[0] == k_quant.shape[0]
 
-    if policy.value("indexer_relu") and not triton_tensor_cores:
-        if _turing_fused_prefill_scores(q):
-            logger.info_once(
-                "SM70 indexer prefill: fused SM75 scorer on %s.",
-                q.device,
-                scope="process",
-            )
-            out = torch.empty(
-                (q.shape[0], k_quant.shape[0]), dtype=torch.float32, device=q.device
-            )
-            torch.ops._C.indexer_prefill_scores_sm75(
-                out, q, weights, k_quant.view(torch.uint8), k_scales
-            )
-            return out
-        if policy.value("indexer_prefill_cublas"):
-            logger.info_once(
-                "SM70 indexer prefill: cuBLAS route on %s.", q.device, scope="process"
-            )
-            return _prefill_logits_cublas(q, k_quant, k_scales, weights)
+    if policy.value("indexer_relu") and _turing_fused_prefill_scores(q):
+        logger.info_once(
+            "SM70 indexer prefill: fused SM75 scorer on %s.", q.device, scope="process"
+        )
+        out = torch.empty(
+            (q.shape[0], k_quant.shape[0]), dtype=torch.float32, device=q.device
+        )
+        torch.ops._C.indexer_prefill_scores_sm75(
+            out, q, weights, k_quant.view(torch.uint8), k_scales
+        )
+        return out
+
+    if (
+        policy.value("indexer_relu")
+        and not triton_tensor_cores
+        and policy.value("indexer_prefill_cublas")
+    ):
+        logger.info_once(
+            "SM70 indexer prefill: cuBLAS route on %s.", q.device, scope="process"
+        )
+        return _prefill_logits_cublas(q, k_quant, k_scales, weights)
 
     if policy.value("indexer_relu"):
         logger.info_once(
