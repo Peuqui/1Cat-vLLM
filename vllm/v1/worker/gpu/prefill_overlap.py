@@ -253,8 +253,8 @@ class PrefillOverlap:
         def run_half(ctx, inputs):
             try:
                 # New threads start on device 0 and its default stream.
-                torch.cuda.set_device(self.device)
-                torch.cuda.set_stream(ctx.compute_stream)
+                torch.accelerator.set_device_index(self.device)
+                torch.accelerator.set_stream(ctx.compute_stream)
                 with (
                     torch.inference_mode(),
                     ctx,

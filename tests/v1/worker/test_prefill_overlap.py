@@ -186,7 +186,7 @@ class _ToyModel(torch.nn.Module):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_halves_overlapping_collectives_match_the_whole_batch():
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     overlap = PrefillOverlap(_overlap_config(), device)
     model = _ToyModel(num_layers=6)
     input_ids = torch.arange(4096, device=device) % 97
@@ -208,7 +208,7 @@ def test_halves_overlapping_collectives_match_the_whole_batch():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("fail_tokens", [2049, 2047], ids=["first", "second"])
 def test_a_failing_half_stops_both_and_reports_its_error(fail_tokens):
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     overlap = PrefillOverlap(_overlap_config(), device)
     model = _ToyModel(num_layers=6, fail_tokens=fail_tokens)
     input_ids = torch.arange(4096, device=device) % 97
