@@ -755,11 +755,12 @@ def test_fp8_dynamic_tuning_skips_stale_lut_by_default(monkeypatch):
 def test_freeze_makes_the_measured_plan_final(monkeypatch):
     device = torch.device("cpu")
     frozen = []
-    monkeypatch.setattr(
-        warmup.sm70_native_cache,
-        "freeze_tuning",
-        lambda hint: frozen.append(hint) or 7,
-    )
+
+    def fake_freeze(hint):
+        frozen.append(hint)
+        return 7
+
+    monkeypatch.setattr(warmup.sm70_native_cache, "freeze_tuning", fake_freeze)
     assert warmup._freeze_tuning_plan(device) == 7
     assert len(frozen) == 1
     assert frozen[0].device == device and frozen[0].numel() == 0
