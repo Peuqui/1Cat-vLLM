@@ -25,8 +25,8 @@ import torch
 from vllm.triton_utils import tl, triton
 
 # More rows per expert on average than this take the Triton kernel, the hand
-# kernel the rest. Measured on a V100 with DeepSeek-V4-Flash layer 5 (W13 + W2,
-# Zipf skew 0 / 0.8 / 1.2): Triton is 0.3-1.5 % slower at 12.9 rows per expert,
+# kernel the rest. Measured against the hand kernel on DeepSeek-V4-Flash layer 5
+# (W13 + W2, Zipf skew 0 / 0.8 / 1.2): Triton is 0.3-1.5 % slower at 12.9 rows,
 # 0.7-5.9 % faster at 13.8 and 16-23 % faster at 23.9.
 TRITON_MIN_ROWS_PER_EXPERT = 13
 # Groups by size: (more than, at most) rows, and the tile (BLOCK_M, BLOCK_N,
