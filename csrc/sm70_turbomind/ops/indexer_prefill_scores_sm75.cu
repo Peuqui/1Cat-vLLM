@@ -4,8 +4,8 @@
 // Prefill index scores of the sparse-attention lightning indexer, fused on
 // Turing's m16n8k8 tensor cores:
 //
-//   out[t, key] = scale[key] * sum_h w[t, h] * relu(fp16(q[t, h, :] . k[key,
-//   :]))
+//   out[t, key] = scale[key] * sum_h w[t, h]
+//                 * relu(fp16(q[t, h, :] . k[key, :]))
 //
 // The cuBLAS route stacks the heads into M and writes the [tokens * heads,
 // keys] fp16 scores (64 MiB per 512-token chunk and 1024 keys) before a second
@@ -323,9 +323,9 @@ void indexer_prefill_scores_sm75(torch::Tensor out, torch::Tensor q,
               "indexer_prefill_scores_sm75: tensors must be CUDA tensors");
   TORCH_CHECK(q.scalar_type() == torch::kFloat16 && q.dim() == 3 &&
                   q.size(2) == kHeadDim && q.stride(2) == 1 &&
-                  q.stride(1) == kHeadDim,
+                  q.stride(1) == kHeadDim && q.stride(0) % 2 == 0,
               "indexer_prefill_scores_sm75: q must be float16 [tokens, heads, "
-              "128] with contiguous heads");
+              "128] with contiguous heads and an even token stride");
   const int64_t num_q = q.size(0);
   const int64_t num_heads = q.size(1);
   TORCH_CHECK(num_heads == 32 || num_heads == 64,

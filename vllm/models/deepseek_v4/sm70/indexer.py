@@ -777,6 +777,11 @@ def sm70_indexer_prefill_logits(
 
     if policy.value("indexer_relu") and not triton_tensor_cores:
         if _turing_fused_prefill_scores(q):
+            logger.info_once(
+                "SM70 indexer prefill: fused SM75 scorer on %s.",
+                q.device,
+                scope="process",
+            )
             out = torch.empty(
                 (q.shape[0], k_quant.shape[0]), dtype=torch.float32, device=q.device
             )
@@ -785,9 +790,18 @@ def sm70_indexer_prefill_logits(
             )
             return out
         if policy.value("indexer_prefill_cublas"):
+            logger.info_once(
+                "SM70 indexer prefill: cuBLAS route on %s.", q.device, scope="process"
+            )
             return _prefill_logits_cublas(q, k_quant, k_scales, weights)
 
     if policy.value("indexer_relu"):
+        logger.info_once(
+            "SM70 indexer prefill: Triton scorer on %s (tensor cores: %s).",
+            q.device,
+            triton_tensor_cores,
+            scope="process",
+        )
         return _prefill_scores_triton(
             q, k_quant, k_scales, weights, tensor_cores=triton_tensor_cores
         )
@@ -996,18 +1010,14 @@ def _decode_cublas_blocker(
             and weights.dtype == torch.float32,
         ),
         (
-            (
-                "the shared key gather and one FP32 score tile within the indexer "
-                "workspace budget"
-            ),
+            "the shared key gather and one FP32 score tile within the indexer "
+            "workspace budget",
             lambda: _decode_score_tile_keys(max_seq_len, rows_per_request(), q.shape[1])
             > 0,
         ),
         (
-            (
-                f"a uint8 cache [blocks, block_size, {_INDEX_CACHE_BYTES}] with "
-                "contiguous blocks"
-            ),
+            f"a uint8 cache [blocks, block_size, {_INDEX_CACHE_BYTES}] with "
+            "contiguous blocks",
             lambda: cache.ndim == 3
             and cache.dtype == torch.uint8
             and cache.shape[1] > 0

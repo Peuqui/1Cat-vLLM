@@ -488,6 +488,7 @@ def test_sm70_sparse_bmm_prefill_buffers_share_the_kv_workspace_request():
 
     layer = MagicMock()
     layer.max_num_batched_tokens = 2048
+    # A MagicMock attribute is truthy and would pick the tensor-core route.
     layer.sparse_tensor_cores = False
     q = torch.empty((1, 64, 512), dtype=torch.float16)
     impl = sparse.DeepseekV4SM70SparseImpl
