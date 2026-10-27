@@ -28,7 +28,11 @@ from vllm.runtime_resources import activate_runtime_resources
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.ubatching import cat_ubatch_outputs, make_ubatch_contexts
+from vllm.v1.worker.ubatching import (
+    MicroBatchAborted,
+    cat_ubatch_outputs,
+    make_ubatch_contexts,
+)
 
 logger = init_logger(__name__)
 
@@ -148,12 +152,42 @@ class PrefillOverlap:
                 "kernel_config.tp_prefill_overlap_min_tokens excludes LoRA and "
                 "KV transfer, whose per-batch state it cannot split."
             )
+        if parallel_config.decode_context_parallel_size > 1:
+            raise ValueError(
+                "kernel_config.tp_prefill_overlap_min_tokens excludes decode "
+                "context parallelism, whose sequence lengths it cannot split."
+            )
+        if vllm_config.model_config.is_encoder_decoder:
+            raise ValueError(
+                "kernel_config.tp_prefill_overlap_min_tokens excludes "
+                "encoder-decoder models, whose encoder inputs it cannot split."
+            )
         self.vllm_config = vllm_config
         self.min_tokens = vllm_config.kernel_config.tp_prefill_overlap_min_tokens
         self.device = device
         self.comm_stream = torch.cuda.Stream(device)
         # Two micro-batch threads and the caller.
         self.ready_barrier = threading.Barrier(3)
+
+    @staticmethod
+    def check_model(model: torch.nn.Module) -> None:
+        """Reject models whose forward the two halves cannot share: MoE layers
+        dispatch without the micro-batch hooks, and deepstack vision features
+        live in a model buffer indexed from token 0 in each half."""
+        # Imported here: the MoE layer pulls in the model executor.
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
+        for module in model.modules():
+            if isinstance(module, FusedMoE):
+                raise ValueError(
+                    "kernel_config.tp_prefill_overlap_min_tokens supports "
+                    "dense models only; this model has MoE layers."
+                )
+            if getattr(module, "deepstack_num_level", 0) > 0:
+                raise ValueError(
+                    "kernel_config.tp_prefill_overlap_min_tokens cannot split "
+                    "the deepstack visual features of this model."
+                )
 
     def split_token(
         self,
@@ -240,5 +274,9 @@ class PrefillOverlap:
             for thread in threads:
                 thread.join()
         if errors:
-            raise errors[0]
+            # The other half stops with MicroBatchAborted; report the cause.
+            raise next(
+                (e for e in errors if not isinstance(e, MicroBatchAborted)),
+                errors[0],
+            )
         return cat_ubatch_outputs(outputs)

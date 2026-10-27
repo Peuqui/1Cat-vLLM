@@ -117,12 +117,52 @@ def test_align_mode_split_on_a_request_boundary_stays():
     assert _align_split([0, 800, 1600], [0, 0], 800) == 800
 
 
+def _overlap_config(dcp: int = 1, encoder_decoder: bool = False):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=2,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            decode_context_parallel_size=dcp,
+        ),
+        model_config=SimpleNamespace(is_encoder_decoder=encoder_decoder),
+        lora_config=None,
+        kv_transfer_config=None,
+        kernel_config=SimpleNamespace(tp_prefill_overlap_min_tokens=8),
+    )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [_overlap_config(dcp=2), _overlap_config(encoder_decoder=True)],
+    ids=["decode_context_parallel", "encoder_decoder"],
+)
+def test_overlap_rejects_configurations_it_cannot_split(config):
+    with pytest.raises(ValueError, match="tp_prefill_overlap_min_tokens excludes"):
+        PrefillOverlap(config, torch.device("cpu"))
+
+
+def test_overlap_rejects_moe_and_deepstack_models():
+    from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
+    def model_of(*modules):
+        return SimpleNamespace(modules=lambda: iter(modules))
+
+    with pytest.raises(ValueError, match="dense models only"):
+        PrefillOverlap.check_model(model_of(object.__new__(FusedMoE)))
+    with pytest.raises(ValueError, match="deepstack"):
+        PrefillOverlap.check_model(model_of(SimpleNamespace(deepstack_num_level=3)))
+    # A vision tower without deepstack levels (Qwen3.5) splits like text.
+    PrefillOverlap.check_model(model_of(SimpleNamespace(deepstack_num_level=0)))
+
+
 class _ToyModel(torch.nn.Module):
     """Elementwise layers with a slow stand-in all-reduce between them."""
 
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, fail_tokens: int | None = None):
         super().__init__()
         self.num_layers = num_layers
+        self.fail_tokens = fail_tokens
 
     @staticmethod
     def _all_reduce(x: torch.Tensor) -> torch.Tensor:
@@ -133,6 +173,8 @@ class _ToyModel(torch.nn.Module):
         x = input_ids.float()
         for layer in range(self.num_layers):
             x = x * 1.5 + layer
+            if layer == 2 and input_ids.shape[0] == self.fail_tokens:
+                raise ValueError("half failed")
             if dbo_overlaps_collectives():
                 x = dbo_run_collective_overlapped(self._all_reduce, x)
             else:
@@ -143,17 +185,7 @@ class _ToyModel(torch.nn.Module):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_halves_overlapping_collectives_match_the_whole_batch():
     device = torch.device("cuda", torch.cuda.current_device())
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=2,
-            pipeline_parallel_size=1,
-            data_parallel_size=1,
-        ),
-        lora_config=None,
-        kv_transfer_config=None,
-        kernel_config=SimpleNamespace(tp_prefill_overlap_min_tokens=8),
-    )
-    overlap = PrefillOverlap(config, device)
+    overlap = PrefillOverlap(_overlap_config(), device)
     model = _ToyModel(num_layers=6)
     input_ids = torch.arange(4096, device=device) % 97
     with torch.inference_mode():
@@ -169,3 +201,28 @@ def test_halves_overlapping_collectives_match_the_whole_batch():
         output = overlap.run(model, halves, contexts)
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
         assert not dbo_overlaps_collectives()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("fail_tokens", [2049, 2047], ids=["first", "second"])
+def test_a_failing_half_stops_both_and_reports_its_error(fail_tokens):
+    device = torch.device("cuda", torch.cuda.current_device())
+    overlap = PrefillOverlap(_overlap_config(), device)
+    model = _ToyModel(num_layers=6, fail_tokens=fail_tokens)
+    input_ids = torch.arange(4096, device=device) % 97
+    contexts = [
+        ForwardContext(
+            no_compile_layers={}, attn_metadata={}, slot_mapping={}, ubatch_slices=None
+        )
+        for _ in range(2)
+    ]
+    halves = [{"input_ids": input_ids[:2049]}, {"input_ids": input_ids[2049:]}]
+    # Without the shared abort the other half waited forever for the failed one.
+    with pytest.raises(ValueError, match="half failed"):
+        overlap.run(model, halves, contexts)
+    assert not dbo_overlaps_collectives()
+    # The overlap keeps working after a failed batch.
+    healthy = _ToyModel(num_layers=6)
+    with torch.inference_mode():
+        expected = healthy(input_ids=input_ids)
+    torch.testing.assert_close(overlap.run(healthy, halves, contexts), expected)

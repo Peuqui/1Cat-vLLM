@@ -438,6 +438,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.model = self.load_lora_model(
                     self.model, self.vllm_config, self.device
                 )
+            if self.prefill_overlap is not None:
+                self.prefill_overlap.check_model(self.model)
 
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None

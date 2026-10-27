@@ -17,6 +17,10 @@ _NUM_UBATCHES: int = 2
 _CURRENT_CONTEXTS: list["UBatchContext | None"] = []
 
 
+class MicroBatchAborted(RuntimeError):
+    """Raised in a micro-batch thread because another micro-batch failed."""
+
+
 class UBatchContext:
     """
     Context manager for micro-batching synchronization using threading events.
@@ -33,6 +37,7 @@ class UBatchContext:
         cpu_signal_event: threading.Event,
         gpu_comm_done_event: torch.Event,
         gpu_compute_done_event: torch.Event,
+        abort_event: threading.Event,
         schedule: str = "default",
         overlap_collectives: bool = False,
     ):
@@ -46,6 +51,10 @@ class UBatchContext:
         self.current_stream = compute_stream
         self.gpu_comm_done_event = gpu_comm_done_event
         self.gpu_compute_done_event = gpu_compute_done_event
+        # Shared by all micro-batches of one run: a failing micro-batch sets it
+        # before waking the next one, which would otherwise wait forever for a
+        # thread that is gone.
+        self.abort_event = abort_event
         self.schedule = schedule
         self.overlap_collectives = overlap_collectives
         self.recv_hook = None
@@ -59,6 +68,7 @@ class UBatchContext:
 
         self.cpu_wait_event.wait()
         self.cpu_wait_event.clear()
+        self._raise_if_aborted()
         self._restore_context()
         # Assume we want to start on the compute stream
         self.update_stream(self.compute_stream)
@@ -68,7 +78,10 @@ class UBatchContext:
         global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
         _CURRENT_CONTEXTS[self.id] = None
         del _THREAD_ID_TO_CONTEXT[threading.get_ident()]
-        self.maybe_run_recv_hook()
+        if exc_type is not None:
+            self.abort_event.set()
+        else:
+            self.maybe_run_recv_hook()
         self.cpu_signal_event.set()
         self.cpu_wait_event.clear()
         return False
@@ -101,10 +114,18 @@ class UBatchContext:
         assert current_stream() == self.current_stream
         assert not self.cpu_wait_event.is_set()
 
+        self._raise_if_aborted()
         self.cpu_signal_event.set()
         self.cpu_wait_event.wait()
         self.cpu_wait_event.clear()
+        self._raise_if_aborted()
         self._restore_context()
+
+    def _raise_if_aborted(self):
+        if self.abort_event.is_set():
+            raise MicroBatchAborted(
+                f"micro-batch {self.id} stops because another micro-batch failed"
+            )
 
     def switch_to_comm(self):
         self.update_stream(self.comm_stream)
@@ -263,6 +284,7 @@ def make_ubatch_contexts(
     Create a context manager for micro-batching synchronization.
     """
     cpu_events = [threading.Event() for _ in range(num_micro_batches)]
+    abort_event = threading.Event()
     gpu_comm_done_events = [torch.Event() for _ in range(num_micro_batches)]
     gpu_compute_done_events = [torch.Event() for _ in range(num_micro_batches)]
 
@@ -278,6 +300,7 @@ def make_ubatch_contexts(
             cpu_signal_event=cpu_events[(i + 1) % num_micro_batches],
             gpu_comm_done_event=gpu_comm_done_events[i],
             gpu_compute_done_event=gpu_compute_done_events[i],
+            abort_event=abort_event,
             schedule=schedule,
             overlap_collectives=overlap_collectives,
         )
