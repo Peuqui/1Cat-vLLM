@@ -125,3 +125,50 @@ def test_matches_the_fp32_reference(
     # fp16 inputs and fp16 probabilities in P.V, as in FlashAttention-2: the
     # largest error measured on these cases is about 1.2e-3.
     torch.testing.assert_close(out.float(), reference, rtol=0, atol=3e-3)
+
+
+def _selection_impl():
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+
+    impl = object.__new__(FlashAttentionImpl)
+    impl.turing_prefill_min_query_len = 65
+    impl.head_size = HEAD_DIM
+    impl.vllm_flash_attn_version = 2
+    impl.sliding_window = (-1, -1)
+    impl.alibi_slopes = None
+    impl.sinks = None
+    impl.logits_soft_cap = 0
+    impl.kv_cache_dtype = "auto"
+    impl.batch_invariant_enabled = False
+    return impl
+
+
+@pytest.mark.parametrize(
+    ("blocks", "page_size", "expected"),
+    [
+        (64, 16, True),
+        (64, 64, True),
+        (64, 128, False),
+        (64, 800, False),
+        # The [blocks, 2, page, heads, dim] view spans more than 2^31 elements.
+        (2**31 // (2 * 16 * 2 * HEAD_DIM) + 1, 16, False),
+    ],
+)
+def test_selection_keeps_unsupported_caches_on_fa2(
+    monkeypatch, blocks, page_size, expected
+):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability",
+        lambda capability, device_id=None: capability == (7, 5),
+    )
+    impl = _selection_impl()
+    metadata = SimpleNamespace(max_query_len=128, causal=True)
+    query = torch.empty(128, 12, HEAD_DIM, dtype=torch.float16, device="meta")
+    cache = torch.empty(
+        blocks, 2, page_size, 2, HEAD_DIM, dtype=torch.float16, device="meta"
+    )
+    key_cache = cache[:, 0]
+    assert impl._use_turing_prefill(metadata, query, key_cache) is expected

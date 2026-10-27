@@ -709,14 +709,22 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
     def _use_turing_prefill(
-        self, attn_metadata: FlashAttentionMetadata, query: torch.Tensor
+        self,
+        attn_metadata: FlashAttentionMetadata,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
     ) -> bool:
         """Whether this batch takes `paged_prefill_attention_sm75`.
 
         Turing only (the query's own device): FA2's Turing build runs causal
         head-dim-256 prefills over an fp16 paged cache at about a quarter of
-        the m16n8k8 rate, while newer cards have their own FA2 kernels.
+        the m16n8k8 rate, while newer cards have their own FA2 kernels. The
+        kernel takes pages of 16, 32 or 64 tokens and forms 32-bit cache
+        offsets; other caches stay on FA2.
         """
+        largest_offset = key_cache.size(3) + sum(
+            (key_cache.size(d) - 1) * key_cache.stride(d) for d in range(3)
+        )
         return (
             0 < self.turing_prefill_min_query_len <= attn_metadata.max_query_len
             and self.head_size == 256
@@ -729,6 +737,8 @@ class FlashAttentionImpl(AttentionImpl):
             and not self.logits_soft_cap
             and not is_quantized_kv_cache(self.kv_cache_dtype)
             and not self.batch_invariant_enabled
+            and key_cache.size(1) in (16, 32, 64)
+            and largest_offset <= torch.iinfo(torch.int32).max
             and current_platform.is_device_capability(
                 (7, 5), device_id=query.device.index
             )
@@ -876,7 +886,7 @@ class FlashAttentionImpl(AttentionImpl):
                     fa_version=self.vllm_flash_attn_version,
                 )
                 return output
-            elif self._use_turing_prefill(attn_metadata, query):
+            elif self._use_turing_prefill(attn_metadata, query, key_cache):
                 torch.ops._C.paged_prefill_attention_sm75(
                     output[:num_actual_tokens],
                     query[:num_actual_tokens],
