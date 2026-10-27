@@ -5,9 +5,9 @@
 // e2m1 code decoder, and Turing's m16n8k8 tensor-core MMA with the ldmatrix
 // load that feeds it. Volta runs mma.m8n8k4 at full rate; Turing executes it
 // at half its tensor rate and gets its full rate only from m16n8k8, which
-// every later generation also runs. The m16n8k8 helpers compile to nothing
-// below SM75, so the SM70 build of a file that also holds an SM75 kernel
-// stays valid.
+// every later generation also runs. The m16n8k8 helpers trap below SM75, so
+// the SM70 build of a file that also holds an SM75 kernel compiles and fails
+// loudly if that kernel ever runs without its sm_75 code.
 #pragma once
 
 #include <cuda_fp16.h>
@@ -16,6 +16,8 @@
 
 namespace vllm::sm70 {
 
+// Derived from TurboMind's cvt_f16x8_e2m1 (lmdeploy, Apache-2.0;
+// csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/attention/quantization.h).
 // Eight e2m1 codes (one 32-bit word, low nibble first) to fp16 bit patterns:
 // sign and exponent/mantissa bits move into fp16 positions, and the 2^14
 // exponent re-bias is left to the caller's scale. out[i] pairs codes

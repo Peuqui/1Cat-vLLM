@@ -49,7 +49,7 @@ from vllm.platforms import current_platform
 _QPN8_MAX_M = 8
 # Turing's tensor-core GEMM on the packed codes runs M above _QPN8_MAX_M up to
 # this bound. Up to M=8 the packed m8n8k4 GEMM is faster on most projection
-# shapes (CUDA-graph replay, Quadro RTX 8000, 20.10.2026: the tensor-core GEMM
+# shapes (CUDA-graph replay, Quadro RTX 8000, 2026-10-20: the tensor-core GEMM
 # took 1.01-1.28x its time on 10 of 13 DeepSeek-V4 and Qwen3.8-27B shapes,
 # 0.78-1.02x on the other three, and 0.16-0.60x at M=16..64); above this bound
 # the dense reconstruction + cuBLAS is faster (1.15-1.75x at M>=1024).

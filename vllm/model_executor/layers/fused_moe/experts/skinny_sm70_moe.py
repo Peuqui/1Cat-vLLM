@@ -83,7 +83,7 @@ def grouped_splitk(k: int, order: QpnFragmentOrder) -> int:
 
     Picks the most preferred specialization the native kernel instantiates
     that divides the actual K groups. Both kernels prefer 8 warps (tuning
-    sweeps 21.10.2026); Turing's m16n8k8 kernel takes 4 where 8 would leave a
+    sweeps 2026-10-21); Turing's m16n8k8 kernel takes 4 where 8 would leave a
     warp fewer than 16 groups, Volta's m8n8k4 kernel 16 or 10 where 8 does
     not divide K.
     """

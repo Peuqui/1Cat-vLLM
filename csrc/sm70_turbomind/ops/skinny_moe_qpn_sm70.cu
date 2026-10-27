@@ -784,7 +784,7 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
   TORCH_CHECK(K % 64 == 0 && (K / 16) % splitk == 0,
               "K/16 must split into splitk equal slices");
   // Both kernels give a CTA two 32-column tiles that share each activation
-  // load (tuning sweeps 21.10.2026: RTX 8000 and V100, DSv4, GLM-5.3 and
+  // load (tuning sweeps 2026-10-21: RTX 8000 and V100, DSv4, GLM-5.3 and
   // Flash-Next expert shapes); four tiles gained at most 4 % in prefill and
   // lost 3-5 % in decode.
   constexpr int kColumnTiles = 2;

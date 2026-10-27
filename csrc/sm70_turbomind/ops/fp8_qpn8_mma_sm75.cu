@@ -311,7 +311,7 @@ struct TileChoice {
 // Wave model: resident waves x K blocks per CTA x per-slot cost of one 128-deep
 // K block, plus the split-K partials' traffic. Per-tile costs (relative to
 // 16 rows) and the reduction weight were fitted on a Quadro RTX 8000 over the
-// Qwen3.8-27B TP2 projections at M=1..512 (20.10.2026): the choice is 1.9 %
+// Qwen3.8-27B TP2 projections at M=1..512 (2026-10-20): the choice is 1.9 %
 // behind the measured best tile and split on average, 15.7 % at worst. Ties
 // keep fewer splits, then fewer rows.
 TileChoice choose_tile(int64_t m, int64_t n, int64_t k, int sms) {
