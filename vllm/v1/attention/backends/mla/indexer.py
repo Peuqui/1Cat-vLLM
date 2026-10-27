@@ -397,7 +397,7 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     max_model_len = vllm_config.model_config.max_model_len
     # The buffer gathers the keys of every request in a prefill chunk, so more
     # than max_num_seqs sequences of max_model_len never need room (a
-    # single-sequence engine at 1M tokens would reserve 5.5 GiB for nothing).
+    # single-sequence engine at 1M tokens would reserve 5.16 GiB for nothing).
     # NOTE(Chen): 40 is a magic number for controlling the prefill buffer size.
     # Each entry is 128 fp8 bytes and 4 scale bytes for a total of 132 bytes.
     # The flashmla_sparse backend uses a workspace size of 5 * max_model_len.

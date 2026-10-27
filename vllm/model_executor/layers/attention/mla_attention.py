@@ -241,7 +241,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
-from vllm.utils.math_utils import cdiv, round_down
+from vllm.utils.math_utils import cdiv, round_down, round_up
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -1429,7 +1429,12 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             scheduler_config.max_num_seqs * cache_config.block_size,
         )
 
-        return chunked_prefill_workspace_size
+        # The DCP all-gather splits the workspace evenly across its group; fewer
+        # than 8 requests of an odd max_model_len would not divide.
+        return round_up(
+            chunked_prefill_workspace_size,
+            vllm_config.parallel_config.decode_context_parallel_size,
+        )
 
     @staticmethod
     def determine_prefill_query_data_type(
