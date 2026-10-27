@@ -199,6 +199,19 @@ def _freeze_tuning_plan(device: torch.device) -> int:
     return sm70_native_cache.freeze_tuning(device_hint)
 
 
+def _freeze_tuning_if_requested(worker: Worker, device: torch.device) -> None:
+    if not worker.vllm_config.kernel_config.sm70_runtime.value(
+        "freeze_tuning_after_warmup"
+    ):
+        return
+    logger.info(
+        "SM70 TurboMind tuning frozen after warmup: %d measured shapes "
+        "final for the service lifetime on device %s.",
+        _freeze_tuning_plan(device),
+        device,
+    )
+
+
 def _run_coordinated_dense_warmup(
     warmup: Callable[[], Any],
     device: torch.device,
@@ -1357,12 +1370,4 @@ def _sm70_awq_warmup(worker: Worker) -> None:
             exported_records,
             device,
         )
-    if worker.vllm_config.kernel_config.sm70_runtime.value(
-        "freeze_tuning_after_warmup"
-    ):
-        logger.info(
-            "SM70 TurboMind tuning frozen after warmup: %d measured shapes "
-            "final for the service lifetime on device %s.",
-            _freeze_tuning_plan(device),
-            device,
-        )
+    _freeze_tuning_if_requested(worker, device)

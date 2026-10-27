@@ -766,6 +766,24 @@ def test_freeze_makes_the_measured_plan_final(monkeypatch):
     assert frozen[0].device == device and frozen[0].numel() == 0
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_freeze_runs_only_with_the_switch(monkeypatch, enabled):
+    frozen = []
+
+    def fake_freeze(device):
+        frozen.append(device)
+        return 0
+
+    monkeypatch.setattr(warmup, "_freeze_tuning_plan", fake_freeze)
+    runtime = Sm70RuntimeConfig(freeze_tuning_after_warmup=enabled)
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(kernel_config=SimpleNamespace(sm70_runtime=runtime))
+    )
+    device = torch.device("cpu")
+    warmup._freeze_tuning_if_requested(worker, device)
+    assert frozen == ([device] if enabled else [])
+
+
 def test_warmup_runs_inside_the_workers_config_context(monkeypatch):
     # Outside the context the warmup captures default native policies, a
     # partition the layers never dispatch in.
