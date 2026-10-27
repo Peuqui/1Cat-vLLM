@@ -657,8 +657,8 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        # The kernels are written for SM70 (mma.m8n8k4) and tested on SM70 and
-        # SM75. The capability comes from this worker's own device: on a node
+        # The kernels run mma.m8n8k4 on SM70 and m16n8k8 on SM75, tested on
+        # both. The capability comes from this worker's own device: on a node
         # that mixes card generations, device 0 answers for another card.
         if not current_platform.is_cuda() or not torch.accelerator.is_available():
             return False
