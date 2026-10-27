@@ -660,6 +660,7 @@ class FP8QPN8LinearState:
         group_scales: torch.Tensor,
         output_size: int,
         split_k: int,
+        decode_split_k: int,
         accumulator_chains: int,
         prefetch_codes: bool,
         sm75_mma: bool = False,
@@ -668,30 +669,38 @@ class FP8QPN8LinearState:
         self.group_scales = group_scales
         self.output_size = output_size
         self.split_k = split_k
+        self.decode_split_k = decode_split_k
         self.accumulator_chains = accumulator_chains
         self.prefetch_codes = prefetch_codes
         # Turing's tensor-core GEMM serves M above 8 without rebuilding the
         # FP16 weight; it takes row-group scales on N, K multiples of 128.
         self.sm75_mma = sm75_mma
 
+    def split_k_for(self, m: int) -> int:
+        """The occupancy-fitted split for the M <= 8 launch it was measured
+        on; the table split for the M16 and M32 bodies, whose native M=17..32
+        candidate only takes split-K 12 or 16."""
+        return self.decode_split_k if m <= QPN8_OCCUPANCY_MAX_M else self.split_k
 
-def fp8_qpn8_launch_config(
-    k: int, n: int, device: torch.device
-) -> tuple[int, int, bool]:
+
+def fp8_qpn8_launch_config(k: int) -> tuple[int, int, bool]:
     """Split-K, accumulator chains and code prefetch for a QPN8 GEMM.
 
-    The dispatcher admits split-K up to 16; the measured Qwen3.8 shapes use
-    16 (K = 5120) and 12 (K = 1536) with two accumulator chains.
+    The dispatcher admits split-K up to 16; the table takes the largest of
+    16, 12 and 8 that divides K's 16-element code groups, with two
+    accumulator chains.
     """
     groups = k // QPN2_GROUP_SIZE
     for split_k in (16, 12, 8):
         if groups % split_k == 0:
-            return fp8_qpn8_occupancy_split_k(k, n, split_k, device), 2, False
+            return split_k, 2, False
     raise RuntimeError(f"no QPN8 launch configuration for K={k}")
 
 
 # One CTA of the M <= 8 QPN8 GEMM covers this many output columns.
 _QPN8_COLUMNS_PER_CTA = 32
+# fp8_qpn8_occupancy_split_k was measured for the M <= 8 QPN8 GEMM only.
+QPN8_OCCUPANCY_MAX_M = 8
 
 
 def fp8_qpn8_occupancy_split_k(
@@ -814,9 +823,7 @@ def _prepare_fp8_qpn8_linear(
     layer.register_buffer(
         "_sm70_turing_fp8_packed_scales", group_scales, persistent=False
     )
-    split_k, accumulator_chains, prefetch_codes = fp8_qpn8_launch_config(
-        k, n, codes.device
-    )
+    split_k, accumulator_chains, prefetch_codes = fp8_qpn8_launch_config(k)
     setattr(
         layer,
         FP8_QPN8_STATE_ATTR,
@@ -825,6 +832,7 @@ def _prepare_fp8_qpn8_linear(
             group_scales,
             n,
             split_k,
+            fp8_qpn8_occupancy_split_k(k, n, split_k, codes.device),
             accumulator_chains,
             prefetch_codes,
             sm75_mma=(
@@ -859,7 +867,7 @@ def apply_prepared_fp8_qpn8_linear(
         state.codes,
         state.group_scales,
         state.output_size,
-        state.split_k,
+        state.split_k_for(reshaped_x.shape[0]),
         state.accumulator_chains,
         state.prefetch_codes,
         state.sm75_mma,

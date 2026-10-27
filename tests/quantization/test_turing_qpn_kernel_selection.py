@@ -357,11 +357,19 @@ def test_qpn8_split_k_follows_device_occupancy(
     assert tm.fp8_qpn8_occupancy_split_k(k, n, split_k, device) == expected
 
 
-def test_qpn8_per_tensor_launch_config_follows_occupancy(monkeypatch):
+def test_qpn8_per_tensor_occupancy_split_only_up_to_m8():
     from vllm.model_executor.layers.quantization import sm70_turbomind as tm
 
-    properties = NS(multi_processor_count=72, max_threads_per_multi_processor=1024)
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: properties)
-    device = torch.device("cuda", 0)
-    assert tm.fp8_qpn8_launch_config(4096, 512, device) == (16, 2, False)
-    assert tm.fp8_qpn8_launch_config(3072, 5120, device) == (8, 2, False)
+    assert tm.fp8_qpn8_launch_config(4096) == (16, 2, False)
+    assert tm.fp8_qpn8_launch_config(576) == (12, 2, False)
+    # RTX 8000, K 3072 / N 5120: split 8 fits the M <= 8 grid into one wave;
+    # the M16 and M32 bodies keep the table split (M=17..32 takes 12 or 16).
+    state = tm.FP8QPN8LinearState(torch.empty(0), torch.empty(0), 5120, 16, 8, 2, False)
+    assert [state.split_k_for(m) for m in (1, 8, 9, 16, 17, 32)] == [
+        8,
+        8,
+        16,
+        16,
+        16,
+        16,
+    ]
