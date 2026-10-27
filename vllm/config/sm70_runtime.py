@@ -64,12 +64,12 @@ class Sm70RuntimeConfig:
     gemm_lut_path: str | None = None
     """Optional tuning-cache template; device/rank expansion remains worker-local."""
     freeze_tuning_after_warmup: bool = False
-    """Make the plan TurboMind measured during warmup authoritative for the
-    service lifetime on this device (export and import it): later calls reuse
-    the measured plan of the nearest shape instead of measuring a new shape on
-    the first request that brings it (which made the first long DeepSeek-V4
-    prefills after a boot up to 2.2 s slower and the kernel choice depend on
-    the request order)."""
+    """Mark the plan TurboMind measured during warmup final for the service
+    lifetime on this device: a shape the warmup did not measure reuses the next
+    larger measured plan (else the heuristic) instead of being measured on the
+    first request that brings it, which slowed the first DeepSeek-V4 prefills
+    of some lengths after a boot by 1.4 to 3.7 s and made the kernel choice
+    depend on the request order."""
     errors: dict[str, str] = Field(default_factory=dict, init=False)
     """Deferred errors for options skipped by the original warmup gates."""
 

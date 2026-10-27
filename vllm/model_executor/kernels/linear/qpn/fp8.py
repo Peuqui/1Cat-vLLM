@@ -38,7 +38,8 @@ _SM70_FP8_PREFILL_DENSE_MIN_M = 3920
 # Grouped BMMs (DeepSeek-V4 wo_a) run as one TurboMind grouped GEMM up to this
 # many tokens per group, the decode and speculative verification sizes; one
 # launch per group reads each group's weights with a GEMM tile sized for
-# prefill (V100, 8 groups of 1024 x 4096 at 6 tokens: 195 µs vs 51 µs).
+# prefill (V100, 8 groups of 1024 x 4096 at 6 tokens: eight launches 195 µs,
+# one grouped launch 125 µs, 51 µs with the small-shape tuning).
 SM70_FP8_GROUPED_DECODE_MAX_TOKENS = 16
 _SM70_FP8_EXACT_8K_PREFILL_M = 8000
 _SM70_FP8_EXACT_8K_PREFILL_SHAPES = {
