@@ -9,7 +9,7 @@ W[gids[g]].T`` for the slots of every expert group (``perm``, ``gids``,
 decodes every weight tile again for each 8-row block; here one program takes
 BLOCK_M rows of one expert group and BLOCK_N packed columns, so a decoded tile
 serves BLOCK_M rows. That pays off once a prefill chunk gives the experts more
-than 16 rows on average. Programs map to row blocks, not to groups, so a
+than 13 rows on average. Programs map to row blocks, not to groups, so a
 popular expert spreads over as many programs as it has blocks instead of
 leaving one program as the straggler; routing is skewed, so each group takes
 the row tile that fits its size (one launch per tile size).
@@ -24,8 +24,11 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-# More rows per expert than this take the Triton kernel (hand kernel below).
-TRITON_MIN_ROWS_PER_EXPERT = 16
+# More rows per expert on average than this take the Triton kernel, the hand
+# kernel the rest. Measured on a V100 with DeepSeek-V4-Flash layer 5 (W13 + W2,
+# Zipf skew 0 / 0.8 / 1.2): Triton is 0.3-1.5 % slower at 12.9 rows per expert,
+# 0.7-5.9 % faster at 13.8 and 16-23 % faster at 23.9.
+TRITON_MIN_ROWS_PER_EXPERT = 13
 # Groups by size: (more than, at most) rows, and the tile (BLOCK_M, BLOCK_N,
 # BLOCK_K, warps) for W13 (token-major x) and W2 (slot-major x). Measured on the
 # M8N8K4 cards with a DeepSeek-V4-Flash layer (256 experts, top-6) under uniform and

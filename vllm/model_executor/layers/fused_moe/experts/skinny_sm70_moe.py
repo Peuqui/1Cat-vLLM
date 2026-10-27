@@ -901,7 +901,7 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         for launches that do not decode the planes in place.
         """
         # Volta's hand kernel decodes every weight tile again for each 8-row
-        # block; past 16 rows per expert on average the Triton kernel, which
+        # block; past 13 rows per expert on average the Triton kernel, which
         # decodes a tile once per row block, is faster.
         if (
             self._triton_tensor_cores
