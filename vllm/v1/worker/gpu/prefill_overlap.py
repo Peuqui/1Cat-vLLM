@@ -173,7 +173,9 @@ class PrefillOverlap:
     def check_model(model: torch.nn.Module) -> None:
         """Reject models whose forward the two halves cannot share: MoE layers
         dispatch without the micro-batch hooks, and deepstack vision features
-        live in a model buffer indexed from token 0 in each half."""
+        live in a model buffer indexed from token 0 in each half (Qwen3-VL
+        counts their levels in deepstack_num_level, Granite 4 Vision lists the
+        layers that read them in _ds_layer_indices)."""
         # Imported here: the MoE layer pulls in the model executor.
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 
@@ -183,7 +185,9 @@ class PrefillOverlap:
                     "kernel_config.tp_prefill_overlap_min_tokens supports "
                     "dense models only; this model has MoE layers."
                 )
-            if getattr(module, "deepstack_num_level", 0) > 0:
+            if getattr(module, "deepstack_num_level", 0) > 0 or getattr(
+                module, "_ds_layer_indices", None
+            ):
                 raise ValueError(
                     "kernel_config.tp_prefill_overlap_min_tokens cannot split "
                     "the deepstack visual features of this model."

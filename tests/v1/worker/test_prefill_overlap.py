@@ -152,6 +152,8 @@ def test_overlap_rejects_moe_and_deepstack_models():
         PrefillOverlap.check_model(model_of(object.__new__(FusedMoE)))
     with pytest.raises(ValueError, match="deepstack"):
         PrefillOverlap.check_model(model_of(SimpleNamespace(deepstack_num_level=3)))
+    with pytest.raises(ValueError, match="deepstack"):
+        PrefillOverlap.check_model(model_of(SimpleNamespace(_ds_layer_indices=[0, 1])))
     # A vision tower without deepstack levels (Qwen3.5) splits like text.
     PrefillOverlap.check_model(model_of(SimpleNamespace(deepstack_num_level=0)))
 

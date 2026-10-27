@@ -717,10 +717,10 @@ class FlashAttentionImpl(AttentionImpl):
         """Whether this batch takes `paged_prefill_attention_sm75`.
 
         Turing only (the query's own device): FA2's Turing build runs causal
-        head-dim-256 prefills over an fp16 paged cache at about a quarter of
-        the m16n8k8 rate, while newer cards have their own FA2 kernels. The
-        kernel takes pages of 16, 32 or 64 tokens and forms 32-bit cache
-        offsets; other caches stay on FA2.
+        head-dim-256 prefills over an fp16 paged cache at about a third of
+        the m16n8k8 kernel's rate (23 against 61 TFLOPS), while newer cards
+        have their own FA2 kernels. The kernel takes pages of 16, 32 or 64
+        tokens and forms 32-bit cache offsets; other caches stay on FA2.
         """
         largest_offset = key_cache.size(3) + sum(
             (key_cache.size(d) - 1) * key_cache.stride(d) for d in range(3)

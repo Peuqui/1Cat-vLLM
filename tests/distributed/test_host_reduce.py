@@ -152,3 +152,11 @@ def test_host_reduce_copy_engine_matches_nccl():
     failures = ctx.Queue()
     mp.spawn(_copy_engine_worker, args=(port, failures), nprocs=2, join=True)
     assert failures.empty()
+
+
+def test_copy_engine_limit_must_exceed_the_kernel_limit():
+    # The copy-engine mode serves payloads above max_bytes only.
+    HostReduceConfig(max_bytes=262144, copy_engine_max_bytes=0)
+    HostReduceConfig(max_bytes=262144, copy_engine_max_bytes=262160)
+    with pytest.raises(ValueError, match="copy_engine_max_bytes"):
+        HostReduceConfig(max_bytes=262144, copy_engine_max_bytes=262144)
