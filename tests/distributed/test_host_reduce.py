@@ -121,14 +121,14 @@ def _copy_engine_worker(rank: int, port: int, failures) -> None:
             assert torch.equal(got, expected), x.numel()
         too_large = torch.ones(COPY_MAX_BYTES // 2 + 8, device=device).half()
         assert comm.all_reduce(too_large) is None
+        # A captured payload above max_bytes is rejected, so the caller's
+        # next collective serves it; the capture itself must not fail.
         graph = torch.cuda.CUDAGraph()
         static = torch.ones(5120 * 64, device=device).half()
-        try:
-            with torch.cuda.graph(graph):
-                comm.all_reduce(static)
-            raise AssertionError("the copy-engine mode must refuse capture")
-        except RuntimeError as error:
-            assert "cannot be captured" in str(error), error
+        with torch.cuda.graph(graph):
+            assert comm.rejection_reason(static) == "copy_engine_mode_not_capturable"
+            assert comm.all_reduce(static) is None
+        assert comm.rejection_reason(static) is None
     except Exception as exc:  # noqa: BLE001 - reported to the parent
         failures.put(f"rank {rank}: {exc!r}")
         raise

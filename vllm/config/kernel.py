@@ -649,6 +649,15 @@ class HostReduceConfig:
     this size in shared host memory. 0 leaves payloads above max_bytes on
     NCCL."""
 
+    def __post_init__(self) -> None:
+        # The copy-engine mode serves payloads above max_bytes; a smaller limit
+        # would never be reached.
+        if 0 < self.copy_engine_max_bytes <= self.max_bytes:
+            raise ValueError(
+                "host_reduce.copy_engine_max_bytes must be 0 or exceed "
+                f"max_bytes ({self.max_bytes}), got {self.copy_engine_max_bytes}"
+            )
+
 
 @config
 class KernelConfig:

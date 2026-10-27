@@ -170,6 +170,11 @@ class HostReduceCommunicator:
         largest = max(self.policy.max_bytes, self.policy.copy_engine_max_bytes)
         if not 0 < nbytes <= largest or nbytes % 16:
             return "payload_outside_channel"
+        # The copy-engine mode orders its pieces from the host, so a graph
+        # cannot replay it; captured payloads of that size keep the next
+        # collective in the chain.
+        if nbytes > self.policy.max_bytes and torch.cuda.is_current_stream_capturing():
+            return "copy_engine_mode_not_capturable"
         if tensor.data_ptr() % 16:
             return "requires_16_byte_alignment"
         return None
