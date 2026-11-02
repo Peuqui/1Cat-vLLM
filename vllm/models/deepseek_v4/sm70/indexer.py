@@ -384,19 +384,18 @@ def _prefill_index_scores_kernel(
     BLOCK_K: tl.constexpr,
     KEYS_PER_PROGRAM: tl.constexpr,
     KEYS_AS_M: tl.constexpr,
-    ROUND_FP16: tl.constexpr,
 ):
     """Prefill index scores, every head of BLOCK_T tokens in one MMA operand.
 
-        out[t, s] = scale[s] * sum_h w[t, h] * relu(fp16(q[t, h] . k[s]))
+        out[t, s] = scale[s] * sum_h w[t, h] * relu(q[t, h] . k[s])
 
     The heads stack into a [BLOCK_T * NUM_HEADS, 128] query operand that every
     key tile of the program reuses (the indexer is MQA). Keys widen to fp16 as
-    value * 2^-8, the product is taken back by 256 and (ROUND_FP16) rounded to
-    fp16 as the cuBLAS prefill route stores its scores; the decode route keeps
-    the fp32 product, as its cuBLAS route does; relu, head weights and head sum stay in
-    registers and the per-key scale applies to the sum. KEYS_AS_M puts the keys
-    on the MMA's M side instead of the (token, head) rows.
+    value * 2^-8 and the product is taken back by 256 in FP32: without the
+    per-key scale one product can pass fp16's 65504. Relu, head weights and
+    head sum stay in registers and the per-key scale applies to the sum.
+    KEYS_AS_M puts the keys on the MMA's M side instead of the (token, head)
+    rows.
     """
     rows = tl.program_id(0) * BLOCK_T * NUM_HEADS + tl.arange(0, BLOCK_T * NUM_HEADS)
     row_tokens = rows // NUM_HEADS
@@ -425,8 +424,6 @@ def _prefill_index_scores_kernel(
             )
             k = _e4m3_bits_as_scaled_fp16(raw)
             scores = tl.dot(k, q_t) * 256.0
-            if ROUND_FP16:
-                scores = scores.to(tl.float16).to(tl.float32)
             scores = tl.maximum(scores, 0.0) * weights[None, :]
             scores = tl.sum(tl.reshape(scores, (BLOCK_K, BLOCK_T, NUM_HEADS)), axis=2)
             scale = tl.load(k_scale_ptr + keys, mask=key_valid, other=0.0)
@@ -451,8 +448,6 @@ def _prefill_index_scores_kernel(
             )
             k_t = _e4m3_bits_as_scaled_fp16(raw)
             scores = tl.dot(q, k_t) * 256.0
-            if ROUND_FP16:
-                scores = scores.to(tl.float16).to(tl.float32)
             scores = tl.maximum(scores, 0.0) * weights[:, None]
             scores = tl.sum(tl.reshape(scores, (BLOCK_T, NUM_HEADS, BLOCK_K)), axis=1)
             scale = tl.load(k_scale_ptr + keys, mask=key_valid, other=0.0)
@@ -729,7 +724,6 @@ def _prefill_scores_triton(
     weights,
     tensor_cores: bool,
     out: torch.Tensor | None = None,
-    round_fp16: bool = True,
 ):
     num_q, num_heads, head_dim = q.shape
     num_k = k_quant.shape[0]
@@ -762,7 +756,6 @@ def _prefill_scores_triton(
         BLOCK_K=tile.block_k,
         KEYS_PER_PROGRAM=tile.keys_per_program,
         KEYS_AS_M=tile.keys_as_m,
-        ROUND_FP16=round_fp16,
         num_warps=tile.num_warps,
         num_stages=tile.num_stages,
     )
@@ -953,8 +946,8 @@ def _decode_logits_fused(
     and one tensor-core kernel scores every row and head of the request:
     relu, head weights, head sum and key scales stay in registers, so the
     [rows * heads, keys] FP32 score tile of the cuBLAS route (101 MB for six
-    rows, 64 heads and 66k keys) never reaches memory. The FP32 product is
-    kept (no fp16 rounding), as in the cuBLAS route.
+    rows, 64 heads and 66k keys) never reaches memory. The products stay
+    FP32, as in the cuBLAS route.
     """
     total_rows, _, head_dim = q.shape
     num_requests = block_table.shape[0] // table_rows_per_request
@@ -982,7 +975,6 @@ def _decode_logits_fused(
             weights[first : first + rows],
             tensor_cores=True,
             out=out[first : first + rows],
-            round_fp16=False,
         )
     return out
 
