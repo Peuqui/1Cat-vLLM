@@ -1193,11 +1193,13 @@ def test_no_spec_tokens_scheduled_for_prefill_chunks():
     assert len(output.scheduled_spec_decode_tokens[req.request_id]) == num_spec_tokens
 
 
-def test_sync_pp_spec_decode_waits_for_in_flight_step():
+def test_sync_pp_spec_decode_waits_for_in_flight_step(monkeypatch):
     """Sync scheduling under PP keeps several steps in flight, and a step's drafts
     reach the scheduler before its sampled token. A request must not be
     scheduled again in that window: it would carry the drafts without the token
     they follow (draft_len rows for draft_len drafts)."""
+    # Scheduler bookkeeping is CPU-only; do not require two physical GPUs.
+    pretend_gpu_count(monkeypatch, 2)
     num_spec_tokens = 3
     scheduler = create_scheduler(
         num_speculative_tokens=num_spec_tokens,
@@ -1236,10 +1238,12 @@ def test_sync_pp_spec_decode_waits_for_in_flight_step():
     assert after.scheduled_spec_decode_tokens[req.request_id] == [1, 2, 3]
 
 
-def test_sync_pp_spec_decode_waits_when_in_flight_step_drafts_nothing():
+def test_sync_pp_spec_decode_waits_when_in_flight_step_drafts_nothing(monkeypatch):
     """A confidence threshold can cut a step's drafts to none. The request must
     still wait for its in-flight step: its computed tokens already count that
     step's drafts, so scheduling it would yield a negative token count."""
+    # Scheduler bookkeeping is CPU-only; do not require two physical GPUs.
+    pretend_gpu_count(monkeypatch, 2)
     num_spec_tokens = 3
     scheduler = create_scheduler(
         num_speculative_tokens=num_spec_tokens,
