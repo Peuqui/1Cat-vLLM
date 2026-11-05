@@ -284,9 +284,10 @@ class PleOffloadLayer(nn.Module, ABC):
     """
 
     _is_cpu_offloaded = False
-    # Whether this instance built its own resident tables. Decided once by the
-    # guarded constructor while the engine config is current; the forward runs
-    # outside it, where offload_keeps_local_tables() can no longer tell.
+    # Whether the forward gathers this instance's own rows and merges the
+    # worker's rows into them. Decided once by the guarded constructor while the
+    # engine config is current; the forward runs outside it, where
+    # offload_keeps_local_tables() can no longer tell.
     _keeps_local_tables = False
     _gpu_output_buffer: torch.Tensor
     _sem: CpuGpuSemaphore

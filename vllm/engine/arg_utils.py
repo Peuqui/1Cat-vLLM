@@ -540,6 +540,7 @@ class EngineArgs:
         CacheConfig.prefix_cache_retention_interval
     )
     mamba_tail_checkpoint: bool = CacheConfig.mamba_tail_checkpoint
+    partial_prefix_cache: bool = CacheConfig.partial_prefix_cache
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -1191,6 +1192,9 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--mamba-tail-checkpoint", **cache_kwargs["mamba_tail_checkpoint"]
+        )
+        cache_group.add_argument(
+            "--partial-prefix-cache", **cache_kwargs["partial_prefix_cache"]
         )
         cache_group.add_argument(
             "--calculate-kv-scales", **cache_kwargs["calculate_kv_scales"]
@@ -1940,8 +1944,11 @@ class EngineArgs:
                 self.compilation_config.cudagraph_capture_sizes = (
                     cudagraph_capture_sizes
                 )
+                max_tokens = self.max_num_batched_tokens
                 self.compilation_config.max_cudagraph_capture_size = max(
-                    cudagraph_capture_sizes
+                    size
+                    for size in cudagraph_capture_sizes
+                    if max_tokens is None or size <= max_tokens
                 )
                 profile_updates.append(
                     "cudagraph_capture_sizes="
@@ -2031,6 +2038,7 @@ class EngineArgs:
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             prefix_cache_retention_interval=self.prefix_cache_retention_interval,
             mamba_tail_checkpoint=self.mamba_tail_checkpoint,
+            partial_prefix_cache=self.partial_prefix_cache,
             calculate_kv_scales=self.calculate_kv_scales,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,

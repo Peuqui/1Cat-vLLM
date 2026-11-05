@@ -107,6 +107,39 @@ def test_mla_spec_rejects_a_codec_that_contradicts_its_cache_dtype():
         )
 
 
+def test_deepseek_v4_swa_carrier_keeps_its_584_byte_rows_after_merge():
+    """The sliding-window group spec is rebuilt by merge, without a mode.
+
+    Its carrier must still get the packed fp8_ds_mla row: a 512-wide "auto"
+    view also fits the 576-aligned page and would go unnoticed.
+    """
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
+
+    layers = [
+        SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            sliding_window=128,
+            cache_dtype_str="fp8_ds_mla",
+            alignment=576,
+            model_version="deepseek_v4",
+        )
+        for _ in range(2)
+    ]
+    group = SlidingWindowMLASpec.merge(layers)
+    assert group.kv_quant_mode is get_kv_quant_mode("fp8_ds_mla")
+    shape = DeepseekSparseSWABackend.get_kv_cache_shape(
+        num_blocks=3,
+        block_size=group.block_size,
+        num_kv_heads=1,
+        head_size=512,
+        cache_dtype_str=group.layout_cache_dtype("fp8_ds_mla"),
+    )
+    assert shape == (3, 64, 584)
+
+
 @pytest.mark.parametrize("block_size", [32, 64, 128, 256])
 def test_copy_with_new_block_size_keeps_padding_valid(block_size):
     """Growing the block grows the payload; the padded page must keep up.
