@@ -237,8 +237,8 @@ def cat_ubatch_outputs(
     """Concatenate per-ubatch model outputs along the batch dim.
 
     Most models return a single hidden-states tensor per ubatch. Target
-    models running with auxiliary output (e.g. EAGLE3 or DFlash speculative
-    decoding, which collect aux hidden states for the drafter) return a tuple
+    models running with auxiliary output (speculative decoding whose drafter
+    collects aux hidden states, e.g. EAGLE3) return a tuple
     of the hidden states and a list of aux tensors instead. Fan out over the
     tuple and list components, nesting as deep as the model's output goes, so
     `torch.cat` sees matching shapes and the caller receives the same
