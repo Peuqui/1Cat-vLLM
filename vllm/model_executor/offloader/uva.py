@@ -68,7 +68,9 @@ class _HostBuffer:
         finalizer = weakref.finalize(
             self, torch.cuda.cudart().cudaHostUnregister, pointer
         )
-        finalizer.atexit = False
+        # ``atexit`` is a documented writable property; typeshed's __slots__
+        # declaration does not list it.
+        finalizer.atexit = False  # type: ignore[misc]
 
 
 def _share_key(module: nn.Module, qualified_name: str, p: torch.Tensor) -> str | None:
