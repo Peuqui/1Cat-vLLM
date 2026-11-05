@@ -1889,8 +1889,10 @@ def test_eagle_external_hit_ends_on_gpu_replay_boundary(eagle, num_tokens):
     assert req.shared_prefix_boundary == 0  # a complete hit is no junction
     # The same page the GPU retains for this prompt (replay boundary).
     if eagle:
+        # Without lookahead block hashes every EAGLE group also drops its
+        # last block, which is what moves the boundary one page back.
         boundaries = KVCacheCoordinator.get_replay_boundaries(
-            SimpleNamespace(eagle_group_ids={0}),
+            SimpleNamespace(eagle_group_ids={0}, drop_eagle_group_ids={0}),
             SimpleNamespace(num_tokens=num_tokens),
             16,
         )
