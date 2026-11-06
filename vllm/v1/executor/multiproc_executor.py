@@ -20,7 +20,7 @@ from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Lock as LockType
 from threading import Thread
-from typing import Any
+from typing import Any, cast
 
 import cloudpickle
 import torch
@@ -781,8 +781,9 @@ class WorkerProc:
         )
 
         pipes = {handle.ready_pipe: handle for handle in unready_proc_handles}
-        num_workers = len(unready_proc_handles)
-        ready_responses: dict[int, tuple[dict[str, Any], UnreadyWorkerProcHandle]] = {}
+        ready_proc_handles: list[WorkerProcHandle | None] = [None] * len(
+            unready_proc_handles
+        )
         while pipes:
             ready = multiprocessing.connection.wait(pipes.keys())
             for pipe in ready:
@@ -794,8 +795,10 @@ class WorkerProc:
                     if response["status"] != "READY":
                         raise e
 
-                    idx = unready_proc_handle.rank % num_workers
-                    ready_responses[idx] = (response, unready_proc_handle)
+                    idx = unready_proc_handle.rank % len(ready_proc_handles)
+                    ready_proc_handles[idx] = WorkerProc.wait_for_response_handle_ready(
+                        response, unready_proc_handle
+                    )
                 except EOFError:
                     e.__suppress_context__ = True
                     raise e from None
@@ -804,15 +807,7 @@ class WorkerProc:
                     # Close connection.
                     pipe.close()
 
-        # Connect to the response queues only once every worker is ready. A
-        # queue connected before another worker failed would stay open in the
-        # failure traceback; when the garbage collector later finalizes its
-        # ZMQ context, the context no longer sees the socket and blocks in
-        # zmq_ctx_term forever, so the engine process never exits.
-        return [
-            WorkerProc.wait_for_response_handle_ready(*ready_responses[idx])
-            for idx in range(num_workers)
-        ]
+        return cast(list[WorkerProcHandle], ready_proc_handles)
 
     def shutdown(self):
         if self.rpc_broadcast_mq is not None:
