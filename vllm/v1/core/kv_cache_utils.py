@@ -447,11 +447,6 @@ def _gen_mm_extra_hash_keys(
     if last_pos.offset + last_pos.length <= start_token_idx:
         return extra_keys, start_mm_idx
 
-    # Support start_mm_idx == -1 to indicate the last mm input.
-    if start_mm_idx < 0:
-        assert -start_mm_idx <= len(mm_features)
-        start_mm_idx = len(mm_features) + start_mm_idx
-
     curr_mm_idx = start_mm_idx
     while mm_features and curr_mm_idx < len(mm_features):
         mm_feature = mm_features[curr_mm_idx]
@@ -771,13 +766,10 @@ def get_request_block_hasher(
             # Early stop when there no new full blocks created.
             return []
 
+        # Start at the first mm input also when continuing: a block completed
+        # with generated tokens can still hold several mm inputs. Passed inputs
+        # are skipped, and blocks after the last one return early.
         curr_mm_idx = 0
-        if start_token_idx > 0:
-            # Set curr_mm_idx = -1 to indicate the last mm input.
-            # Note that since we reach to this branch only when the block is
-            # completed with generated tokens, we only need to consider the
-            # last mm input.
-            curr_mm_idx = -1
 
         prev_block_hash_value = (
             request.block_hashes[-1] if request.block_hashes else None
