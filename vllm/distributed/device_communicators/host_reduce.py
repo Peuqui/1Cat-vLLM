@@ -123,6 +123,8 @@ class HostReduceCommunicator:
                     reason = "peer_access_available"
         if reason is None:
             self._open()
+            if self.policy.copy_engine_max_bytes:
+                self._probe_copy_engine()
         self.status.update(
             enabled=reason is None,
             reason=reason,
@@ -158,6 +160,33 @@ class HostReduceCommunicator:
         if self.rank == 0:
             os.unlink(paths[0])
         self.status.update(dtype="float16", transport="pinned_host_memory")
+
+    def _probe_copy_engine(self) -> None:
+        """Diagnosis (27B slow-prefill boots, 2026-11-06): copy-engine
+        throughput of the freshly opened channel, 20 exchanges of a prefill
+        half (10 MiB) on both ranks at once."""
+        numel = min(5 * 2**20, self.policy.copy_engine_max_bytes // 2)
+        with torch.accelerator.device_index(self.device.index):
+            x = torch.ones(numel, dtype=torch.float16, device=self.device)
+            out = torch.empty_like(x)
+            torch.ops._C.host_reduce_copy_engine_out(out, x, self.handle)
+            torch.accelerator.synchronize()
+            dist.barrier(group=self.group)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(20):
+                torch.ops._C.host_reduce_copy_engine_out(out, x, self.handle)
+            end.record()
+            end.synchronize()
+            seconds = start.elapsed_time(end) / 1e3
+        logger.info(
+            "Host reduce copy-engine probe on rank %d: %.2f GB/s per direction "
+            "(20 x %.1f MiB).",
+            self.rank,
+            20 * 2 * numel / seconds / 1e9,
+            2 * numel / 2**20,
+        )
 
     def rejection_reason(self, tensor: torch.Tensor) -> str | None:
         if not self.status["enabled"]:
