@@ -332,3 +332,34 @@ def test_composed_schema_converts_object_and_array_params():
         "wait": {"type": "for", "minutes": 2880},
         "patches": [{"op": "replace", "path": "/schedule", "value": "quiet"}],
     }
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_number_schema_preserves_large_integer(streaming):
+    tool = ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "lookup",
+            "parameters": {
+                "type": "object",
+                "properties": {"limit": {"type": "number"}},
+            },
+        },
+    )
+    parser = make_parser(tools=[tool])
+    value = 2**63 - 1
+    model_output = (
+        f"{TC_START}\n"
+        f'{INV_START}lookup">\n'
+        f'{PARAM_START}limit" string="false">{value}{PARAM_END}\n'
+        f"{INV_END}\n"
+        f"{TC_END}"
+    )
+
+    if streaming:
+        args = reconstruct_args(stream(parser, model_output))
+    else:
+        result = parser.extract_tool_calls(model_output, make_request(tools=[tool]))
+        assert result.tools_called
+        args = result.tool_calls[0].function.arguments
+    assert json.loads(args) == {"limit": value}
