@@ -123,8 +123,6 @@ class HostReduceCommunicator:
                     reason = "peer_access_available"
         if reason is None:
             self._open()
-            if self.policy.copy_engine_max_bytes:
-                self._probe_copy_engine()
         self.status.update(
             enabled=reason is None,
             reason=reason,
