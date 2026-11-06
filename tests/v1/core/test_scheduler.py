@@ -4576,3 +4576,20 @@ def test_eagle3_mm_encoder_cache_with_shift():
         f"shifted_end={scheduled_end_with_shift}) overlapping MM at "
         f"{start_pos}. The fix must schedule encoder inputs."
     )
+
+
+def test_new_block_ids_drained_without_kv_cache_zeroing():
+    """Without Mamba layers nothing zeroes new blocks, but the managers still
+    record them; the scheduler must drain the list every step or it grows for
+    the lifetime of the engine (vllm-project/vllm#44490)."""
+    scheduler = create_scheduler(max_num_batched_tokens=64)
+    assert not scheduler.needs_kv_cache_zeroing
+    (request,) = create_requests(num_requests=1, num_tokens=100)
+    scheduler.add_request(request)
+
+    # Two prefill chunks, each allocating blocks.
+    for _ in range(2):
+        output = scheduler.schedule()
+        assert output.new_block_ids_to_zero is None
+        managers = scheduler.kv_cache_manager.coordinator.single_type_managers
+        assert all(not manager.new_block_ids for manager in managers)
