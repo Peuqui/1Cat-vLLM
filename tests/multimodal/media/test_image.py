@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -205,3 +206,56 @@ def test_image_media_io_load_file(tmp_path):
 
     with pytest.raises(ValueError, match="Failed to load image"):
         image_io.load_file(truncated_real_file)
+
+
+def _left_right_image(image_format: str, exif: bytes | None = None) -> bytes:
+    """16x8 image, left half red and right half blue."""
+    image = Image.new("RGB", (16, 8), (0, 0, 255))
+    image.paste((255, 0, 0), (0, 0, 8, 8))
+    buffer = BytesIO()
+    if exif is None:
+        image.save(buffer, format=image_format, quality=95)
+    else:
+        image.save(buffer, format=image_format, quality=95, exif=exif)
+    return buffer.getvalue()
+
+
+def test_image_media_io_applies_exif_orientation():
+    """A JPEG with EXIF orientation 3 (180 degrees) is loaded upright."""
+    exif = Image.Exif()
+    exif[0x0112] = 3  # Orientation
+    result = ImageMediaIO().load_bytes(_left_right_image("JPEG", exif.tobytes()))
+
+    red, _, blue = result.media.getpixel((2, 4))
+    assert blue > 200 and red < 60  # the blue half is now on the left
+
+
+def test_image_media_io_keeps_image_with_broken_exif():
+    """Broken EXIF data does not fail the request; the image stays as stored."""
+    broken_exif = b"Exif\x00\x00" + b"\x00" * 8  # no valid TIFF header
+    data = _left_right_image("PNG", broken_exif)
+    with pytest.raises(SyntaxError):
+        Image.open(BytesIO(data)).getexif()
+
+    result = ImageMediaIO().load_bytes(data)
+
+    assert result.media.getpixel((2, 4)) == (255, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [({}, (255, 255, 255)), ({"rgba_background_color": [0, 255, 0]}, (0, 255, 0))],
+)
+def test_image_media_io_palette_trns_uses_background(kwargs, expected):
+    """Transparent palette entries of a P-mode PNG get the background color."""
+    image = Image.new("P", (4, 4), 1)
+    image.putpalette([255, 0, 0, 0, 0, 255] + [0] * 762)
+    image.putpixel((0, 0), 0)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG", transparency=1)
+
+    result = ImageMediaIO(**kwargs).load_bytes(buffer.getvalue())
+
+    assert result.media.mode == "RGB"
+    assert result.media.getpixel((0, 0)) == (255, 0, 0)
+    assert result.media.getpixel((1, 1)) == expected
