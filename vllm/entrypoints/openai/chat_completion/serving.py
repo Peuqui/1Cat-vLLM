@@ -1034,7 +1034,9 @@ class OpenAIServingChat(OpenAIServing):
                         # finish_reason is:
                         # "tool_calls" for "auto" or "required" tool calls,
                         # and "stop" for named tool calls.
-                        if (
+                        # A call cut off by max_tokens keeps "length", so the
+                        # client can tell its arguments are incomplete.
+                        if output.finish_reason == "stop" and (
                             auto_tools_called
                             or (tools_streamed[i] and not tool_choice_function_name)
                             or (self.use_harmony and harmony_tools_streamed[i])

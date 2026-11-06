@@ -121,8 +121,10 @@ def gptoss_speculative_server(default_server_args: list[str]):
     )
     server_args = default_server_args + [
         "--speculative-config",
-        f'{{"model": "{GPT_OSS_SPECULATOR_NAME}", '
-        f'"method": "eagle3", "num_speculative_tokens": 3}}',
+        (
+            f'{{"model": "{GPT_OSS_SPECULATOR_NAME}", '
+            f'"method": "eagle3", "num_speculative_tokens": 3}}'
+        ),
         f"--attention-backend={attention_backend}",
     ]
     # gpt-oss requires AITER unified attention on ROCm
@@ -1908,7 +1910,13 @@ async def test_tool_choice_validation_without_parser():
 
 
 @pytest.mark.asyncio
-async def test_streaming_n_gt1_independent_tool_parsers():
+@pytest.mark.parametrize(
+    ("engine_finish_reason", "expected_finish_reason"),
+    [("stop", "tool_calls"), ("length", "length")],
+)
+async def test_streaming_n_gt1_independent_tool_parsers(
+    engine_finish_reason: str, expected_finish_reason: str
+):
     """n>1 streaming must use independent parser instances
     and token-id histories per choice.
     """
@@ -2013,7 +2021,7 @@ async def test_streaming_n_gt1_independent_tool_parsers():
                     token_ids=[],
                     cumulative_logprob=0.0,
                     logprobs=None,
-                    finish_reason="stop",
+                    finish_reason=engine_finish_reason,
                 )
                 for choice_idx in range(num_choices)
             ],
@@ -2022,6 +2030,7 @@ async def test_streaming_n_gt1_independent_tool_parsers():
 
     # Collect tool-call deltas per choice from the SSE stream.
     tc_deltas_by_choice: dict[int, list[dict]] = {i: [] for i in range(num_choices)}
+    finish_reasons_by_choice: dict[int, list[str]] = {i: [] for i in range(num_choices)}
     async for chunk_str in serving_chat.chat_completion_stream_generator(
         request=request,
         result_generator=result_generator(),
@@ -2044,6 +2053,8 @@ async def test_streaming_n_gt1_independent_tool_parsers():
                 if delta.get("tool_calls"):
                     for tc in delta["tool_calls"]:
                         tc_deltas_by_choice[idx].append(tc)
+                if choice.get("finish_reason") is not None:
+                    finish_reasons_by_choice[idx].append(choice["finish_reason"])
 
     # Both choices must independently produce the correct tool call.
     for choice_idx in range(num_choices):
@@ -2067,6 +2078,15 @@ async def test_streaming_n_gt1_independent_tool_parsers():
         parsed_args = json.loads(args_buf)
         assert parsed_args == {"city": "Tokyo"}, (
             f"Choice {choice_idx}: expected {{'city': 'Tokyo'}}, got {parsed_args}"
+        )
+
+        reasons = finish_reasons_by_choice[choice_idx]
+        assert len(reasons) == 1, (
+            f"Choice {choice_idx}: expected exactly 1 finish_reason, got {reasons}"
+        )
+        assert reasons[0] == expected_finish_reason, (
+            f"Choice {choice_idx}: expected finish_reason={expected_finish_reason!r}, "
+            f"got '{reasons[0]}'"
         )
 
 
