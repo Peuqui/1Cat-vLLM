@@ -32,7 +32,7 @@ def test_bad_word_preprocessing_matches_gpu_mask(word):
     tokens = ByteTokenizer().encode(word)
     history = tokens[:-1]
     reqs = RequestState(1, 32, 8, 0, 128, device)
-    reqs.add_request("request", 1, [1, *history], len(history), 8)
+    reqs.add_request("request", 1, [1, *history], len(history))
     state = BadWordsState(reqs)
     state.add_request(0, params)
     reqs.apply_staged_writes()

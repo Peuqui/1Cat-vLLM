@@ -104,7 +104,6 @@ def token_range_batch(input_batch: InputBatch, start: int, end: int) -> InputBat
             input_batch.num_computed_prefill_tokens_np[reqs] + cut_before
         ),
         is_prefilling_np=input_batch.is_prefilling_np[reqs],
-        max_seq_len_np=requests(input_batch.max_seq_len_np),
         input_ids=input_batch.input_ids[start:end],
         positions=input_batch.positions[start:end],
         logits_indices=input_batch.logits_indices[:0],

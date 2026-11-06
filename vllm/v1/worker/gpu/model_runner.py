@@ -1099,15 +1099,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._remove_request(req_id)
 
             prompt_len = len(new_req_data.prompt_token_ids)
-            sampling_params = new_req_data.sampling_params
-            max_tokens = 1 if sampling_params is None else sampling_params.max_tokens
-            assert max_tokens is not None
             self.req_states.add_request(
                 req_id=req_id,
                 prompt_len=prompt_len,
                 all_token_ids=new_req_data.prefill_token_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
-                max_tokens=max_tokens,
             )
             req_index = self.req_states.req_id_to_index[req_id]
 
@@ -1300,9 +1296,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if num_reqs_padded > num_reqs:
                 prefix_anchor_lens[num_reqs:].zero_()
 
-        max_seq_len_np = (
-            self.req_states.max_seq_len[idx_mapping_np] if self.use_pp else None
-        )
         return InputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -1325,7 +1318,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prefill_len_np=prefill_len_np,
             num_computed_prefill_tokens_np=num_computed_prefill_tokens_np,
             is_prefilling_np=is_prefilling_np,
-            max_seq_len_np=max_seq_len_np,
             input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
             positions=self.input_buffers.positions[:num_tokens_after_padding],
             logits_indices=logits_indices,

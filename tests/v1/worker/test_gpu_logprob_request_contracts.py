@@ -107,7 +107,7 @@ def test_rejection_sampler_preserves_custom_logprob_ids(
     slots = []
     for i in range(2 if mixed else 1):
         name = str(i)
-        reqs.add_request(name, 2, [1, 5], 2, 8)
+        reqs.add_request(name, 2, [1, 5], 2)
         slot = reqs.req_id_to_index[name]
         slots.append(slot)
         params = (

@@ -96,7 +96,7 @@ def test_full_vocab_logprobs_are_not_the_none_sentinel(vocab_size, mixed, dtype)
     slots = []
     for i, count in enumerate([-1, 2] if mixed else [-1]):
         name = str(i)
-        reqs.add_request(name, 2, [1, 2], 2, 8)
+        reqs.add_request(name, 2, [1, 2], 2)
         slot = reqs.req_id_to_index[name]
         slots.append(slot)
         params = SamplingParams(temperature=0, seed=0, logprobs=count)
@@ -152,7 +152,7 @@ def test_prompt_logprobs_shared_helper_across_chunk_boundary(count):
 @pytest.mark.parametrize("drafts", [[], [7], [7, 8], [7, 8, 7]])
 def test_bad_words_follow_current_draft_prefix(drafts):
     reqs = _request_state(128)
-    reqs.add_request("request", 2, [1, 2, 5], 3, 8)
+    reqs.add_request("request", 2, [1, 2, 5], 3)
     slot = reqs.req_id_to_index["request"]
     state = BadWordsState(reqs)
     words = [[7, 9], [5, 10], [7, 8, 11], [5, 7, 12], [13]]
@@ -198,7 +198,7 @@ def test_min_tokens_graph_replay_crosses_boundary():
 
 def test_bad_words_graph_replay_and_request_slot_reuse():
     reqs = _request_state(128)
-    reqs.add_request("first", 2, [1, 2, 5], 3, 8)
+    reqs.add_request("first", 2, [1, 2, 5], 3)
     slot = reqs.req_id_to_index["first"]
     state = BadWordsState(reqs)
     words = [[7, 9], [5, 10], [7, 8, 11], [8, 7, 12]]
@@ -225,7 +225,7 @@ def test_bad_words_graph_replay_and_request_slot_reuse():
         torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
 
     reqs.remove_request("first")
-    reqs.add_request("second", 2, [1, 2, 5], 3, 8)
+    reqs.add_request("second", 2, [1, 2, 5], 3)
     assert reqs.req_id_to_index["second"] == slot
     state.add_request(slot, SamplingParams())
     reqs.apply_staged_writes()
