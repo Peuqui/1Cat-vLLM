@@ -1512,9 +1512,11 @@ def test_streaming_multi_param_single_chunk(qwen3_tool_parser, qwen3_tokenizer):
         "\n<function=get_current_weather>",
         "\n",  # triggers json_started -> sends "{"
         # This single delta delivers all three parameters at once
-        "<parameter=city>\nDallas\n</parameter>"
-        "\n<parameter=state>\nTX\n</parameter>"
-        "\n<parameter=unit>\nfahrenheit\n</parameter>",
+        (
+            "<parameter=city>\nDallas\n</parameter>"
+            "\n<parameter=state>\nTX\n</parameter>"
+            "\n<parameter=unit>\nfahrenheit\n</parameter>"
+        ),
         "\n</function>",
         "\n</tool_call>",
     ]
@@ -1777,3 +1779,89 @@ def test_adjust_request_required_prefers_structural_tag(
     out = qwen3_tool_parser.adjust_request(req)
     assert out.structured_outputs is not None
     assert out.structured_outputs.structural_tag is not None
+
+
+_WEATHER_CALL = (
+    "<tool_call>\n<function=get_current_weather>\n<parameter=city>\nDallas\n"
+    "</parameter>\n<parameter=state>\nTX\n</parameter>\n</function>\n</tool_call>"
+)
+
+
+def _stream_content_and_calls(parser, tokenizer, model_output, request):
+    content = ""
+    calls: dict[int, dict[str, str]] = {}
+    for delta in stream_delta_message_generator(
+        parser, tokenizer, model_output, request
+    ):
+        content += delta.content or ""
+        for tool_call in delta.tool_calls or []:
+            call = calls.setdefault(tool_call.index, {"name": "", "arguments": ""})
+            if tool_call.function and tool_call.function.name:
+                call["name"] = tool_call.function.name
+            if tool_call.function and tool_call.function.arguments:
+                call["arguments"] += tool_call.function.arguments
+    return content, calls
+
+
+@pytest.mark.parametrize(
+    ("model_output", "expected_content"),
+    [
+        (
+            "<tool_call></tool_call>Content after empty tools.",
+            "Content after empty tools.",
+        ),
+        ('Before.<tool_call>{"name":</tool_call> After.', "Before. After."),
+    ],
+)
+def test_streaming_empty_tool_block_keeps_following_content(
+    qwen3_tool_parser, qwen3_tokenizer, model_output, expected_content
+):
+    """A block that closes without a function header must not swallow the
+    rest of the stream (non-streaming keeps the text as content)."""
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+
+    content, calls = _stream_content_and_calls(
+        qwen3_tool_parser, qwen3_tokenizer, model_output, request
+    )
+    assert content == expected_content
+    assert calls == {}
+
+    extracted = qwen3_tool_parser.extract_tool_calls(model_output, request=request)
+    assert not extracted.tools_called
+    assert extracted.content == model_output
+
+
+def test_streaming_empty_tool_block_before_call(qwen3_tool_parser, qwen3_tokenizer):
+    """A call after an empty block streams with index 0, as in non-streaming."""
+    model_output = "<tool_call></tool_call>\n" + _WEATHER_CALL
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+
+    content, calls = _stream_content_and_calls(
+        qwen3_tool_parser, qwen3_tokenizer, model_output, request
+    )
+    assert content == ""
+    assert list(calls) == [0]
+    assert calls[0]["name"] == "get_current_weather"
+    assert json.loads(calls[0]["arguments"]) == {"city": "Dallas", "state": "TX"}
+
+    extracted = qwen3_tool_parser.extract_tool_calls(model_output, request=request)
+    assert extracted.tools_called
+    assert [call.function.name for call in extracted.tool_calls] == [
+        "get_current_weather"
+    ]
+
+
+def test_streaming_empty_tool_block_in_multi_token_delta(qwen3_tool_parser):
+    """Speculative decoding can deliver the empty block and the text after it
+    in one delta; the text after the block must still arrive."""
+    from tests.tool_parsers.utils import run_tool_extraction_streaming
+
+    reconstructor = run_tool_extraction_streaming(
+        qwen3_tool_parser,
+        ["<tool_call></tool_call>Content after", " empty tools."],
+        ChatCompletionRequest(model=MODEL, messages=[]),
+        assert_one_tool_per_delta=False,
+    )
+
+    assert reconstructor.other_content == "Content after empty tools."
+    assert reconstructor.tool_calls == []
