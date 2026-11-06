@@ -33,6 +33,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    get_tp_group,
     prepare_communication_buffer_for_model,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -1032,6 +1033,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
+        # Diagnosis (27B slow-prefill boots, 2026-11-06): has the host-reduce
+        # copy engine slowed down by the end of the graph capture?
+        host_reduce_comm = getattr(
+            get_tp_group().device_communicator, "host_reduce_comm", None
+        )
+        if (
+            host_reduce_comm is not None
+            and host_reduce_comm.status["enabled"]
+            and host_reduce_comm.policy.copy_engine_max_bytes
+        ):
+            host_reduce_comm._probe_copy_engine()
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:
