@@ -17,6 +17,7 @@ from vllm.model_executor.models.shared_weights import (
     get_target_lm_head as get_target_lm_head,
 )
 from vllm.platforms import current_platform
+from vllm.runtime_resources import share_runtime_resources
 
 logger = init_logger(__name__)
 
@@ -78,6 +79,7 @@ def get_parallel_draft_model(vllm_config: VllmConfig, model_tag: str) -> nn.Modu
             else vllm_config.cache_config
         ),
     )
+    share_runtime_resources(draft_vllm_config, vllm_config)
     with set_model_tag(model_tag):
         return get_model(vllm_config=draft_vllm_config, model_config=draft_model_config)
 
