@@ -1865,3 +1865,46 @@ def test_streaming_empty_tool_block_in_multi_token_delta(qwen3_tool_parser):
 
     assert reconstructor.other_content == "Content after empty tools."
     assert reconstructor.tool_calls == []
+
+
+@pytest.mark.parametrize(
+    ("call_body", "expected_arguments"),
+    [
+        ("", {}),
+        (
+            (
+                "<parameter=city>\nDallas\n</parameter>\n"
+                "<parameter=state>\nTX\n</parameter>\n"
+            ),
+            {"city": "Dallas", "state": "TX"},
+        ),
+    ],
+)
+def test_streaming_call_completed_in_delta_after_skipped_empty_block(
+    qwen3_tool_parser, call_body, expected_arguments
+):
+    """The empty block and the next call's header arrive in one delta, the
+    rest of that call in the next one, then only EOS follows: the call must
+    come out in the delta that skips the empty block (as in non-streaming)."""
+    from tests.tool_parsers.utils import run_tool_extraction_streaming
+
+    deltas = [
+        "<tool_call></tool_call>\n<tool_call>\n<function=get_current_weather>\n",
+        f"{call_body}</function>\n</tool_call>",
+    ]
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+
+    reconstructor = run_tool_extraction_streaming(
+        qwen3_tool_parser, deltas, request, assert_one_tool_per_delta=False
+    )
+    assert len(reconstructor.tool_calls) == 1
+    assert reconstructor.tool_calls[0].function.name == "get_current_weather"
+    assert (
+        json.loads(reconstructor.tool_calls[0].function.arguments) == expected_arguments
+    )
+
+    extracted = qwen3_tool_parser.extract_tool_calls("".join(deltas), request=request)
+    assert [call.function.name for call in extracted.tool_calls] == [
+        "get_current_weather"
+    ]
+    assert json.loads(extracted.tool_calls[0].function.arguments) == expected_arguments

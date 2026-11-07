@@ -138,7 +138,9 @@ class Qwen3CoderToolParser(ToolParser):
         self.skipped_tool_blocks += 1
         self.content_search_start = block_end_idx + len(self.tool_call_end_token)
         if self._current_tool_block() < len(self._tool_start_positions(current_text)):
-            return None
+            # Go on with the next block in this call: it may already be
+            # complete, and a later delta (maybe only EOS) would not get to it.
+            return self._stream_current_tool_block(current_text)
 
         self.is_tool_call_started = False
         # Nothing after the block has been emitted yet: while inside it, the
@@ -706,6 +708,10 @@ class Qwen3CoderToolParser(ToolParser):
                 # Normal content, no tool call
                 return DeltaMessage(content=delta_text)
 
+        return self._stream_current_tool_block(current_text)
+
+    def _stream_current_tool_block(self, current_text: str) -> DeltaMessage | None:
+        """Stream the progress of the <tool_call> block the parser is in."""
         # Check if we're between tool calls (waiting for next one)
         # Count tool calls we've seen vs processed
         tool_start_positions = self._tool_start_positions(current_text)
