@@ -55,6 +55,7 @@ from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
     OpenAIServing,
     clamp_prompt_logprobs,
+    drop_misaligned_logprobs,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
@@ -760,13 +761,13 @@ class OpenAIServingChat(OpenAIServing):
 
                     self._raise_if_error(output.finish_reason, request_id)
 
-                    if request.logprobs and request.top_logprobs is not None:
+                    if request.logprobs:
                         assert output.logprobs is not None, "Did not output logprobs"
                         logprobs = self._create_chat_logprobs(
                             token_ids=output.token_ids,
                             top_logprobs=output.logprobs,
                             tokenizer=tokenizer,
-                            num_output_top_logprobs=request.top_logprobs,
+                            num_output_top_logprobs=request.top_logprobs or 0,
                             return_as_token_id=request.return_tokens_as_token_ids,
                         )
                     else:
@@ -913,6 +914,7 @@ class OpenAIServingChat(OpenAIServing):
                         if (
                             output.finish_reason is None
                             and not request.return_token_ids
+                            and logprobs is None
                         ):
                             continue
                         delta_message = DeltaMessage()
@@ -1195,12 +1197,12 @@ class OpenAIServingChat(OpenAIServing):
             out_logprobs = output.logprobs
             tool_call_info = None
 
-            if request.logprobs and request.top_logprobs is not None:
+            if request.logprobs:
                 assert out_logprobs is not None, "Did not output logprobs"
                 logprobs = self._create_chat_logprobs(
                     token_ids=token_ids,
                     top_logprobs=out_logprobs,
-                    num_output_top_logprobs=request.top_logprobs,
+                    num_output_top_logprobs=request.top_logprobs or 0,
                     tokenizer=tokenizer,
                     return_as_token_id=request.return_tokens_as_token_ids,
                 )
@@ -1257,7 +1259,11 @@ class OpenAIServingChat(OpenAIServing):
                     logprobs=logprobs,
                     finish_reason=(
                         "tool_calls"
-                        if (tool_call_info is not None and tool_call_info.tools_called)
+                        if (
+                            output.finish_reason == "stop"
+                            and tool_call_info is not None
+                            and tool_call_info.tools_called
+                        )
                         else output.finish_reason
                         if output.finish_reason
                         else "stop"
@@ -1469,10 +1475,8 @@ class OpenAIServingChat(OpenAIServing):
             # In OpenAI's API, when a tool is called, the finish_reason is:
             # "tool_calls" for "auto" or "required" tool calls,
             # and "stop" for named tool calls.
-            is_finish_reason_tool_calls = auto_tools_called or (
-                request.tool_choice
-                and request.tool_choice == "required"
-                and output.finish_reason == "stop"
+            is_finish_reason_tool_calls = output.finish_reason == "stop" and (
+                auto_tools_called or request.tool_choice == "required"
             )
 
             # Encode routed_experts for transport. JSON can't carry raw
@@ -1633,6 +1637,7 @@ class OpenAIServingChat(OpenAIServing):
             if return_as_token_id is not None
             else self.return_tokens_as_token_ids
         )
+        top_logprobs = drop_misaligned_logprobs(token_ids, top_logprobs)
         for i, token_id in enumerate(token_ids):
             step_top_logprobs = top_logprobs[i]
             if step_top_logprobs is None or step_top_logprobs.get(token_id) is None:

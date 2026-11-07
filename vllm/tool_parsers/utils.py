@@ -139,40 +139,6 @@ def is_complete_json(input_str: str) -> bool:
         return False
 
 
-def _is_json_finite(obj: Any) -> bool:
-    """Whether *obj* can be serialized to valid JSON.
-
-    ``json.dumps(..., allow_nan=False)`` raises ``ValueError`` on any
-    non-finite float (``inf``/``-inf``/``nan``) anywhere in the value, so this
-    detects non-finite floats nested inside parsed lists/dicts too.
-    """
-    try:
-        json.dumps(obj, allow_nan=False)
-        return True
-    except (ValueError, TypeError):
-        return False
-
-
-def _parse_finite_number(value: str) -> int | float | None:
-    """Parse a finite JSON number; whole values (also "3.0", "1e3") as int.
-
-    int() comes first so that integers above 2**53 stay exact. inf/-inf/nan
-    are not valid JSON numbers and give None (int(float("inf")) would raise
-    OverflowError, json.dumps(inf) would emit invalid JSON "Infinity").
-    """
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        pass
-    try:
-        number = float(value)
-    except (ValueError, TypeError):
-        return None
-    if not math.isfinite(number):
-        return None
-    return int(number) if number.is_integer() else number
-
-
 def consume_space(i: int, s: str) -> int:
     while i < len(s) and s[i].isspace():
         i += 1
@@ -204,13 +170,17 @@ def find_tool_properties(
     return {}
 
 
+def _params_or_empty_object(params: dict[str, Any] | None) -> dict[str, Any]:
+    # Missing or empty parameters still constrain the arguments to an object.
+    return params if params else {"type": "object", "properties": {}}
+
+
 def _get_tool_schema_from_tool(tool: Tool) -> dict:
     name, params = _extract_tool_info(tool)
-    params = params if params else {"type": "object", "properties": {}}
     return {
         "properties": {
             "name": {"type": "string", "enum": [name]},
-            "parameters": params,
+            "parameters": _params_or_empty_object(params),
         },
         "required": ["name", "parameters"],
     }
@@ -237,8 +207,9 @@ def _get_tool_schema_defs(
 
 def _get_json_schema_from_tools(
     tools: list[Tool],
+    parallel_tool_calls: bool | None = None,
 ) -> dict:
-    json_schema = {
+    json_schema: dict[str, Any] = {
         "type": "array",
         "minItems": 1,
         "items": {
@@ -246,6 +217,10 @@ def _get_json_schema_from_tools(
             "anyOf": [_get_tool_schema_from_tool(tool) for tool in tools],
         },
     }
+    # Only an explicit `false` asks for a single call; `None` means the field
+    # was not set and the default (parallel calls allowed) applies.
+    if parallel_tool_calls is False:
+        json_schema["maxItems"] = 1
     json_schema_defs = _get_tool_schema_defs(tools)
     if json_schema_defs:
         json_schema["$defs"] = json_schema_defs
@@ -255,6 +230,7 @@ def _get_json_schema_from_tools(
 def get_json_schema_from_tools(
     tool_choice: str | ToolChoiceFunction | ChatCompletionNamedToolChoiceParam,
     tools: list[Tool] | None,
+    parallel_tool_calls: bool | None = None,
 ) -> str | dict | None:
     # tool_choice: "none"
     if tool_choice in ("none", None) or tools is None:
@@ -267,7 +243,7 @@ def get_json_schema_from_tools(
         tool_map = {tool.name: tool for tool in tools if isinstance(tool, FunctionTool)}
         if tool_name not in tool_map:
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
-        return tool_map[tool_name].parameters
+        return _params_or_empty_object(tool_map[tool_name].parameters)
     # tool_choice: Forced Function (ChatCompletion)
     if (not isinstance(tool_choice, str)) and isinstance(
         tool_choice, ChatCompletionNamedToolChoiceParam
@@ -280,10 +256,10 @@ def get_json_schema_from_tools(
         }
         if tool_name not in tool_map:
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
-        return tool_map[tool_name].function.parameters
+        return _params_or_empty_object(tool_map[tool_name].function.parameters)
     # tool_choice: "required"
     if tool_choice == "required":
-        return _get_json_schema_from_tools(tools)
+        return _get_json_schema_from_tools(tools, parallel_tool_calls)
     # tool_choice: "auto"
     return None
 
@@ -556,6 +532,40 @@ _TYPE_ALIASES: dict[str, str] = {
     "list": "array",
     "sequence": "array",
 }
+
+
+def _is_json_finite(obj: Any) -> bool:
+    """Whether *obj* can be serialized to valid JSON.
+
+    ``json.dumps(..., allow_nan=False)`` raises ``ValueError`` on any
+    non-finite float (``inf``/``-inf``/``nan``) anywhere in the value, so this
+    detects non-finite floats nested inside parsed lists/dicts too.
+    """
+    try:
+        json.dumps(obj, allow_nan=False)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _parse_finite_number(value: str) -> int | float | None:
+    """Parse a finite JSON number; whole values (also "3.0", "1e3") as int.
+
+    int() comes first so that integers above 2**53 stay exact. inf/-inf/nan
+    are not valid JSON numbers and give None (int(float("inf")) would raise
+    OverflowError, json.dumps(inf) would emit invalid JSON "Infinity").
+    """
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        pass
+    try:
+        number = float(value)
+    except (ValueError, TypeError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return int(number) if number.is_integer() else number
 
 
 def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:

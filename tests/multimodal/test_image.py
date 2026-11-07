@@ -8,11 +8,7 @@ import numpy as np
 import pytest
 from PIL import Image, ImageChops
 
-from vllm.multimodal.image import (
-    _has_transparency,
-    convert_image_mode,
-    normalize_image,
-)
+from vllm.multimodal.image import convert_image_mode, normalize_image
 
 pytestmark = pytest.mark.cpu_test
 
@@ -60,7 +56,6 @@ def test_palette_with_trns_to_rgb():
     img.putpixel((1, 0), 1)
     img.info["transparency"] = 1
 
-    assert _has_transparency(img)
     converted = convert_image_mode(img, "RGB")
     assert converted.mode == "RGB"
     r, g, b = converted.getpixel((1, 0))
@@ -72,7 +67,6 @@ def test_palette_with_trns_to_rgb():
 def test_l_mode_no_trns_to_rgb():
     """L-mode without transparency should convert directly."""
     img = Image.new("L", (4, 4), 128)
-    assert not _has_transparency(img)
     converted = convert_image_mode(img, "RGB")
     assert converted.mode == "RGB"
     assert converted.getpixel((0, 0)) == (128, 128, 128)
