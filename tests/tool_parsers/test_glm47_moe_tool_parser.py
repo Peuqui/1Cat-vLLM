@@ -149,6 +149,31 @@ class TestGlm47Streaming:
             )
         assert len(glm47_tool_parser.prev_tool_call_arr) >= 1
 
+    def test_no_args_name_reaches_the_client(self, glm47_tool_parser, mock_request):
+        """The call without arguments must be sent, not only recorded inside.
+
+        ``<tool_call>func</tool_call>`` has neither a newline nor an
+        ``<arg_key>`` after the name; the streamed name used to wait for one
+        and the client got ``finish_reason=tool_calls`` without any call.
+        """
+        _reset(glm47_tool_parser)
+        sent = []
+        current_text = ""
+        for chunk in ["Ich schaue nach. ", "<tool_call>", "scheduler_list", "</tool_call>"]:
+            current_text += chunk
+            delta = glm47_tool_parser.extract_tool_calls_streaming(
+                previous_text="",
+                current_text=current_text,
+                delta_text=chunk,
+                previous_token_ids=[],
+                current_token_ids=[],
+                delta_token_ids=[],
+                request=mock_request,
+            )
+            if delta is not None:
+                sent.extend(delta.tool_calls)
+        assert [call.function.name for call in sent if call.function.name] == ["scheduler_list"]
+
     def test_with_args(self, glm47_tool_parser, mock_request):
         _reset(glm47_tool_parser)
         chunks = [
