@@ -26,7 +26,6 @@ class DeepSeekV4ToolParser(DeepSeekV32ToolParser):
         "<｜DSML｜tool>",
     )
     tool_call_end_token: str = "</｜DSML｜tool_calls>"
-    ignored_tool_call_tags: tuple[str, ...] = ("function_calls",)
 
     def get_structural_tag(self, request: ChatCompletionRequest):
         return get_model_structural_tag(

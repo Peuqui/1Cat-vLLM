@@ -152,8 +152,8 @@ def test_extract_tool_calls():
 
 
 def test_function_calls_wrapper_is_not_recognized():
-    # Preserve the V4 dialect boundary while recovering genuinely bare invokes.
-    # An explicit V3.2 container and its contents pass through together.
+    # The V3.2 wrapper is not a V4 terminal, so it passes through as content,
+    # but the invoke inside it is still parsed (tool calls anchor on the invoke).
     parser = make_parser()
     model_output = build_tool_call("search", {"query": "vllm"}).replace(
         "tool_calls", "function_calls"
@@ -161,9 +161,9 @@ def test_function_calls_wrapper_is_not_recognized():
 
     result = parser.extract_tool_calls(model_output, make_request())
 
-    assert not result.tools_called
-    assert result.tool_calls == []
-    assert result.content == model_output
+    assert result.tools_called
+    assert result.tool_calls[0].function.name == "search"
+    assert result.content == "<｜DSML｜function_calls>\n"
 
 
 def test_missing_tool_calls_wrapper_is_recovered():
@@ -554,18 +554,22 @@ def test_missing_string_attribute_uses_schema_type(streaming):
 
 @pytest.mark.parametrize("chunk_size", [0, 1, 7])
 @pytest.mark.parametrize("followed_by_valid_call", [False, True])
-def test_function_calls_block_is_not_accepted(chunk_size, followed_by_valid_call):
+def test_invoke_inside_function_calls_block_is_recognized(
+    chunk_size, followed_by_valid_call
+):
+    # As in upstream vLLM: the V3.2 wrapper stays content, the invoke inside it
+    # is still a call, streamed and complete alike, and a V4 block after it too.
     parser = make_parser()
     model_output = build_tool_call("search", {"query": "vllm"}).replace(
         "tool_calls", "function_calls"
     )
-
-    ignored = model_output
+    expected_names = ["search"]
     if followed_by_valid_call:
         model_output += build_tool_call("accepted", {"query": "current"})
+        expected_names.append("accepted")
     if chunk_size:
         deltas = stream(parser, model_output, chunk_size)
-        assert "".join(delta.content or "" for delta in deltas) == ignored
+        content = "".join(delta.content or "" for delta in deltas)
         names = [
             call.function.name
             for delta in deltas
@@ -574,10 +578,11 @@ def test_function_calls_block_is_not_accepted(chunk_size, followed_by_valid_call
         ]
     else:
         result = parser.extract_tool_calls(model_output, make_request())
-        assert result.content == ignored
-        assert result.tools_called is followed_by_valid_call
+        assert result.tools_called
+        content = result.content
         names = [call.function.name for call in result.tool_calls]
-    assert names == (["accepted"] if followed_by_valid_call else [])
+    assert content == "<｜DSML｜function_calls>\n"
+    assert names == expected_names
 
 
 @pytest.mark.parametrize("streaming", [False, True])
