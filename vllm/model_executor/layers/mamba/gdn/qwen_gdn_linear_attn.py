@@ -132,6 +132,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.platforms.compiled_capability import is_sm70_device
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -2883,7 +2884,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         supports_direct = getattr(direct_target, "supports_direct_output", None)
         direct_write = bool(
             output is not None
-            and current_platform.is_device_capability(70)
+            and is_sm70_device(output.device.index)
             and (
                 getattr(self, "enable_sm70_dflash2_fused_gdn_verify", False)
                 or not torch.compiler.is_compiling()
