@@ -8,18 +8,11 @@ from vllm import ir
 from vllm.config.execution_policy import graph_policy
 from vllm.config.sm70_dflash2 import sm70_dflash2_enabled
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
+from vllm.platforms.compiled_capability import is_sm70_device
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
-
-
-@torch.compiler.assume_constant_result
-def _sm70_gated_norm_device_supported(device_id: int | None) -> bool:
-    # Capability is static for the device guarded by the compiled tensor input.
-    # Do not trace the platform's cached NVML/PyTorch capability query.
-    return current_platform.is_device_capability(70, device_id=device_id)
 
 
 @torch.compiler.assume_constant_result
@@ -144,7 +137,7 @@ def _use_sm70_dflash2_fixed_gemma_rms(
     return bool(
         sm70_dflash2_enabled("fixed_gemma_rms", policy)
         and (graph if graph is not None else graph_policy()).compile_graph
-        and _sm70_gemma_long_prefill_available()
+        and is_sm70_device(None)
         and x.is_cuda
         and x.dtype == torch.float16
         and x.ndim == 2
@@ -261,9 +254,9 @@ def _use_sm70_dflash2_gemma_fused_add_rms(
     return bool(
         sm70_dflash2_enabled("fused_gemma_rms", policy)
         and (graph if graph is not None else graph_policy()).compile_graph
-        # Keep the cached platform query out of the AOT fullgraph. The helper
-        # below is explicitly constant-foldable by Dynamo.
-        and _sm70_gemma_long_prefill_available()
+        # Keep the cached platform query out of the AOT fullgraph:
+        # is_sm70_device is constant-foldable by Dynamo.
+        and is_sm70_device(None)
         and residual is not None
         and x.is_cuda
         and x.dtype == torch.float16
@@ -281,11 +274,6 @@ def _use_sm70_dflash2_gemma_fused_add_rms(
         and residual.is_contiguous()
         and weight.is_contiguous()
     )
-
-
-@torch.compiler.assume_constant_result
-def _sm70_gemma_long_prefill_available() -> bool:
-    return current_platform.is_device_capability(70)
 
 
 def _sm70_gemma_rms_norm_eager(
@@ -410,7 +398,7 @@ def use_long_prefill_fused(
         policy.gemma_long_prefill_fused
         and residual is not None
         and x.is_cuda
-        and _sm70_gemma_long_prefill_available()
+        and is_sm70_device(None)
         and x.dtype == torch.float16
         and residual.dtype == torch.float32
         and weight.dtype in (torch.float16, torch.bfloat16, torch.float32)

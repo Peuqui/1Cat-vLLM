@@ -26,18 +26,11 @@ from vllm.config.speculative_sampling import mtp_batch_enabled
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.platforms import current_platform
+from vllm.platforms.compiled_capability import is_sm70_device
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
-
-
-@torch.compiler.assume_constant_result
-def _volta_device(device_id: int | None) -> bool:
-    # The GDN projection split runs inside the compiled backbone. Capability is
-    # static for the device of the traced tensors; tracing the platform's
-    # cached capability query fails the full-graph compile.
-    return current_platform.is_device_capability(70, device_id=device_id)
 
 
 class _GemvPlan(NamedTuple):
@@ -169,7 +162,7 @@ def _can_fuse_gdn_projection_split(qkvz: torch.Tensor, ba: torch.Tensor) -> bool
         and qkvz.is_cuda
         and ba.is_cuda
         and qkvz.device == ba.device
-        and _volta_device(qkvz.device.index)
+        and is_sm70_device(qkvz.device.index)
     )
 
 
