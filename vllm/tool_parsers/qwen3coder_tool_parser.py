@@ -139,10 +139,19 @@ class Qwen3CoderToolParser(ToolParser):
         text after it, so neither content nor later calls are lost."""
         self.skipped_tool_blocks += 1
         self.content_search_start = block_end_idx + len(self.tool_call_end_token)
-        if self._current_tool_block() < len(self._tool_start_positions(current_text)):
-            # Go on with the next block in this call: it may already be
-            # complete, and a later delta (maybe only EOS) would not get to it.
-            return self._stream_current_tool_block(current_text)
+        # A buffered/speculative delta can contain many closed empty blocks.
+        # Scan those iteratively so recovery does not consume Python frames.
+        starts = self._tool_start_positions(current_text)
+        while self._current_tool_block() < len(starts):
+            start = starts[self._current_tool_block()]
+            end = current_text.find(self.tool_call_end_token, start)
+            if end == -1:
+                return self._stream_current_tool_block(current_text)
+            block = current_text[start : end + len(self.tool_call_end_token)]
+            if self.tool_call_prefix in block:
+                return self._stream_current_tool_block(current_text)
+            self.skipped_tool_blocks += 1
+            self.content_search_start = end + len(self.tool_call_end_token)
 
         self.is_tool_call_started = False
         # Nothing after the block has been emitted yet: while inside it, the

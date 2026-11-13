@@ -76,6 +76,12 @@ def _restore_bundled_prefill_operands(
         tl.store(OutScales + index, effective * 16384.0, index < ScaleCount)
 
 
+@torch.compiler.assume_constant_result
+def _native_decode_rows() -> int:
+    capacity = getattr(torch.ops._C, "nvfp4_qpn2_max_rows_sm70", None)
+    return int(capacity()) if capacity is not None else 32
+
+
 def _dispatch(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -91,14 +97,14 @@ def _dispatch(
 
     # Keep M dispatch opaque: compiled token ranges include both decode and
     # prefill. Native QPN2 codes and E4M3 scales are the only resident layout.
-    if x.shape[0] <= 32:
+    if x.shape[0] <= _native_decode_rows():
         # Retune only the single-request gated shape; preserve the admitted
         # two-chain batch reductions for concurrent requests.
         if (
             x.shape[0] <= 8
             and gated_silu
             and x.shape[1] == 5120
-            and out.shape[1] == 4352
+            and out.shape[1] in (4352, 8704)
         ):
             accumulator_chains = 1
         op = (
@@ -121,12 +127,14 @@ def _dispatch(
     k = x.shape[1]
     n = out.shape[1] * (2 if gated_silu else 1)
     workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes)
+    if workspace is not None and workspace.numel() < k * n:
+        workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes, k * n)
     if workspace is None or workspace.numel() < k * n:
         raise RuntimeError("Native QPN2 prefill workspace is unavailable")
     device = codes.device.index
     assert device is not None
     scale_workspace = _scale_workspaces.get(device)
-    if scale_workspace is None:
+    if scale_workspace is None or scale_workspace.numel() < workspace.numel() // 16:
         scale_workspace = torch.empty(
             workspace.numel() // 16, dtype=torch.float16, device=codes.device
         )
@@ -187,4 +195,70 @@ register_policy_op(
     "str[]? native_policy=None) -> ()",
     _dispatch,
     _dispatch_fake,
+)
+
+
+def _bundled_down_dispatch(
+    out,
+    x,
+    codes,
+    bundled_scales,
+    tm_weight,
+    scales,
+    global_scale,
+    split_k,
+    accumulator_chains,
+    tm_scales,
+    group_size,
+    k_ld,
+    q_ld,
+    gated_silu,
+    min_prefill_m,
+    prescaled_scales,
+    native_policy=None,
+):
+    if 1 <= x.shape[0] <= 8 and not gated_silu:
+        sm70_ops.nvfp4_qpn2_gemm_sm70_out(
+            out,
+            x,
+            codes,
+            bundled_scales,
+            global_scale,
+            split_k,
+            accumulator_chains,
+            native_policy=native_policy,
+        )
+        return
+    sm70_ops.nvfp4_qpn2_tm_dispatch_sm70_out(
+        out,
+        x,
+        tm_weight,
+        scales,
+        global_scale,
+        split_k,
+        accumulator_chains,
+        tm_scales,
+        group_size,
+        k_ld,
+        q_ld,
+        gated_silu,
+        min_prefill_m,
+        prescaled_scales,
+        native_policy=native_policy,
+    )
+
+
+def _bundled_down_dispatch_fake(*args, **kwargs):
+    return None
+
+
+register_policy_op(
+    "sm70_nvfp4_bundled_down_dispatch",
+    "(Tensor(a!) out, Tensor x, Tensor codes, Tensor bundled_scales, "
+    "Tensor tm_weight, Tensor scales, float global_scale, int split_k, "
+    "int accumulator_chains, Tensor tm_scales, int group_size, int k_ld, "
+    "int q_ld, bool gated_silu, int min_prefill_m, bool prescaled_scales, "
+    "str[]? native_policy=None) -> ()",
+    _bundled_down_dispatch,
+    _bundled_down_dispatch_fake,
 )

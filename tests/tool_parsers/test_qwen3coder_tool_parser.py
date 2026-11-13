@@ -3,6 +3,7 @@
 
 import json
 from collections.abc import Generator
+from unittest.mock import MagicMock
 
 import pytest
 from openai.types.responses.function_tool import FunctionTool
@@ -1785,6 +1786,33 @@ _WEATHER_CALL = (
     "<tool_call>\n<function=get_current_weather>\n<parameter=city>\nDallas\n"
     "</parameter>\n<parameter=state>\nTX\n</parameter>\n</function>\n</tool_call>"
 )
+
+
+@pytest.mark.parametrize("tail", ["visible trailing content", _WEATHER_CALL])
+def test_buffered_empty_blocks_do_not_overflow_stack(sample_tools, tail):
+    tokenizer = MagicMock()
+    tokenizer.get_vocab.return_value = {"<tool_call>": 1, "</tool_call>": 2}
+    parser = Qwen3CoderToolParser(tokenizer, tools=sample_tools)
+    request = ChatCompletionRequest(
+        model="local", messages=[], tools=_as_chat_completion_tools(sample_tools)
+    )
+    previous = "<tool_call>"
+    current = "<tool_call></tool_call>" * 600 + tail
+    parser.extract_tool_calls_streaming("", previous, previous, [], [], [], request)
+    result = parser.extract_tool_calls_streaming(
+        previous, current, current[len(previous) :], [], [], [], request
+    )
+    assert result is not None
+    if tail == _WEATHER_CALL:
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].index == 0
+        assert result.tool_calls[0].function.name == "get_current_weather"
+        assert json.loads(result.tool_calls[0].function.arguments) == {
+            "city": "Dallas",
+            "state": "TX",
+        }
+    else:
+        assert result.content == tail
 
 
 def _stream_content_and_calls(parser, tokenizer, model_output, request):

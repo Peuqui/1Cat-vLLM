@@ -152,8 +152,8 @@ def test_extract_tool_calls():
 
 
 def test_function_calls_wrapper_is_not_recognized():
-    # The V3.2 wrapper is not a V4 terminal, so it passes through as content,
-    # but the invoke inside it is still parsed (tool calls anchor on the invoke).
+    # Preserve the V4 dialect boundary while recovering genuinely bare invokes.
+    # An explicit V3.2 container and its contents pass through together.
     parser = make_parser()
     model_output = build_tool_call("search", {"query": "vllm"}).replace(
         "tool_calls", "function_calls"
@@ -161,9 +161,9 @@ def test_function_calls_wrapper_is_not_recognized():
 
     result = parser.extract_tool_calls(model_output, make_request())
 
-    assert result.tools_called
-    assert result.tool_calls[0].function.name == "search"
-    assert result.content == "<｜DSML｜function_calls>\n"
+    assert not result.tools_called
+    assert result.tool_calls == []
+    assert result.content == model_output
 
 
 def test_missing_tool_calls_wrapper_is_recovered():
@@ -375,69 +375,6 @@ def test_composed_schema_converts_object_and_array_params():
     }
 
 
-@pytest.mark.parametrize("streaming", [False, True])
-def test_number_schema_preserves_large_integer(streaming):
-    tool = ChatCompletionToolsParam(
-        type="function",
-        function={
-            "name": "lookup",
-            "parameters": {
-                "type": "object",
-                "properties": {"limit": {"type": "number"}},
-            },
-        },
-    )
-    parser = make_parser(tools=[tool])
-    value = 2**63 - 1
-    model_output = (
-        f"{TC_START}\n"
-        f'{INV_START}lookup">\n'
-        f'{PARAM_START}limit" string="false">{value}{PARAM_END}\n'
-        f"{INV_END}\n"
-        f"{TC_END}"
-    )
-
-    if streaming:
-        args = reconstruct_args(stream(parser, model_output))
-    else:
-        result = parser.extract_tool_calls(model_output, make_request(tools=[tool]))
-        assert result.tools_called
-        args = result.tool_calls[0].function.arguments
-    assert json.loads(args) == {"limit": value}
-
-
-@pytest.mark.parametrize("streaming", [False, True])
-def test_integer_schema_accepts_whole_number_float(streaming):
-    tool = ChatCompletionToolsParam(
-        type="function",
-        function={
-            "name": "round_to",
-            "parameters": {
-                "type": "object",
-                "properties": {"precision": {"type": "integer"}},
-            },
-        },
-    )
-    parser = make_parser(tools=[tool])
-    model_output = (
-        f"{TC_START}\n"
-        f'{INV_START}round_to">\n'
-        f'{PARAM_START}precision" string="false">3.0{PARAM_END}\n'
-        f"{INV_END}\n"
-        f"{TC_END}"
-    )
-
-    if streaming:
-        args = reconstruct_args(stream(parser, model_output))
-    else:
-        result = parser.extract_tool_calls(model_output, make_request(tools=[tool]))
-        assert result.tools_called
-        args = result.tool_calls[0].function.arguments
-    precision = json.loads(args)["precision"]
-    assert precision == 3
-    assert isinstance(precision, int)
-
-
 def test_missing_parameter_close_does_not_swallow_next_parameter():
     """Without </｜DSML｜parameter>, the next parameter's opener ends the value
     (batch and streaming, the opener split across deltas)."""
@@ -613,3 +550,114 @@ def test_missing_string_attribute_uses_schema_type(streaming):
     limit = json.loads(args)["limit"]
     assert limit == 7
     assert isinstance(limit, int)
+
+
+@pytest.mark.parametrize("chunk_size", [0, 1, 7])
+@pytest.mark.parametrize("followed_by_valid_call", [False, True])
+def test_function_calls_block_is_not_accepted(chunk_size, followed_by_valid_call):
+    parser = make_parser()
+    model_output = build_tool_call("search", {"query": "vllm"}).replace(
+        "tool_calls", "function_calls"
+    )
+
+    ignored = model_output
+    if followed_by_valid_call:
+        model_output += build_tool_call("accepted", {"query": "current"})
+    if chunk_size:
+        deltas = stream(parser, model_output, chunk_size)
+        assert "".join(delta.content or "" for delta in deltas) == ignored
+        names = [
+            call.function.name
+            for delta in deltas
+            for call in (delta.tool_calls or [])
+            if call.function.name
+        ]
+    else:
+        result = parser.extract_tool_calls(model_output, make_request())
+        assert result.content == ignored
+        assert result.tools_called is followed_by_valid_call
+        names = [call.function.name for call in result.tool_calls]
+    assert names == (["accepted"] if followed_by_valid_call else [])
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_number_schema_preserves_large_integer(streaming):
+    tool = ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "lookup",
+            "parameters": {
+                "type": "object",
+                "properties": {"limit": {"type": "number"}},
+            },
+        },
+    )
+    parser = make_parser(tools=[tool])
+    value = 2**63 - 1
+    model_output = (
+        f"{TC_START}\n"
+        f'{INV_START}lookup">\n'
+        f'{PARAM_START}limit" string="false">{value}{PARAM_END}\n'
+        f"{INV_END}\n"
+        f"{TC_END}"
+    )
+
+    if streaming:
+        args = reconstruct_args(stream(parser, model_output))
+    else:
+        result = parser.extract_tool_calls(model_output, make_request(tools=[tool]))
+        assert result.tools_called
+        args = result.tool_calls[0].function.arguments
+    assert json.loads(args) == {"limit": value}
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_integer_schema_accepts_whole_number_float(streaming):
+    tool = ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "round_to",
+            "parameters": {
+                "type": "object",
+                "properties": {"precision": {"type": "integer"}},
+            },
+        },
+    )
+    parser = make_parser(tools=[tool])
+    model_output = (
+        f"{TC_START}\n"
+        f'{INV_START}round_to">\n'
+        f'{PARAM_START}precision" string="false">3.0{PARAM_END}\n'
+        f"{INV_END}\n"
+        f"{TC_END}"
+    )
+
+    if streaming:
+        args = reconstruct_args(stream(parser, model_output))
+    else:
+        result = parser.extract_tool_calls(model_output, make_request(tools=[tool]))
+        assert result.tools_called
+        args = result.tool_calls[0].function.arguments
+    precision = json.loads(args)["precision"]
+    assert precision == 3
+    assert isinstance(precision, int)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "<｜DSML｜function_calls>example</｜DSML｜function_calls>",
+        "an unclosed literal <｜DSML｜function_calls>",
+    ],
+)
+def test_foreign_wrapper_literal_in_argument_is_preserved(streaming, literal):
+    parser = make_parser()
+    model_output = build_tool_call("get_weather", {"location": literal})
+    if streaming:
+        arguments = reconstruct_args(stream(parser, model_output))
+    else:
+        result = parser.extract_tool_calls(model_output, make_request())
+        assert result.tools_called
+        arguments = result.tool_calls[0].function.arguments
+    assert json.loads(arguments) == {"location": literal}

@@ -38,6 +38,26 @@ SM70_DFLASH2_VERIFIER_DEFAULTS = {
     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": "1",
 }
 
+# Target-side verifier routes measured on the Qwen3.8 native MTP contract
+# (q = 1 + drafts <= 8 rows per request). Drafter-, selector- and LM-head
+# routes stay DFlash2-only.
+SM70_MTP_VERIFIER_DEFAULTS = {
+    name: SM70_DFLASH2_VERIFIER_DEFAULTS[name]
+    for name in (
+        "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY",
+        "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT",
+        "VLLM_SM70_FP8_QPN8",
+        "VLLM_SM70_DFLASH2_VERIFY_FASTPATH",
+        "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA",
+        "VLLM_SM70_DFLASH2_FUSED_GDN_NORM",
+        "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT",
+        "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS",
+        "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS",
+        "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA",
+        "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA",
+    )
+}
+
 SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS = {
     "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": "1",
     "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": "1",
@@ -250,6 +270,14 @@ class Sm70DFlash2Config:
     """Multiplier for probabilistic proposal temperature; positive."""
     proposal_top_p: float | None = None
     """Nucleus probability for draft proposals, in (0, 1]."""
+    sharded_selector_codebook: bool = False
+    """Shard the candidate selector's two vocabulary codebooks across TP ranks.
+
+    Each rank keeps 1/TP of the rows; a lookup reads the owner's rows and an
+    all-reduce preserves finite nonzero values bitwise on every rank. Zero
+    values are equal, but their sign may change when adding +0. Saves
+    (TP-1)/TP of the codebooks' memory per GPU for one small all-reduce per
+    codebook and draft step. Configuration only, no environment alias."""
     sources: dict[str, str] = Field(default_factory=dict, init=False)
     """Initialization sources, excluded from graph options."""
 
@@ -262,7 +290,16 @@ class Sm70DFlash2Config:
     explicit_fields: tuple[str, ...] = Field(default=(), init=False, repr=False)
     """Explicit configuration or legacy settings, used by mixed-format defaults."""
 
-    def resolve(self, *, qualified: bool) -> None:
+    def resolve(self, *, qualified: bool, mtp_qualified: bool = False) -> None:
+        """``qualified`` admits the DFlash2 contract and all its verifier
+        defaults; ``mtp_qualified`` only the target-side MTP subset."""
+        table = (
+            SM70_DFLASH2_VERIFIER_DEFAULTS
+            if qualified
+            else SM70_MTP_VERIFIER_DEFAULTS
+            if mtp_qualified
+            else {}
+        )
         variable = envs.environment_variables["VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER"]
         if isinstance(variable, EnvVar):
             variable.warn_if_deprecated()
@@ -278,7 +315,7 @@ class Sm70DFlash2Config:
                 else name
                 if name in os.environ
                 else "qualified_model"
-                if qualified and name in SM70_DFLASH2_VERIFIER_DEFAULTS
+                if name in table
                 else "default",
             )
             if (
@@ -300,10 +337,8 @@ class Sm70DFlash2Config:
                     )
             if configured is None:
                 configured = (
-                    bool(int(SM70_DFLASH2_VERIFIER_DEFAULTS[name]))
-                    if qualified
-                    and name in SM70_DFLASH2_VERIFIER_DEFAULTS
-                    and name not in os.environ
+                    bool(int(table[name]))
+                    if name in table and name not in os.environ
                     else envs.environment_variables[name]()
                 )
             setattr(self, field, configured)
@@ -362,6 +397,9 @@ class Sm70DFlash2Config:
             result["lookup"] = {
                 field: getattr(self.lookup, field) for field in self.lookup.aliases
             }
+        # Listed only when on, so the default keeps existing compile keys.
+        if self.sharded_selector_codebook:
+            result["sharded_selector_codebook"] = True
         return result
 
 

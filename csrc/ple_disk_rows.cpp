@@ -36,8 +36,10 @@ void copy_rows_with_prefetch_window(const std::vector<const uint8_t*>& sources,
   const auto bytes = static_cast<uintptr_t>(row_bytes);
   std::vector<size_t> order(sources.size());
   std::iota(order.begin(), order.end(), size_t{0});
-  std::sort(order.begin(), order.end(),
-            [&](size_t a, size_t b) { return sources[a] < sources[b]; });
+  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    return reinterpret_cast<uintptr_t>(sources[a]) <
+           reinterpret_cast<uintptr_t>(sources[b]);
+  });
   // Unique pages in copy order and, per copied row, one past its last page.
   std::vector<uintptr_t> pages;
   std::vector<size_t> pages_through_row(order.size());
@@ -142,6 +144,8 @@ void ple_disk_cached_gather_u8(torch::Tensor ids, torch::Tensor pointers,
                                torch::Tensor cache_ids,
                                torch::Tensor cache_rows,
                                int64_t prefetch_window_bytes) {
+  TORCH_CHECK(prefetch_window_bytes >= 0,
+              "PLE disk prefetch window must not be negative");
   TORCH_CHECK(ids.device().is_cpu() && out.device().is_cpu() &&
                   cache_ids.device().is_cpu() && cache_rows.device().is_cpu(),
               "PLE cached gather requires CPU storage");

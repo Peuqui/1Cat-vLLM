@@ -96,7 +96,9 @@ constexpr size_t kSm70Tp4PushAllreduceM16Bytes =
     16 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceM32Bytes =
     32 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
-constexpr size_t kSm70Tp4PushAllreduceMaxBytes = kSm70Tp4PushAllreduceM32Bytes;
+constexpr size_t kSm70Tp4PushAllreduceM64Bytes =
+    64 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduceMaxBytes = kSm70Tp4PushAllreduceM64Bytes;
 constexpr size_t kSm70Tp4PushAllreduce8KiBBytes = 4096 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpBytes = 2560 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpMtp5Bytes =
@@ -198,25 +200,41 @@ constexpr size_t kSm70PushNormBatchMetaBytes = 2048;
 static_assert(sizeof(Sm70PushNormBatchMeta) <= kSm70PushNormBatchMetaBytes);
 constexpr size_t kSm70PushNormBatchOffset =
     kSm70PushNormPacketOffset + kSm70PushNormMetaBytes;
-constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+constexpr size_t kSm70MtpNormOffset =
     kSm70PushNormBatchOffset + kSm70PushNormBatchMetaBytes +
     kSm70Tp4PushAllreduceEpochs * kSm70Tp4PushAllreduceWorldSize *
         kSm70Tp4PushAllreduceM32Bytes;
+
+// MTP verifier batches keep independent epochs when the active row count
+// changes.
+constexpr int kSm70MtpNormRows = 64;
+constexpr size_t kSm70MtpNormMetaBytes = 4096;
+struct alignas(8) Sm70MtpNormMeta {
+  uint32_t generation[kSm70MtpNormRows];
+  uint64_t partial[kSm70MtpNormRows][4];
+};
+static_assert(sizeof(Sm70MtpNormMeta) <= kSm70MtpNormMetaBytes);
+constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+    kSm70MtpNormOffset + kSm70MtpNormMetaBytes +
+    kSm70Tp4PushAllreduceEpochs * kSm70Tp4PushAllreduceWorldSize *
+        kSm70MtpNormRows * kSm70GemmaRmsNormHiddenSize * sizeof(half);
 
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
 // Concurrent MTP4 verification batches of Qwen4Exp/Flash-Next (H2560): two or
-// more requests of five rows each, up to the persistent buffer capacity.
+// more requests of five rows each, up to the qualified 320-KiB capacity.
+// Growing H5120 verification storage must not expand this independent route.
 inline bool sm70_qwen4exp_verify_batch_bytes(size_t bytes) {
   constexpr size_t request_bytes = 5 * 2560 * sizeof(half);
   return bytes % request_bytes == 0 && bytes >= 2 * request_bytes &&
-         bytes <= kSm70Tp4PushAllreduceMaxBytes;
+         bytes <= kSm70Tp4PushAllreduceM32Bytes;
 }
 
 inline int sm70_tp4_push_allreduce_blocks(const CollectivePolicy& policy,
                                           size_t bytes,
-                                          bool allow_generic = false) {
+                                          bool allow_generic = false,
+                                          bool allow_large_verifier = false) {
   // Experimental message-size admission, independent of model or batch shape.
   // Each thread handles one 16-byte pack. Use the smallest covering grid,
   // bounded by the existing persistent buffer, including for known payloads.
@@ -232,7 +250,12 @@ inline int sm70_tp4_push_allreduce_blocks(const CollectivePolicy& policy,
   if (bytes == kSm70Tp4PushAllreduceM8Bytes ||
       (concurrency != nullptr && std::strcmp(concurrency, "1") == 0 &&
        (bytes == kSm70Tp4PushAllreduceM16Bytes ||
-        bytes == kSm70Tp4PushAllreduceM32Bytes))) {
+        bytes == kSm70Tp4PushAllreduceM32Bytes ||
+        (allow_large_verifier &&
+         policy.raw(CollectivePolicyField::custom_allreduce_algo) == nullptr &&
+         bytes > kSm70Tp4PushAllreduceM32Bytes &&
+         bytes <= kSm70Tp4PushAllreduceM64Bytes &&
+         bytes % (kSm70GemmaRmsNormHiddenSize * sizeof(half)) == 0)))) {
     return kSm70Tp4PushAllreduceBlocks;
   }
   if (bytes == kSm70Tp4PushAllreduce8KiBBytes) {
@@ -280,6 +303,14 @@ inline int sm70_tp4_push_allreduce_blocks(const CollectivePolicy& policy,
                  (mtp5 == nullptr || std::strcmp(mtp5, "1") == 0)
              ? 13
              : 0;
+}
+
+inline int sm70_tp4_push_allreduce_threads(size_t bytes) {
+  // Preserve the qualified smaller-message geometry. Larger captured decode
+  // messages reuse the same two-epoch protocol with fewer packs per thread.
+  return bytes > kSm70Tp4PushAllreduceM32Bytes
+             ? 2 * kSm70Tp4PushAllreduceThreads
+             : kSm70Tp4PushAllreduceThreads;
 }
 
 inline int sm70_gemma_rms_norm_threads(const CollectivePolicy& policy) {
@@ -799,12 +830,12 @@ DINLINE void sm70_push_store_volatile_16b(const P& value, void* address,
                  "l"(destination));
 }
 
-template <typename P, int ngpus, typename A>
+template <typename P, int ngpus, typename A, int StartRank = 0>
 DINLINE P sm70_push_reduce(P (&values)[ngpus]) {
-  A accumulator = upcast(values[0]);
+  A accumulator = upcast(values[StartRank]);
 #pragma unroll
   for (int rank = 1; rank < ngpus; ++rank) {
-    packed_assign_add(accumulator, upcast(values[rank]));
+    packed_assign_add(accumulator, upcast(values[(StartRank + rank) % ngpus]));
   }
   return downcast<P>(accumulator);
 }
@@ -859,7 +890,22 @@ __global__ void __launch_bounds__(512, 1)
   sm70_pack32_barrier_at_end<ngpus>(sg, self_sg, rank);
 }
 
-template <int ngpus>
+// Match the per-partition accumulation order of the TP4 two-stage reduction.
+template <typename P, typename A>
+DINLINE P sm70_push_reduce_partition(P (&values)[4], int owner) {
+  switch (owner) {
+    case 1:
+      return sm70_push_reduce<P, 4, A, 1>(values);
+    case 2:
+      return sm70_push_reduce<P, 4, A, 2>(values);
+    case 3:
+      return sm70_push_reduce<P, 4, A, 3>(values);
+    default:
+      return sm70_push_reduce<P, 4, A>(values);
+  }
+}
+
+template <int ngpus, bool RotatedOrder = false>
 __global__ void __launch_bounds__(1024, 1)
     sm70_cross_device_reduce_1stage_push(RankData push_buffers,
                                          const half* __restrict__ input,
@@ -913,8 +959,18 @@ __global__ void __launch_bounds__(1024, 1)
       if (!has_empty_slot) break;
     }
 
-    reinterpret_cast<P*>(output)[offset] =
-        sm70_push_reduce<P, ngpus, A>(peer_values);
+    P reduced;
+    if constexpr (RotatedOrder) {
+      // The old two-stage path starts each output partition at its owner rank.
+      // Match that FP32 addition order, including cancellation and signed zero.
+      const int partition = offset / (packed_size / ngpus);
+      const int owner = partition < ngpus ? partition : ngpus - 1;
+      static_assert(ngpus == 4);
+      reduced = sm70_push_reduce_partition<P, A>(peer_values, owner);
+    } else {
+      reduced = sm70_push_reduce<P, ngpus, A>(peer_values);
+    }
+    reinterpret_cast<P*>(output)[offset] = reduced;
 
     P empty;
 #pragma unroll
@@ -1175,26 +1231,79 @@ static __global__ void __launch_bounds__(kSm70Tp8HierarchicalPushThreads, 1)
   }
 }
 
+// The opaque FP32-residual Gemma norm uses an eight-warp reduction. Share its
+// arithmetic across peer-pull and peer-push collectives, including explicit
+// FMA and cast boundaries. The caller publishes values and synchronizes first,
+// then synchronizes again before consuming inverse_rms.
+__device__ __forceinline__ void sm70_gemma_eight_warp_inverse(
+    const float* shared_values, float* warp_sum, float& inverse_rms,
+    float epsilon) {
+  constexpr int Width = 5120;
+  const int tid = threadIdx.x;
+  if (tid < 256) {
+    float v[24] = {};
+#pragma unroll
+    for (int chunk = 0; chunk < 3; ++chunk) {
+      int col = tid * 8 + chunk * 2048;
+      if (col < Width) {
+        float4 s0 = reinterpret_cast<const float4*>(shared_values + col)[0];
+        float4 s1 = reinterpret_cast<const float4*>(shared_values + col)[1];
+        v[chunk * 8] = s0.x;
+        v[chunk * 8 + 1] = s0.y;
+        v[chunk * 8 + 2] = s0.z;
+        v[chunk * 8 + 3] = s0.w;
+        v[chunk * 8 + 4] = s1.x;
+        v[chunk * 8 + 5] = s1.y;
+        v[chunk * 8 + 6] = s1.z;
+        v[chunk * 8 + 7] = s1.w;
+      }
+    }
+    float variance = __fmul_rn(v[1], v[1]);
+    variance = __fmaf_rn(v[0], v[0], variance);
+#pragma unroll
+    for (int i = 2; i < 16; ++i) variance = __fmaf_rn(v[i], v[i], variance);
+#pragma unroll
+    for (int i = 16; i < 24; ++i)
+      variance = __fadd_rn(__fmul_rn(v[i], v[i]), variance);
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1)
+      variance =
+          __fadd_rn(variance, __shfl_xor_sync(0xffffffff, variance, offset));
+    if ((tid & 31) == 0) warp_sum[tid / 32] = variance;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float partial[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      partial[i] = __fadd_rn(warp_sum[i], warp_sum[i + 4]);
+    float total = __fadd_rn(__fadd_rn(partial[0], partial[2]),
+                            __fadd_rn(partial[1], partial[3]));
+    float mean = __fmaf_rn(total, 1.0f / Width, epsilon), inv;
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv) : "f"(mean));
+    inverse_rms = inv;
+  }
+}
+
 // This prototype deliberately stays narrow: it mirrors the FP32 Gemma RMSNorm
 // reduction order for a [tokens, 5120] FP16 projection. Each CTA handles one
 // row, retains the normal all-reduce peer order, and applies only its local
 // residual after the peer reduction.
-template <int Threads, int ngpus, typename ResidualT, typename WeightT>
-__global__ void __launch_bounds__(Threads, 1)
-    sm70_peer_reduce_gemma_rms_norm(RankData* _dp, RankSignals sg,
-                                    Signal* self_sg,
-                                    const ResidualT* __restrict__ residual,
-                                    const WeightT* __restrict__ weight,
-                                    half* __restrict__ normalized_out,
-                                    float* __restrict__ residual_out, int rank,
-                                    float epsilon) {
+template <int Threads, int ngpus, typename ResidualT, typename WeightT,
+          bool EightWarpOrder = false>
+__global__ void __launch_bounds__(Threads, 1) sm70_peer_reduce_gemma_rms_norm(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    const ResidualT* __restrict__ residual, const WeightT* __restrict__ weight,
+    half* __restrict__ normalized_out, float* __restrict__ residual_out,
+    int rank, float epsilon, half* k16_out, int num_tokens) {
   using P = typename packed_t<half>::P;
   using A = typename packed_t<half>::A;
   constexpr int kPackedWidth = P::size;
   constexpr int kVarianceVectorWidth = 4;
 
-  __shared__ float residual_values[kSm70GemmaRmsNormHiddenSize];
+  __shared__ __align__(16) float residual_values[kSm70GemmaRmsNormHiddenSize];
   __shared__ float inverse_rms;
+  __shared__ float warp_sum[8];
   using BlockReduce = cub::BlockReduce<float, Threads>;
   __shared__ typename BlockReduce::TempStorage reduce_store;
 
@@ -1222,23 +1331,29 @@ __global__ void __launch_bounds__(Threads, 1)
   }
   __syncthreads();
 
-  // Match rms_norm_kernel<float, 4, 2>: each thread consumes vector indices
-  // tid, tid + blockDim.x, ... and CUB reduces the resulting partial sums.
-  float variance = 0.0f;
-  for (int vector_idx = tid;
-       vector_idx < kSm70GemmaRmsNormHiddenSize / kVarianceVectorWidth;
-       vector_idx += blockDim.x) {
-    const int element_offset = vector_idx * kVarianceVectorWidth;
+  if constexpr (EightWarpOrder) {
+    sm70_gemma_eight_warp_inverse(residual_values, warp_sum, inverse_rms,
+                                  epsilon);
+  } else {
+    // Match rms_norm_kernel<float, 4, 2>: each thread consumes vector indices
+    // tid, tid + blockDim.x, ... and CUB reduces the resulting partial sums.
+    float variance = 0.0f;
+    for (int vector_idx = tid;
+         vector_idx < kSm70GemmaRmsNormHiddenSize / kVarianceVectorWidth;
+         vector_idx += blockDim.x) {
+      const int element_offset = vector_idx * kVarianceVectorWidth;
 #pragma unroll
-    for (int i = 0; i < kVarianceVectorWidth; ++i) {
-      const float value = residual_values[element_offset + i];
-      variance += value * value;
+      for (int i = 0; i < kVarianceVectorWidth; ++i) {
+        const float value = residual_values[element_offset + i];
+        variance += value * value;
+      }
     }
-  }
-  variance = BlockReduce(reduce_store).Reduce(variance, CubAddOp{}, blockDim.x);
+    variance =
+        BlockReduce(reduce_store).Reduce(variance, CubAddOp{}, blockDim.x);
 
-  if (tid == 0) {
-    inverse_rms = rsqrtf(variance / kSm70GemmaRmsNormHiddenSize + epsilon);
+    if (tid == 0) {
+      inverse_rms = rsqrtf(variance / kSm70GemmaRmsNormHiddenSize + epsilon);
+    }
   }
   __syncthreads();
 
@@ -1251,8 +1366,15 @@ __global__ void __launch_bounds__(Threads, 1)
       const int column = element_offset + i;
       const float gemma_weight =
           sm70_gemma_rms_norm_to_float(weight[column]) + 1.0f;
-      normalized_out[row_offset + column] =
+      const half value =
           __float2half_rn(residual_values[column] * inverse_rms * gemma_weight);
+      normalized_out[row_offset + column] = value;
+      if (k16_out != nullptr) {
+        const size_t index =
+            (static_cast<size_t>(column / 16) * num_tokens + row) * 16 +
+            column % 16;
+        k16_out[index] = value;
+      }
     }
   }
 
@@ -1770,8 +1892,158 @@ using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
 static_assert(sizeof(IPC_KEY) == sizeof(cudaIpcMemHandle_t));
 static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
 
-// All 40 CTAs fit on SM70. The row leader waits only for four local
-// partial reductions; no grid-wide synchronization is required.
+// Each rank reduces one quarter of a row and broadcasts the rounded sum.
+// Keep the reference rank order and eight-warp RMS variance tree.
+template <typename Weight, int Rank>
+__global__
+__launch_bounds__(640, 1) void sm70_mtp_row_push_allreduce_gemma_rms_norm(
+    RankData buffers, const half* __restrict__ input,
+    const float* __restrict__ residual, const Weight* __restrict__ weight,
+    half* __restrict__ output, half* __restrict__ k16_output,
+    float* __restrict__ residual_out, const void* local_buffer, float epsilon,
+    bool rotated_order) {
+  constexpr int Width = 5120, Stride = kSm70MtpNormRows * Width / 8;
+  using P = typename packed_t<half>::P;
+  using A = typename packed_t<half>::A;
+  const int row = blockIdx.x, tid = threadIdx.x;
+  const int pack = row * 640 + tid, column = tid * 8;
+  char* local = const_cast<char*>(reinterpret_cast<const char*>(local_buffer));
+  auto* meta = reinterpret_cast<volatile Sm70MtpNormMeta*>(local);
+  const uint32_t generation = meta->generation[row] + 1;
+  const int epoch = (generation & 1) * 4 * Stride;
+  char* data = local + kSm70MtpNormMetaBytes;
+  P own = reinterpret_cast<const P*>(input)[pack];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) sm70_push_escape_sentinel(own.data[i]);
+  const int owner = tid / 160;
+  if (owner != Rank) {
+    char* destination =
+        const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[owner])) +
+        kSm70MtpNormMetaBytes;
+    sm70_push_store_volatile_16b(
+        own, destination + (epoch + Rank * Stride) * sizeof(P), pack);
+  }
+  P empty;
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    *reinterpret_cast<uint16_t*>(&empty.data[i]) =
+        kSm70Tp4PushAllreduceSentinel;
+  P sum;
+  if (owner == Rank) {
+    P peers[4];
+    while (true) {
+      bool missing = false;
+#pragma unroll
+      for (int peer = 0; peer < 4; ++peer) {
+        if (peer == Rank) {
+          peers[peer] = own;
+        } else {
+          sm70_push_load_volatile_16b(
+              peers[peer], data + (epoch + peer * Stride) * sizeof(P), pack);
+#pragma unroll
+          for (int i = 0; i < 8; ++i)
+            missing |= sm70_push_is_sentinel(peers[peer].data[i]);
+        }
+      }
+      if (!missing) break;
+    }
+    if (rotated_order) {
+      const int partition_owner = pack / (gridDim.x * 160);
+      sum = sm70_push_reduce_partition<P, A>(peers, partition_owner);
+    } else {
+      sum = sm70_push_reduce<P, 4, A>(peers);
+    }
+#pragma unroll
+    for (int peer = 0; peer < 4; ++peer) {
+      if (peer != Rank)
+        sm70_push_store_volatile_16b(
+            empty, data + (epoch + peer * Stride) * sizeof(P), pack);
+    }
+    P published = sum;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) sm70_push_escape_sentinel(published.data[i]);
+#pragma unroll
+    for (int peer = 0; peer < 4; ++peer) {
+      if (peer != Rank) {
+        char* destination = const_cast<char*>(reinterpret_cast<const char*>(
+                                buffers.ptrs[peer])) +
+                            kSm70MtpNormMetaBytes;
+        // The destination's own channel is unused by the scatter phase.
+        sm70_push_store_volatile_16b(
+            published, destination + (epoch + peer * Stride) * sizeof(P), pack);
+      }
+    }
+  } else {
+    while (true) {
+      sm70_push_load_volatile_16b(
+          sum, data + (epoch + Rank * Stride) * sizeof(P), pack);
+      bool missing = false;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) missing |= sm70_push_is_sentinel(sum.data[i]);
+      if (!missing) break;
+    }
+    sm70_push_store_volatile_16b(
+        empty, data + (epoch + Rank * Stride) * sizeof(P), pack);
+  }
+  const float4 ra = reinterpret_cast<const float4*>(residual)[pack * 2];
+  const float4 rb = reinterpret_cast<const float4*>(residual)[pack * 2 + 1];
+  const float rv[8] = {ra.x, ra.y, ra.z, ra.w, rb.x, rb.y, rb.z, rb.w};
+  float values[8];
+  __shared__ __align__(16) float shared_values[Width];
+  __shared__ float warp_sum[8];
+  __shared__ float inverse;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    values[i] = __fadd_rn(__half2float(sum.data[i]), rv[i]);
+  }
+  reinterpret_cast<float4*>(shared_values)[tid * 2] =
+      make_float4(values[0], values[1], values[2], values[3]);
+  reinterpret_cast<float4*>(shared_values)[tid * 2 + 1] =
+      make_float4(values[4], values[5], values[6], values[7]);
+  reinterpret_cast<float4*>(residual_out)[pack * 2] =
+      make_float4(values[0], values[1], values[2], values[3]);
+  reinterpret_cast<float4*>(residual_out)[pack * 2 + 1] =
+      make_float4(values[4], values[5], values[6], values[7]);
+  __syncthreads();
+  sm70_gemma_eight_warp_inverse(shared_values, warp_sum, inverse, epsilon);
+  if (tid == 0) {
+    meta->generation[row] = generation;
+  }
+  __syncthreads();
+  float weights[8];
+  if constexpr (std::is_same_v<Weight, float>) {
+    float4 w0 = reinterpret_cast<const float4*>(weight + column)[0];
+    float4 w1 = reinterpret_cast<const float4*>(weight + column)[1];
+    weights[0] = w0.x;
+    weights[1] = w0.y;
+    weights[2] = w0.z;
+    weights[3] = w0.w;
+    weights[4] = w1.x;
+    weights[5] = w1.y;
+    weights[6] = w1.z;
+    weights[7] = w1.w;
+  } else {
+    P packed_weight = reinterpret_cast<const P*>(weight)[tid];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      weights[i] = __half2float(packed_weight.data[i]);
+  }
+  P normalized;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    float w = weights[i] + 1.0f;
+    normalized.data[i] =
+        __float2half_rn(__fmul_rn(__fmul_rn(values[i], inverse), w));
+  }
+  reinterpret_cast<P*>(output)[pack] = normalized;
+  if (k16_output != nullptr) {
+    const size_t packed_offset =
+        (static_cast<size_t>(tid >> 1) * gridDim.x + row) * 2 + (tid & 1);
+    reinterpret_cast<P*>(k16_output)[packed_offset] = normalized;
+  }
+}
+
+// The eight-row DFlash route uses five CTAs per row.
 template <typename WeightT, bool Reference = false>
 __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
     vllm::RankData buffers, const half* input, const float* residual,
@@ -2159,6 +2431,7 @@ class CustomAllreduce {
   const CollectivePolicy policy_;
   std::atomic<bool> logged_norm_route_{false};
   std::atomic<bool> logged_sum2_route_{false};
+  std::atomic<bool> logged_sum2_generic_push_{false};
   int rank_;
   int world_size_;
   // Full NVLink or xGMI connection between GPUs.
@@ -2323,9 +2596,13 @@ class CustomAllreduce {
     auto* batch_data = static_cast<char*>(ptrs[rank_]) +
                        kSm70PushNormBatchOffset + kSm70PushNormBatchMetaBytes;
     CUDACHECK(cudaMemset(batch_data, kSm70Tp4PushAllreduceSentinelByte,
-                         kSm70Tp4PushAllreduceBufferBytes -
-                             kSm70PushNormBatchOffset -
+                         kSm70MtpNormOffset - kSm70PushNormBatchOffset -
                              kSm70PushNormBatchMetaBytes));
+    auto* mtp_data = static_cast<char*>(ptrs[rank_]) + kSm70MtpNormOffset +
+                     kSm70MtpNormMetaBytes;
+    CUDACHECK(cudaMemset(mtp_data, kSm70Tp4PushAllreduceSentinelByte,
+                         kSm70Tp4PushAllreduceBufferBytes - kSm70MtpNormOffset -
+                             kSm70MtpNormMetaBytes));
     sm70_tp4_push_buffers_registered_ = true;
   }
 
@@ -2463,14 +2740,25 @@ class CustomAllreduce {
       // pull path.
       if (sm70_tp4_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
+          policy_.raw(CollectivePolicyField::custom_allreduce_algo) ==
+              nullptr &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
           custom_allreduce_current_device_is_sm70()) {
         const int push_blocks =
-            sm70_tp4_push_allreduce_blocks(policy_, bytes, true);
+            sm70_tp4_push_allreduce_blocks(policy_, bytes, true, true);
         if (push_blocks > 0) {
-          sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize>
-              <<<push_blocks, kSm70Tp4PushAllreduceThreads, 0, stream>>>(
-                  sm70_tp4_push_buffers_, input, output, rank_, size);
+          if (bytes >= 512 * 1024) {
+            sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize,
+                                                 true>
+                <<<push_blocks, sm70_tp4_push_allreduce_threads(bytes), 0,
+                   stream>>>(sm70_tp4_push_buffers_, input, output, rank_,
+                             size);
+          } else {
+            sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize>
+                <<<push_blocks, sm70_tp4_push_allreduce_threads(bytes), 0,
+                   stream>>>(sm70_tp4_push_buffers_, input, output, rank_,
+                             size);
+          }
           return;
         }
       }
@@ -2606,15 +2894,18 @@ class CustomAllreduce {
            fully_connected_ && sm70_tp4_push_buffers_registered_;
   }
 
-  template <int ngpus, typename ResidualT, typename WeightT>
-  void sm70_allreduce_gemma_rms_norm(cudaStream_t stream, half* input,
-                                     const ResidualT* residual,
-                                     const WeightT* weight,
-                                     half* normalized_out, float* residual_out,
-                                     int num_tokens, int hidden_size,
-                                     float epsilon,
-                                     bool benchmark_reference = false,
-                                     half* k16_out = nullptr) {
+  bool sm70_push_norm_mtp_ready(int num_tokens) const {
+    return num_tokens >= 1 && num_tokens <= kSm70MtpNormRows &&
+           fully_connected_ && sm70_tp4_push_buffers_registered_;
+  }
+
+  template <int ngpus, typename ResidualT, typename WeightT,
+            bool EightWarpOrder = false>
+  void sm70_allreduce_gemma_rms_norm(
+      cudaStream_t stream, half* input, const ResidualT* residual,
+      const WeightT* weight, half* normalized_out, float* residual_out,
+      int num_tokens, int hidden_size, float epsilon,
+      bool benchmark_reference = false, half* k16_out = nullptr) {
     if (world_size_ != ngpus || !custom_allreduce_current_device_is_sm70()) {
       throw std::runtime_error("SM70 Gemma RMSNorm prototype requires TP" +
                                std::to_string(ngpus) + " on an SM70 device.");
@@ -2633,30 +2924,89 @@ class CustomAllreduce {
     }
 
     if constexpr (ngpus == 4 && std::is_same_v<ResidualT, float>) {
+      if (!benchmark_reference && sm70_push_norm_mtp_ready(num_tokens)) {
+        const char* algorithm =
+            policy_.raw(CollectivePolicyField::custom_allreduce_algo);
+        bool rotated_order =
+            static_cast<size_t>(num_tokens) * hidden_size * sizeof(half) >=
+            512 * 1024;
+        if (algorithm != nullptr) {
+          if (std::strcmp(algorithm, "1stage") == 0 ||
+              std::strcmp(algorithm, "oneshot") == 0) {
+            rotated_order = false;
+          } else if (std::strcmp(algorithm, "2stage") == 0 ||
+                     std::strcmp(algorithm, "twoshot") == 0) {
+            rotated_order = true;
+          } else {
+            throw std::runtime_error("Invalid VLLM_CUSTOM_ALLREDUCE_ALGO: " +
+                                     std::string(algorithm));
+          }
+        }
+        RankData mtp_buffers{};
+        for (int peer = 0; peer < 4; ++peer) {
+          mtp_buffers.ptrs[peer] =
+              static_cast<const char*>(sm70_tp4_push_buffers_.ptrs[peer]) +
+              kSm70MtpNormOffset;
+        }
+        switch (rank_) {
+          case 0:
+            sm70_mtp_row_push_allreduce_gemma_rms_norm<WeightT, 0>
+                <<<num_tokens, 640, 0, stream>>>(
+                    mtp_buffers, input, residual, weight, normalized_out,
+                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon,
+                    rotated_order);
+            break;
+          case 1:
+            sm70_mtp_row_push_allreduce_gemma_rms_norm<WeightT, 1>
+                <<<num_tokens, 640, 0, stream>>>(
+                    mtp_buffers, input, residual, weight, normalized_out,
+                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon,
+                    rotated_order);
+            break;
+          case 2:
+            sm70_mtp_row_push_allreduce_gemma_rms_norm<WeightT, 2>
+                <<<num_tokens, 640, 0, stream>>>(
+                    mtp_buffers, input, residual, weight, normalized_out,
+                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon,
+                    rotated_order);
+            break;
+          case 3:
+            sm70_mtp_row_push_allreduce_gemma_rms_norm<WeightT, 3>
+                <<<num_tokens, 640, 0, stream>>>(
+                    mtp_buffers, input, residual, weight, normalized_out,
+                    k16_out, residual_out, mtp_buffers.ptrs[rank_], epsilon,
+                    rotated_order);
+            break;
+        }
+        return;
+      }
       if (num_tokens == kSm70PushNormRows && fully_connected_ &&
           sm70_tp4_push_buffers_registered_) {
+        const int blocks = num_tokens * kSm70PushNormParts;
         if (benchmark_reference) {
           sm70_push_allreduce_gemma_rms_norm<WeightT, true>
-              <<<40, 128, 0, stream>>>(
+              <<<blocks, 128, 0, stream>>>(
                   sm70_tp4_push_buffers_, input, residual, weight,
                   normalized_out, residual_out, rank_,
                   sm70_tp4_push_buffers_.ptrs[rank_], epsilon);
         } else {
-          sm70_push_allreduce_gemma_rms_norm<WeightT><<<40, 128, 0, stream>>>(
-              sm70_tp4_push_buffers_, input, residual, weight, normalized_out,
-              residual_out, rank_, sm70_tp4_push_buffers_.ptrs[rank_], epsilon);
+          sm70_push_allreduce_gemma_rms_norm<WeightT>
+              <<<blocks, 128, 0, stream>>>(
+                  sm70_tp4_push_buffers_, input, residual, weight,
+                  normalized_out, residual_out, rank_,
+                  sm70_tp4_push_buffers_.ptrs[rank_], epsilon);
         }
         return;
       }
       if ((num_tokens == 16 || num_tokens == 24 || num_tokens == 32) &&
           !benchmark_reference && fully_connected_ &&
           sm70_tp4_push_buffers_registered_) {
-#define VLLM_LAUNCH_SM70_PUSH_NORM_BATCH(ROWS)                              \
-  sm70_push_allreduce_gemma_rms_norm_batch<WeightT, ROWS>                   \
-      <<<40, 128, 0, stream>>>(sm70_tp4_push_buffers_, input, residual,     \
-                               weight, normalized_out, k16_out,             \
-                               residual_out, rank_,                         \
-                               sm70_tp4_push_buffers_.ptrs[rank_], epsilon)
+#define VLLM_LAUNCH_SM70_PUSH_NORM_BATCH(ROWS)                                \
+  sm70_push_allreduce_gemma_rms_norm_batch<WeightT, ROWS>                     \
+      <<<40, 128, 0, stream>>>(sm70_tp4_push_buffers_, input, residual,       \
+                               weight, normalized_out, k16_out, residual_out, \
+                               rank_, sm70_tp4_push_buffers_.ptrs[rank_],     \
+                               epsilon)
         if (num_tokens == 16) {
           VLLM_LAUNCH_SM70_PUSH_NORM_BATCH(16);
         } else if (num_tokens == 24) {
@@ -2679,16 +3029,17 @@ class CustomAllreduce {
                                       ResidualT, WeightT>
           <<<num_tokens, kSm70GemmaRmsNormThreads, 0, stream>>>(
               ptrs, sg_, self_sg_, residual, weight, normalized_out,
-              residual_out, rank_, epsilon);
+              residual_out, rank_, epsilon, k16_out, num_tokens);
       return;
     }
 
     const int threads = sm70_gemma_rms_norm_threads(policy_);
-#define VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(THREADS)                          \
-  sm70_peer_reduce_gemma_rms_norm<THREADS, ngpus, ResidualT, WeightT>     \
-      <<<num_tokens, THREADS, 0, stream>>>(ptrs, sg_, self_sg_, residual, \
-                                           weight, normalized_out,        \
-                                           residual_out, rank_, epsilon)
+#define VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(THREADS)                               \
+  sm70_peer_reduce_gemma_rms_norm<THREADS, ngpus, ResidualT, WeightT,          \
+                                  EightWarpOrder>                              \
+      <<<num_tokens, THREADS, 0, stream>>>(                                    \
+          ptrs, sg_, self_sg_, residual, weight, normalized_out, residual_out, \
+          rank_, epsilon, k16_out, num_tokens)
     switch (threads) {
       case 256:
         VLLM_LAUNCH_SM70_GEMMA_RMS_NORM(256);
@@ -2818,6 +3169,17 @@ class CustomAllreduce {
           bytes == kSm70Tp4PushAllreduceQwen4ExpBytes &&
           (qwen4_exp_m1 == nullptr || std::strcmp(qwen4_exp_m1, "1") == 0);
 
+      // Reuse ordinary TP4's bounded 16-byte admission. The opt-in is
+      // communicator-owned; unset/zero preserves sum2's existing selectors.
+      const char* sum2_push_any =
+          policy_.raw(CollectivePolicyField::sm70_tp4_sum2_push_any);
+      const char* small = policy_.raw(
+          CollectivePolicyField::sm70_tp4_push_allreduce_small_messages);
+      const bool generic_small =
+          sum2_push_any != nullptr && std::strcmp(sum2_push_any, "1") == 0 &&
+          small != nullptr && std::strcmp(small, "1") == 0 && bytes > 0 &&
+          bytes <= kSm70Tp4PushAllreduceM8Bytes && bytes % 16 == 0;
+
       if (sm70_tp8_hierarchical_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
           sm70_tp8_hierarchical_custom_ar_enabled(policy_, world_size_,
@@ -2833,11 +3195,20 @@ class CustomAllreduce {
       }
       if (sm70_tp4_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
+          policy_.raw(CollectivePolicyField::custom_allreduce_algo) ==
+              nullptr &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
-          (qwen38_batch || qwen38_m2 || qwen38_mtp5 || qwen4_exp_m1_enabled) &&
+          (generic_small || qwen38_batch || qwen38_m2 || qwen38_mtp5 ||
+           qwen4_exp_m1_enabled) &&
           custom_allreduce_current_device_is_sm70()) {
-        const int push_blocks = sm70_tp4_push_allreduce_blocks(policy_, bytes);
+        const int push_blocks =
+            sm70_tp4_push_allreduce_blocks(policy_, bytes, generic_small);
         if (push_blocks > 0) {
+          if (generic_small && !logged_sum2_generic_push_.exchange(true)) {
+            std::cerr << "V41 sum2 generic push active bytes=" << bytes
+                      << " blocks=" << push_blocks << " rank=" << rank_
+                      << std::endl;
+          }
           sm70_cross_device_reduce_sum2_1stage_push<
               kSm70Tp4PushAllreduceWorldSize>
               <<<push_blocks, kSm70Tp4PushAllreduceThreads, 0, stream>>>(

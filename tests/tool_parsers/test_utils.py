@@ -58,6 +58,12 @@ class TestCoerceToSchemaType:
             assert coerce_to_schema_type("option_a", "enum") == "option_a"
 
     class TestIntegerType:
+        @pytest.mark.parametrize(
+            "value", ["9007199254740993.0", "9.007199254740993e15"]
+        )
+        def test_whole_float_keeps_large_integer_digits(self, value):
+            assert coerce_to_schema_type(value, "integer") == 9007199254740993
+
         def test_integer_type(self):
             assert coerce_to_schema_type("42", "integer") == 42
 

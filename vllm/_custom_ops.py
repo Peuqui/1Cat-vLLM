@@ -3090,6 +3090,13 @@ def sm70_tp2_all_reduce_gemma_rms_norm(
     )
 
 
+def custom_ar_verifier_norm_rows_supported(namespace, rows: int) -> bool:
+    """Older native extensions support only the eight-row verifier layouts."""
+    return rows not in (5, 10, 15, 20, 30, 40) or hasattr(
+        namespace, "sm70_tp4_all_reduce_gemma_rms_norm_mtp"
+    )
+
+
 def sm70_tp4_all_reduce_gemma_rms_norm(
     fa: int,
     inp: torch.Tensor,
@@ -4363,4 +4370,18 @@ if hasattr(torch.ops._C, "sm70_ring_atomic_allreduce_out"):
         capacity,
         block_packets=False,
     ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "sm70_bf16_weight_linear"):
+
+    @register_fake("_C::sm70_bf16_weight_linear")
+    def _sm70_bf16_weight_linear_fake(input, weight):
+        return input.new_empty((input.shape[0], weight.shape[0]))
+
+
+if hasattr(torch.ops._C, "sm70_mtp_moe_bf16_out"):
+
+    @register_fake("_C::sm70_mtp_moe_bf16_out")
+    def _sm70_mtp_moe_bf16_fake(output, input, weight, ids, weights, padded, down):
         return None

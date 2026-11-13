@@ -448,10 +448,12 @@ def test_decode_reads_the_block_major_paged_cache(monkeypatch, relu, fused):
 @pytest.mark.parametrize(
     "fused", [False, pytest.param(True, marks=requires_tensor_core_triton)]
 )
-# The second shape crosses the 16k-key switch of the decode score tile
-# (_decode_score_tile) on Volta and Turing.
+# 8k is a finer decode graph bucket; 20k crosses the 16k-key switch of the
+# decode score tile (_decode_score_tile) on Volta and Turing.
 @pytest.mark.parametrize(
-    "live_seq_len,graph_width", [(1017, 2048), (16437, 20480)], ids=["2k", "20k"]
+    "live_seq_len,graph_width",
+    [(1017, 2048), (4089, 8192), (16437, 20480)],
+    ids=["2k", "8k", "20k"],
 )
 @requires_sm70
 def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(

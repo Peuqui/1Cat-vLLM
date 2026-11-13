@@ -22,11 +22,36 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 from ..utils import StatelessProcessGroup
-from .base_device_communicator import DeviceCommunicatorBase
+from .base_device_communicator import _PYNCCL_ALLGATHER, DeviceCommunicatorBase
 from .collective_provider import CollectiveTrace
 
 logger = init_logger(__name__)
+
+_AR_ALLGATHER = envs.VLLM_V41_AR_ALLGATHER == "1"
 _SM70_TP4_LONG_PREFILL_BUFFER_BYTES = 8192 * 5120 * 2
+_PYNCCL_GATHER_DTYPES = {
+    torch.int8,
+    torch.uint8,
+    torch.int32,
+    torch.int64,
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+}
+
+
+def _all_gather_existing_pynccl(input_, communicator, world_size, dim):
+    if not -input_.ndim <= dim < input_.ndim:
+        raise IndexError(f"Invalid all-gather dimension {dim} for {input_.ndim}D input")
+    dim %= input_.ndim
+    shape = input_.shape
+    input_ = input_.contiguous()
+    output = input_.new_empty((world_size, *shape))
+    communicator.all_gather(output, input_)
+    return output.movedim(0, dim).reshape(
+        shape[:dim] + (world_size * shape[dim],) + shape[dim + 1 :]
+    )
 
 
 # The all_reduce custom op is registered as out-of-place, so compiled graphs
@@ -54,6 +79,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             global_ranks,
             global_world_size,
         )
+        native_collective_device = current_platform.is_device_capability(
+            70, device_id=None if self.device is None else self.device.index
+        )
         self._policy = communication_policy()
         trace_enabled = capture_runtime_trace().tp_allreduce
         if "tp" not in unique_name:
@@ -69,15 +97,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-            use_top1_custom_ar = bool(
-                self._policy.top1_custom_ar
-            ) and current_platform.is_device_capability(70)
+            use_top1_custom_ar = (
+                bool(self._policy.top1_custom_ar) and native_collective_device
+            )
             use_sm70_awq_mlp_down_tile_ar = bool(self._policy.awq_tile_ar)
             use_sm70_awq_mlp_down_tile_overlap = bool(self._policy.awq_tile_overlap)
             use_sm70_tp4_long_prefill_fused_norm = (
                 bool(self._policy.long_prefill_norm)
                 and self.world_size == 4
-                and current_platform.is_device_capability(70)
+                and native_collective_device
             )
             use_torch_symm_mem = bool(self._policy.symm_mem)
             use_flashinfer_allreduce = bool(self._policy.flashinfer)
@@ -214,6 +242,30 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.host_reduce_comm = HostReduceCommunicator(
                 self.cpu_group, self.device, self.unique_name
             )
+        self._pynccl_strided_gather = native_collective_device
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        if config is not None:
+            admitted = bool(
+                self._pynccl_strided_gather
+                and _PYNCCL_ALLGATHER
+                and self.pynccl_comm is not None
+                and not self.pynccl_comm.disabled
+            )
+            config.kernel_config.collective_kernel_selections[
+                "all_gather:" + self.unique_name
+            ] = {
+                "enabled": admitted,
+                "reason": None if admitted else "device_or_existing_pynccl_unavailable",
+                "operator": "pynccl_all_gather",
+                "scope": "collective_capability",
+                "runtime_guards": (
+                    "CUDA tensor on communicator device; NCCL-supported dtype"
+                ),
+                "dtypes": sorted(str(t) for t in _PYNCCL_GATHER_DTYPES),
+                "graph_safe": True,
+            }
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
 
@@ -355,6 +407,53 @@ class CudaCommunicator(DeviceCommunicatorBase):
             scope="global",
         )
 
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        # VLLM_V41_AR_ALLGATHER=1 (default off): small all-gathers as one
+        # custom all-reduce of a zero-padded stack (exact: x + 0 == x). On a
+        # node-local TP group the push all-reduce costs tens of microseconds
+        # where NCCL's LL ring all-gather of a few hundred KiB costs hundreds.
+        ca = self.ca_comm
+        if (
+            _AR_ALLGATHER
+            and ca is not None
+            and not ca.disabled
+            and input_.is_cuda
+            and input_.is_contiguous()
+            and input_.dtype in (torch.float16, torch.float32, torch.bfloat16)
+        ):
+            stacked = torch.zeros(
+                (self.world_size,) + tuple(input_.shape),
+                dtype=input_.dtype,
+                device=input_.device,
+            )
+            stacked[self.rank_in_group].copy_(input_)
+            if ca.should_custom_ar(stacked):
+                reduced = ca.custom_all_reduce(stacked)
+                if reduced is not None:
+                    if dim < 0:
+                        dim += input_.dim()
+                    size = input_.size()
+                    return reduced.movedim(0, dim).reshape(
+                        size[:dim] + (self.world_size * size[dim],) + size[dim + 1 :]
+                    )
+        communicator = self.pynccl_comm
+        if (
+            _PYNCCL_ALLGATHER
+            and self._pynccl_strided_gather
+            and communicator is not None
+            and not communicator.disabled
+            and input_.is_cuda
+            and input_.device == communicator.device
+            and input_.dtype in _PYNCCL_GATHER_DTYPES
+            and -input_.ndim <= dim < input_.ndim
+        ):
+            # Reuse the communicator already initialized for all-reduce. A
+            # second lazy ProcessGroupNCCL communicator can exhaust small GPUs.
+            return _all_gather_existing_pynccl(
+                input_, communicator, self.world_size, dim
+            )
+        return super().all_gather(input_, dim)
+
     def all_reduce(self, input_):
         ring_out = self.ring_comm.all_reduce(input_)
         if ring_out is not None:
@@ -457,6 +556,37 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 return out
         return self.all_reduce(input_a + input_b)
 
+    def all_reduce_gemma_rms_norm(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ca_comm = self.ca_comm
+        if (
+            self.use_custom_allreduce
+            and ca_comm is not None
+            and ca_comm.can_all_reduce_gemma_rms_norm(input_, residual, weight)
+        ):
+            return ca_comm.all_reduce_gemma_rms_norm(input_, residual, weight, epsilon)
+        if (
+            self.use_custom_allreduce
+            and ca_comm is not None
+            and ca_comm.sm70_tp4_push_buffer_ptrs is not None
+            and ca_comm.can_sm70_tp4_all_reduce_gemma_rms_norm(input_, residual, weight)
+        ):
+            return ca_comm.sm70_tp4_all_reduce_gemma_rms_norm(
+                input_, residual, weight, epsilon
+            )
+        from vllm.model_executor.layers.layernorm import (
+            _sm70_dflash2_gemma_fused_add_rms_norm,
+        )
+
+        return _sm70_dflash2_gemma_fused_add_rms_norm(
+            self.all_reduce(input_), residual, weight, epsilon
+        )
+
     def sm70_tp2_all_reduce_gemma_rms_norm(
         self,
         input_: torch.Tensor,
@@ -490,32 +620,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             input_, residual, weight, epsilon
         )
 
-    def sm70_tp4_all_reduce_gemma_rms_norm(
-        self,
-        input_: torch.Tensor,
-        residual: torch.Tensor,
-        weight: torch.Tensor,
-        epsilon: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        ca_comm = self.ca_comm
-        if (
-            self.use_custom_allreduce
-            and ca_comm is not None
-            and ca_comm.sm70_tp4_push_buffer_ptrs is not None
-            # One to four eight-row verifier blocks take the push kernels.
-            and input_.shape[0] in (8, 16, 24, 32)
-            and ca_comm.can_sm70_tp4_all_reduce_gemma_rms_norm(input_, residual, weight)
-        ):
-            return ca_comm.sm70_tp4_all_reduce_gemma_rms_norm(
-                input_, residual, weight, epsilon
-            )
-        from vllm.model_executor.layers.layernorm import (
-            _sm70_dflash2_gemma_fused_add_rms_norm,
-        )
-
-        return _sm70_dflash2_gemma_fused_add_rms_norm(
-            self.all_reduce(input_), residual, weight, epsilon
-        )
+    # Historical graph entry remains an alias of the shared ordered boundary.
+    sm70_tp4_all_reduce_gemma_rms_norm = all_reduce_gemma_rms_norm
 
     def sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
         self,

@@ -132,8 +132,13 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=np.array(
                 input_batch.query_start_loc_np[: num_reqs + 1], dtype=np.int32
             ),
-            ngram_context=ngram_context,
+            ngram_context=ngram_context if context_len else None,
         )
+
+    def remove_request(self, req_index: int) -> None:
+        super().remove_request(req_index)
+        if self._ple_early_tokens is not None:
+            self._ple_early_tokens.pop(req_index, None)
 
     def _prepare_ngram_context(
         self,

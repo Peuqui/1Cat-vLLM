@@ -54,6 +54,7 @@ class DeepSeekV32ToolParser(ToolParser):
     tool_call_start_token: str = "<｜DSML｜function_calls>"
     # Misspelled openers a model is known to emit; they open a block too.
     tool_call_start_token_variants: tuple[str, ...] = ()
+    ignored_tool_call_tags: tuple[str, ...] = ()
     tool_call_end_token: str = "</｜DSML｜function_calls>"
     invoke_tag_name: str = "invoke"
     parameter_tag_name: str = "parameter"
@@ -68,6 +69,11 @@ class DeepSeekV32ToolParser(ToolParser):
         self._sent_content_idx: int = 0
         self._buffer: str = ""
         self._in_tool_calls: bool = False
+        self._ignored_tool_call_end: str | None = None
+        self._ignored_tool_call_blocks = {
+            f"<｜DSML｜{tag}>": f"</｜DSML｜{tag}>"
+            for tag in self.ignored_tool_call_tags
+        }
         self._active_tool_index: int | None = None
         self._active_tool_name: str | None = None
         self._active_param_name: str | None = None
@@ -218,8 +224,29 @@ class DeepSeekV32ToolParser(ToolParser):
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
         """Extract tool calls from complete model output (non-streaming)."""
+        searchable = model_output
+        invoke_ranges = []
+        if any(start in model_output for start in self._ignored_tool_call_blocks):
+            invoke_ranges = [
+                match.span()
+                for match in self.invoke_complete_regex.finditer(model_output)
+            ]
+        for start, end in self._ignored_tool_call_blocks.items():
+            # Bare invokes are valid only outside another dialect's wrapper.
+            position = 0
+            while (index := searchable.find(start, position)) != -1:
+                position = index + len(start)
+                if any(left <= index < right for left, right in invoke_ranges):
+                    # Foreign markup inside a legitimate argument is text.
+                    continue
+                stop = searchable.find(end, position)
+                stop = len(searchable) if stop == -1 else stop + len(end)
+                searchable = (
+                    searchable[:index] + " " * (stop - index) + searchable[stop:]
+                )
+                position = stop
         first_tool_idx = self._find_first_marker(
-            model_output, self._tool_calls_start_markers()
+            searchable, self._tool_calls_start_markers()
         )
         if first_tool_idx == -1:
             return ExtractedToolCallInformation(
@@ -233,7 +260,7 @@ class DeepSeekV32ToolParser(ToolParser):
             # inside a tool-calls block or not. A tool call ends the turn,
             # so text between and after the blocks is not content.
             for invoke_name, invoke_content in self.invoke_complete_regex.findall(
-                model_output, first_tool_idx
+                searchable, first_tool_idx
             ):
                 param_dict = self._parse_invoke_params(invoke_content)
                 params = self._convert_params_with_schema(invoke_name, param_dict)
@@ -270,6 +297,7 @@ class DeepSeekV32ToolParser(ToolParser):
         self._sent_content_idx = 0
         self._buffer = ""
         self._in_tool_calls = False
+        self._ignored_tool_call_end = None
         self._active_tool_index = None
         self._active_tool_name = None
         self._active_param_name = None
@@ -455,10 +483,47 @@ class DeepSeekV32ToolParser(ToolParser):
         parameter_end_token = f"</｜DSML｜{self.parameter_tag_name}>"
         invoke_end_token = f"</｜DSML｜{self.invoke_tag_name}>"
 
-        start_markers = self._tool_calls_start_markers()
+        start_markers = (
+            *self._tool_calls_start_markers(),
+            *self._ignored_tool_call_blocks,
+        )
         between_markers = (*start_markers, self.tool_call_end_token)
 
         while True:
+            if self._ignored_tool_call_end is not None:
+                end = self._ignored_tool_call_end
+                end_idx = self._buffer.find(end)
+                size = (
+                    end_idx + len(end)
+                    if end_idx != -1
+                    else len(self._buffer) - partial_tag_overlap(self._buffer, end)
+                )
+                if not self._in_tool_calls:
+                    content_parts.append(self._buffer[:size])
+                self._buffer = self._buffer[size:]
+                if end_idx == -1:
+                    return
+                self._ignored_tool_call_end = None
+                continue
+
+            if self._active_tool_index is None:
+                ignored = next(
+                    (
+                        start
+                        for start in self._ignored_tool_call_blocks
+                        if self._buffer.startswith(start)
+                    ),
+                    None,
+                )
+                if ignored is not None:
+                    if not self._in_tool_calls:
+                        content_parts.append(ignored)
+                    self._buffer = self._buffer[len(ignored) :]
+                    self._ignored_tool_call_end = self._ignored_tool_call_blocks[
+                        ignored
+                    ]
+                    continue
+
             if not self._in_tool_calls:
                 start_idx = self._find_first_marker(self._buffer, start_markers)
                 if start_idx == -1:

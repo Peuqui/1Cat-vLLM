@@ -19,6 +19,35 @@ pytestmark = pytest.mark.skipif(
 WINDOWS = [0, 1, 1 << 16, 1 << 30]
 
 
+@pytest.mark.parametrize("cached", [False, True])
+def test_legacy_call_uses_zero_prefetch_default(cached):
+    table = torch.arange(48, dtype=torch.uint8).reshape(3, 16)
+    pointers = torch.tensor([table.data_ptr()], dtype=torch.int64)
+    ids = torch.tensor([2, 0, 2])
+    output = torch.empty((3, 16), dtype=torch.uint8)
+    args = (ids, pointers, 3, 3, 16, output)
+    if cached:
+        keys = torch.full((2,), -1, dtype=torch.int64)
+        rows = torch.empty((2, 16), dtype=torch.uint8)
+        torch.ops._C.ple_disk_cached_gather_u8(*args, keys, rows)
+    else:
+        torch.ops._C.ple_disk_gather_u8(*args)
+    torch.testing.assert_close(output, table[ids], rtol=0, atol=0)
+
+
+def test_cached_negative_window_is_rejected_before_hit_writes():
+    table = torch.arange(48, dtype=torch.uint8).reshape(3, 16)
+    pointers = torch.tensor([table.data_ptr()], dtype=torch.int64)
+    output = torch.full((1, 16), 123, dtype=torch.uint8)
+    keys = torch.tensor([0])
+    rows = table[:1].clone()
+    with pytest.raises(RuntimeError, match="prefetch window"):
+        torch.ops._C.ple_disk_cached_gather_u8(
+            torch.tensor([0]), pointers, 3, 3, 16, output, keys, rows, -1
+        )
+    assert torch.all(output == 123)
+
+
 @pytest.mark.parametrize("m", [1, 5, 17, 33])
 @pytest.mark.parametrize("row_bytes", [17, 160, 8193])
 @pytest.mark.parametrize("window", WINDOWS)

@@ -255,6 +255,12 @@ class Sm70NvFp4Config(Sm70LinearCompatibility):
     """Captured native selectors/tuning; unused formats do not affect graph keys."""
     qpn4: bool | None = None
     """Retain the shape/model-qualified QPN4 provider."""
+    qpn4_lazy_dense_workspace: bool | None = None
+    """Auto uses native temporary scratch for eager, automatically profiled KV.
+
+    True forces temporary scratch; False forces the resident workspace.
+    Both paths retain load-time workspace admission and QPN4 qualification.
+    """
     dense_qpn2: bool = True
     """Allow native QPN2 with FP16 dense prefill on supported Turing workers."""
     qpn2: bool | None = None
@@ -263,6 +269,14 @@ class Sm70NvFp4Config(Sm70LinearCompatibility):
     """Enable the existing bounded QPN2 prefill dispatcher."""
     shared_weight: bool | None = None
     """Share packed codes with TurboMind instead of retaining a second copy."""
+    bundled_down_decode: bool = False
+    """Use adjacent QPN2 codes/scales for compatible local down projections.
+
+    Compact shared-weight routes use the common TurboMind packing and native
+    projection schedule without an extra weight copy. Separately qualified
+    native-layout routes can bundle their existing packing; other routes may
+    retain an additional bundled copy.
+    """
     shared_scales: bool | None = None
     """Allow compact scales when batch layouts and native ABI permit them."""
     prefill_min_m: int | None = None
@@ -275,13 +289,34 @@ class Sm70NvFp4Config(Sm70LinearCompatibility):
     loader_aliases: ClassVar[dict[str, str]] = SM70_LOADER_ALIASES["nvfp4"]
     input_aliases: ClassVar[tuple[str, ...]] = (*SM70_NVFP4_LINEAR_ALIASES.values(),)
 
-    def resolve(self, *, qualified: bool, active: bool = True) -> None:
+    def resolve(
+        self,
+        *,
+        qualified: bool,
+        active: bool = True,
+        enforce_eager: bool = False,
+        kv_cache_memory_bytes: int | None = None,
+    ) -> None:
         self.capture_inputs()
 
         self.active = self.active or active
         if self.resolved:
             return
         self.qualified = qualified
+        workspace_field = "qpn4_lazy_dense_workspace"
+        self.sources[workspace_field] = (
+            "configuration"
+            if self.qpn4_lazy_dense_workspace is not None
+            else "auto:eager-profile"
+            if enforce_eager and kv_cache_memory_bytes is None
+            else "auto:resident"
+        )
+        if self.qpn4_lazy_dense_workspace is None:
+            # Fixed KV budgets skip peak-memory deduction. Graph pools can
+            # retain temporary scratch, so auto keeps their resident contract.
+            self.qpn4_lazy_dense_workspace = (
+                enforce_eager and kv_cache_memory_bytes is None
+            )
         defaults = {
             "qpn2": qualified,
             "prefill": qualified,
@@ -533,12 +568,15 @@ class Sm70GgufConfig:
     """Host expert representation. ``shared_original`` uses one unsliced GGUF
     cold pool per local TP4 group, with a single native swap coordinator."""
 
-    expert_cache_offload_fraction: float = Field(default=0.30, gt=0.0, lt=1.0)
+    expert_cache_offload_fraction: float = Field(default=0.30, ge=0.0, lt=1.0)
     """Actual fraction of cold experts in ``shared_original`` mode. GPU spare
-    slots are additional capacity and do not reduce this fraction."""
+    slots are additional capacity and do not reduce this fraction. 0 (only with
+    ``expert_cache_spare_slots=0``) keeps every expert resident: no cold pool,
+    no swap coordinator and no decode resolve (PP2 stages)."""
 
-    expert_cache_spare_slots: int = Field(default=8, ge=1, le=64)
-    """Free GPU slots kept per layer so decode misses never wait on eviction."""
+    expert_cache_spare_slots: int = Field(default=8, ge=0, le=64)
+    """Free GPU slots kept per layer so decode misses never wait on eviction.
+    ``shared_original``: 0 exactly when ``expert_cache_offload_fraction`` is 0."""
 
     expert_cache_host_slack: float = Field(default=0.1, ge=0.0, le=1.0)
     """Extra host slots per layer, as a fraction of experts, that keep copies
@@ -641,11 +679,20 @@ class Sm70GgufConfig:
                 )
             if self.expert_cache_profile is not None:
                 raise ValueError("shared_original currently uses deterministic hot ids")
+            if (self.expert_cache_offload_fraction == 0) != (
+                self.expert_cache_spare_slots == 0
+            ):
+                raise ValueError(
+                    "A cold set of zero is expert_cache_offload_fraction=0 with "
+                    "expert_cache_spare_slots=0; any other offload needs spares"
+                )
             if (
                 self.expert_cache_prefill != "turbomind"
                 or self.expert_cache_prefill_prepare != "all"
             ):
                 raise ValueError("shared_original requires complete TurboMind prefill")
+        elif 0 < self.expert_cache_fraction < 1 and not self.expert_cache_spare_slots:
+            raise ValueError("The rank-local expert cache requires spare slots")
 
 
 @config
@@ -909,7 +956,13 @@ class KernelConfig:
     per line). With ``sm70_draft_hot_vocab`` > 0, the draft keeps the first
     that many ranked ids, each rank reading its own vocabulary shard."""
 
-    sm70_draft_single_graph: bool = False
+    sm70_mtp_draft_qpn8: bool = True
+    """Requantize the Qwen3.5/3.8 native MTP drafter's decoder projections to
+    channel-QPN8 on SM70. Only draft proposals change; verification uses the
+    target's own weights. Measured on the 27B: 15.7 -> 15.1 ms per MTP4 round
+    with unchanged acceptance."""
+
+    sm70_draft_single_graph: bool | None = None
     """Capture all MTP draft decode steps, including their slot mappings and
     attention metadata, as one CUDA graph instead of one replay per step."""
     sm70_mtp_lossless_storage: bool = False
@@ -925,9 +978,25 @@ class KernelConfig:
     """Exchange TP-local greedy (value, id) pairs in two direct-NVLink hops
     instead of an all-gather."""
 
-    sm70_greedy_verify: bool = False
+    sm70_mtp_refined_head: bool | None = None
+    """Use full-vocabulary NVFP4 draft proposals with original-weight reranking
+    on SM70 Qwen3.5/3.8 MTP. Each rank retains local candidates and about
+    0.18 GB of proposal weights on TP4. Materializing a quantized head adds
+    about 0.64 GB, while a dense FP16 head shares its existing storage.
+    Candidate screening can change draft acceptance."""
+
+    sm70_mtp_bounded_target_head: bool | None = None
+    """Use bounded FP8 vocabulary search for the dense FP16 target head on
+    SM70 Qwen3.5/3.8 MTP with up to eight rows. Score candidates with
+    original FP16 weights and execute a full-vocabulary device fallback for
+    inconclusive bounds. Additional search storage is about 0.32 GB per rank."""
+
+    sm70_greedy_verify: bool | None = None
     """Verify greedy MTP drafts from TP-local target argmax pairs instead of
-    gathering full-vocabulary logits for the rejection sampler."""
+    gathering full-vocabulary logits for the rejection sampler. By default,
+    enable this for the SM70 Qwen3.5/3.8 native MTP contract. Requests needing
+    penalties, logprobs, grammar masks or random sampling retain the dense path.
+    Explicit false keeps dense verification."""
 
     sm70_sparse_target_sampling: bool = False
     """Verify argmax drafts of top-k 20 sampled requests from TP-local target
@@ -946,7 +1015,7 @@ class KernelConfig:
     sm70_gdn_verify: bool = False
     """Run single-request MTP GDN verification with the SM70 sequential CUDA
     recurrence instead of the Triton fused kernel."""
-    sm70_gdn_spec_replay: bool = False
+    sm70_gdn_spec_replay: bool | None = None
     """Commit speculative GDN states by replay (MTP on SM70).
 
     The native verifier reads each request's committed recurrent state,
@@ -959,7 +1028,7 @@ class KernelConfig:
     def gdn_spec_replay(self) -> bool:
         """Platform-neutral view of ``sm70_gdn_spec_replay`` for generic GDN
         and Mamba layers."""
-        return self.sm70_gdn_spec_replay
+        return bool(self.sm70_gdn_spec_replay)
 
     sm70_round_cost_diagnostics: bool = False
     """Record bounded decode routing histories for a byte/instruction cost
@@ -1161,6 +1230,41 @@ class KernelConfig:
             return value.lower().replace("-", "_")
         return value
 
+    def prefer_speculative_runner(self, cfg) -> bool:
+        from vllm.model_executor.models.runtime_defaults import prefer_native_mtp_runner
+
+        return prefer_native_mtp_runner(cfg)
+
+    def resolve_speculative_defaults(self, cfg) -> None:
+        prefer = self.prefer_speculative_runner(cfg)
+        if self.sm70_greedy_verify is None:
+            self.sm70_greedy_verify = prefer
+        if self.sm70_draft_single_graph is None:
+            self.sm70_draft_single_graph = prefer
+        if self.sm70_mtp_refined_head is None:
+            self.sm70_mtp_refined_head = prefer
+        if self.sm70_mtp_bounded_target_head is None:
+            self.sm70_mtp_bounded_target_head = prefer
+        if self.sm70_gdn_spec_replay is None:
+            from vllm.model_executor.models.config import sm70_mtp_verifier_qualified
+
+            cache = getattr(cfg, "cache_config", None)
+            spec = getattr(cfg, "speculative_config", None)
+            self.sm70_gdn_spec_replay = bool(
+                prefer
+                and cache is not None
+                and getattr(cache, "mamba_cache_mode", None) == "align"
+                and getattr(cache, "mamba_ssm_cache_dtype", "auto")
+                in ("auto", "float32")
+                and spec is not None
+                and 0 < spec.num_speculative_state_tokens() < 8
+                and sm70_mtp_verifier_qualified(
+                    cfg.model_config,
+                    spec,
+                    cfg.parallel_config,
+                )
+            )
+
     def resolve_attention_history(self, cfg) -> bool:
         from vllm.models.qwen4_exp.common.kv_policy import resolve_qsa_host_kv
 
@@ -1169,7 +1273,7 @@ class KernelConfig:
     @property
     def capture_all_draft_steps(self) -> bool:
         """Policy consumed by the generic multistep draft graph manager."""
-        return self.sm70_draft_single_graph
+        return bool(self.sm70_draft_single_graph)
 
     def top1_exchange_callback(self):
         if not self.sm70_top1x:
@@ -1185,7 +1289,26 @@ class KernelConfig:
 
         return native_verifier()
 
-    def resolve_gdn(self, model_config, additional_config) -> None:
+    @staticmethod
+    def mtp_native_gdn_verify(
+        model_config, speculative_config=None, parallel_config=None
+    ) -> bool:
+        from vllm.model_executor.models.config import sm70_mtp_verifier_qualified
+        from vllm.platforms import current_platform
+
+        if not sm70_mtp_verifier_qualified(
+            model_config, speculative_config, parallel_config
+        ):
+            return False
+        return bool(current_platform.is_device_capability(70))
+
+    def resolve_gdn(
+        self,
+        model_config,
+        additional_config,
+        speculative_config=None,
+        parallel_config=None,
+    ) -> None:
         """Capture active GDN policy before worker serialization/cache hashing."""
         from vllm.model_executor.models.config import fla_schedule_family
 
@@ -1194,7 +1317,10 @@ class KernelConfig:
         if family == "gdn":
             self.gdn.resolve(
                 additional_config=additional_config,
-                native_verify=self.sm70_gdn_verify,
+                native_verify=self.sm70_gdn_verify
+                or self.mtp_native_gdn_verify(
+                    model_config, speculative_config, parallel_config
+                ),
             )
 
     sm70_marlin: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)

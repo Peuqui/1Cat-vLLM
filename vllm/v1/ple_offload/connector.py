@@ -27,6 +27,7 @@ from vllm.model_executor.kernels.ple.host_result import (
 from vllm.model_executor.layers.ple_offload_layer import (
     CpuGpuSemaphore,
     PleOffloadLayer,
+    _EarlyResultRelease,
     begin_early_result_release,
     finish_early_result_release,
 )
@@ -97,6 +98,8 @@ class PleOffloadConnector:
         query_start_loc_source: torch.Tensor,
         ngram_context_source: torch.Tensor | None,
     ) -> None:
+        self._request_shutdown = threading.Event()
+        self._early_result_release: _EarlyResultRelease | None = None
         self.device = device
         self.dp_rank = get_dp_group().rank_in_group
         self.tp_rank = get_tp_group().rank_in_group
@@ -196,6 +199,7 @@ class PleOffloadConnector:
         scheduler = vllm_config.scheduler_config
         if (
             self.tp_rank != 0
+            or self.early_prefill
             or not self._uses_cuda_inputs
             or self._ngram_context_source is None
             or self._ngram_context_source.shape[-1] != 2
@@ -433,7 +437,7 @@ class PleOffloadConnector:
             self._request_thread_ready.set()
             while True:
                 request = self._request_queue.get()
-                if request is None:
+                if request is None or self._request_shutdown.is_set():
                     return
                 self._process_request(request, socket)
         except Exception:
@@ -456,6 +460,8 @@ class PleOffloadConnector:
             # The worker reads the shared buffers until it finishes a request.
             with torch.cuda.nvtx.range("ple_offload.wait_previous_request"):
                 while self._request_done[0] < request.seq - 1:
+                    if self._request_shutdown.is_set():
+                        return
                     time.sleep(20e-6)
             self._write_cpu_inputs(request, pending.cpu_inputs)
         elif self._uses_cuda_inputs:
@@ -486,8 +492,18 @@ class PleOffloadConnector:
         num_reqs = request.num_reqs
         if (
             inputs.input_ids.shape != (num_tokens,)
+            or num_tokens < 0
+            or num_reqs < 0
             or inputs.query_start_loc.shape != (num_reqs + 1,)
             or (inputs.ngram_context is None) != (self._ngram_context_buf is None)
+            or num_tokens > self._input_ids_buf.shape[0]
+            or num_reqs + 1 > self._query_start_loc_buf.shape[0]
+            or (
+                inputs.ngram_context is not None
+                and self._ngram_context_buf is not None
+                and inputs.ngram_context.shape
+                != (num_reqs, self._ngram_context_buf.shape[1])
+            )
         ):
             raise ValueError("Early PLE inputs do not match the request shape")
         with torch.cuda.nvtx.range("ple_offload.write_cpu_inputs"):
@@ -647,13 +663,18 @@ class PleOffloadConnector:
         ``cpu_inputs`` and ``eager_forward`` (no CUDA graph replay) are used
         only with ``kernel_config.ple_prefill_early_request``.
         """
+        finish_early_result_release(getattr(self, "_early_result_release", None))
+        self._early_result_release = None
         if dummy_run:
             self.signal_dummy_outputs(num_tokens)
             return
         if use_local_model and (self._ple_policy.hybrid or self._all_pinned_decode):
             return
-        begin_early_result_release(
-            self.early_prefill and eager_forward and bool(self._host_result_regions)
+        self._early_result_release = begin_early_result_release(
+            self.early_prefill and eager_forward and bool(self._host_result_regions),
+            (layer._sem.flag_tensor.data_ptr() for layer in self._layers.values())
+            if self.early_prefill and eager_forward
+            else (),
         )
         if self.early_prefill and cpu_inputs is not None:
             self._launch(num_reqs, num_tokens, cpu_inputs)
@@ -678,7 +699,10 @@ class PleOffloadConnector:
         # results released early by the wait op (eager prefill) are skipped:
         # the worker may already have published the next chunk into them.
         stream = torch.cuda.current_stream(self.device)
-        released = finish_early_result_release()
+        released = finish_early_result_release(
+            getattr(self, "_early_result_release", None)
+        )
+        self._early_result_release = None
         for layer in self._layers.values():
             if (
                 layer._is_cpu_offloaded
@@ -689,6 +713,10 @@ class PleOffloadConnector:
 
     def close(self) -> None:
         """Stop request transport and release host registrations."""
+        finish_early_result_release(getattr(self, "_early_result_release", None))
+        self._early_result_release = None
+        if (shutdown := getattr(self, "_request_shutdown", None)) is not None:
+            shutdown.set()
         request_thread = self._request_thread
         if request_thread is not None and request_thread.is_alive():
             try:

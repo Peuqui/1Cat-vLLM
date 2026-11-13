@@ -35,8 +35,9 @@ def test_mtp_sm70_decode_config_uses_exact_local_tile(m):
 
 
 @pytest.mark.parametrize("m", [1, 5])
-def test_qwen38_mtp_sm70_decode_config_uses_exact_local_tile(m):
-    config = _get_sm70_mtp_moe_decode_config(m, 512, 160, 2560, 10)
+@pytest.mark.parametrize("inter", [160, 320, 640])
+def test_qwen38_mtp_sm70_decode_config_uses_exact_local_tile(m, inter):
+    config = _get_sm70_mtp_moe_decode_config(m, 512, inter, 2560, 10)
 
     assert config is not None
     assert config["BLOCK_SIZE_M"] == 2
@@ -52,7 +53,7 @@ def test_qwen38_mtp_sm70_decode_config_uses_exact_local_tile(m):
         (2, 256, 512, 2048, 8),
         (2, 256, 128, 4096, 8),
         (2, 256, 128, 2048, 4),
-        (2, 512, 160, 2560, 10),
+        (81, 512, 160, 2560, 10),
         (5, 256, 160, 2560, 10),
         (5, 512, 128, 2560, 10),
         (5, 512, 160, 2048, 10),

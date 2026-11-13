@@ -351,6 +351,129 @@ def test_message_queue_busy_to_idle():
     distributed_run(worker_fn_test_busy_to_idle, 4)
 
 
+def test_reader_in_reference_cycle_is_collected_without_blocking():
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=1024 * 1024,
+        max_chunks=1,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    reader.cycle = reader
+    reader_ref = weakref.ref(reader)
+    del reader
+
+    collector = threading.Thread(target=gc.collect, daemon=True)
+    collector.start()
+    collector.join(timeout=10)
+
+    assert not collector.is_alive()
+    assert reader_ref() is None
+
+
+def test_warning_logs(caplog_vllm):
+    """
+    Test that warning logs are emitted at VLLM_RINGBUFFER_WARNING_INTERVAL intervals
+    when indefinite=False, and are not emitted when indefinite=True.
+    """
+
+    # Patch the warning log interval to every 1 ms during reads
+    with mock.patch(
+        "vllm.distributed.device_communicators.shm_broadcast.VLLM_RINGBUFFER_WARNING_INTERVAL",
+        new=0.001,  # 1 ms
+    ):
+        writer = MessageQueue(
+            n_reader=1,
+            n_local_reader=1,
+            max_chunk_bytes=1024 * 1024,  # 1MB chunks
+            max_chunks=10,
+        )
+        reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+
+        # We should have at least one warning log here
+        # "0 seconds" expected due to rounding of 1ms test interval
+        with pytest.raises(TimeoutError):
+            reader.dequeue(timeout=0.01, indefinite=False)
+        assert any(
+            "No available shared memory broadcast block found in 0 seconds"
+            in record.message
+            for record in caplog_vllm.records
+        )
+        caplog_vllm.clear()
+
+        # We should have no warnings this time
+        with pytest.raises(TimeoutError):
+            reader.dequeue(timeout=0.01, indefinite=True)
+        assert all(
+            "No available shared memory broadcast block found in 0 seconds"
+            not in record.message
+            for record in caplog_vllm.records
+        )
+
+        # Clean up when done
+        writer.shutdown()
+        reader.shutdown()
+
+
+@pytest.mark.cpu_test
+def test_busy_reader_consumes_write_notifications():
+    """A reader that never goes idle must still service its notify socket,
+    otherwise libzmq queues a command per notification and memory grows with
+    every message read (upstream vLLM #63165).
+    """
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=1024,
+        max_chunks=1,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    notify_socket = reader._spin_condition.local_notify_socket
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+
+        writer.enqueue("payload")
+        assert notify_socket.poll(timeout=5000)
+        with mock.patch.object(
+            shm_broadcast, "SHM_NOTIFY_POLL_INTERVAL_S", 0, create=True
+        ):
+            assert reader.dequeue(timeout=5) == "payload"
+        assert not notify_socket.poll(timeout=0)
+
+        reader.shutdown()
+        with pytest.raises(RuntimeError, match="cancelled"):
+            reader.dequeue(timeout=1)
+    finally:
+        writer.shutdown()
+        reader.shutdown()
+        # Explicit cleanup also prevents a failing assertion from retaining
+        # live sockets in its traceback and blocking context destruction.
+        writer.local_socket.context.destroy(linger=0)
+        reader.local_socket.context.destroy(linger=0)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("pending_notification", [False, True])
+def test_busy_reader_poll_interval(pending_notification):
+    condition = shm_broadcast.SpinCondition.__new__(shm_broadcast.SpinCondition)
+    condition.last_read = condition.last_notify_poll = 10.0
+    condition.local_notify_socket = mock.Mock()
+    condition.local_notify_socket.poll.return_value = pending_notification
+    with mock.patch.object(
+        shm_broadcast.time, "monotonic", side_effect=[11.9, 12.0, 12.1, 14.0]
+    ):
+        for expected_polls in [0, 1, 1, 2]:
+            condition.record_read()
+            assert condition.local_notify_socket.poll.call_count == expected_polls
+    assert condition.last_read == condition.last_notify_poll == 14.0
+    assert condition.local_notify_socket.recv.call_count == (
+        2 if pending_notification else 0
+    )
+
+
 @pytest.mark.parametrize("should_warn", [False, True])
 def test_reader_timeout_caps_indefinite_waits(should_warn):
     with (
@@ -479,126 +602,3 @@ def test_acquire_read_releases_slot_when_reader_raises():
     finally:
         writer.shutdown()
         reader.shutdown()
-
-
-def test_reader_in_reference_cycle_is_collected_without_blocking():
-    writer = MessageQueue(
-        n_reader=1,
-        n_local_reader=1,
-        max_chunk_bytes=1024 * 1024,
-        max_chunks=1,
-    )
-    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
-    reader.cycle = reader
-    reader_ref = weakref.ref(reader)
-    del reader
-
-    collector = threading.Thread(target=gc.collect, daemon=True)
-    collector.start()
-    collector.join(timeout=10)
-
-    assert not collector.is_alive()
-    assert reader_ref() is None
-
-
-def test_warning_logs(caplog_vllm):
-    """
-    Test that warning logs are emitted at VLLM_RINGBUFFER_WARNING_INTERVAL intervals
-    when indefinite=False, and are not emitted when indefinite=True.
-    """
-
-    # Patch the warning log interval to every 1 ms during reads
-    with mock.patch(
-        "vllm.distributed.device_communicators.shm_broadcast.VLLM_RINGBUFFER_WARNING_INTERVAL",
-        new=0.001,  # 1 ms
-    ):
-        writer = MessageQueue(
-            n_reader=1,
-            n_local_reader=1,
-            max_chunk_bytes=1024 * 1024,  # 1MB chunks
-            max_chunks=10,
-        )
-        reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
-        writer.wait_until_ready()
-        reader.wait_until_ready()
-
-        # We should have at least one warning log here
-        # "0 seconds" expected due to rounding of 1ms test interval
-        with pytest.raises(TimeoutError):
-            reader.dequeue(timeout=0.01, indefinite=False)
-        assert any(
-            "No available shared memory broadcast block found in 0 seconds"
-            in record.message
-            for record in caplog_vllm.records
-        )
-        caplog_vllm.clear()
-
-        # We should have no warnings this time
-        with pytest.raises(TimeoutError):
-            reader.dequeue(timeout=0.01, indefinite=True)
-        assert all(
-            "No available shared memory broadcast block found in 0 seconds"
-            not in record.message
-            for record in caplog_vllm.records
-        )
-
-        # Clean up when done
-        writer.shutdown()
-        reader.shutdown()
-
-
-@pytest.mark.cpu_test
-def test_busy_reader_consumes_write_notifications():
-    """A reader that never goes idle must still service its notify socket,
-    otherwise libzmq queues a command per notification and memory grows with
-    every message read (upstream vLLM #63165).
-    """
-    writer = MessageQueue(
-        n_reader=1,
-        n_local_reader=1,
-        max_chunk_bytes=1024,
-        max_chunks=1,
-    )
-    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
-    notify_socket = reader._spin_condition.local_notify_socket
-    try:
-        writer.wait_until_ready()
-        reader.wait_until_ready()
-
-        writer.enqueue("payload")
-        assert notify_socket.poll(timeout=5000)
-        with mock.patch.object(
-            shm_broadcast, "SHM_NOTIFY_POLL_INTERVAL_S", 0, create=True
-        ):
-            assert reader.dequeue(timeout=5) == "payload"
-        assert not notify_socket.poll(timeout=0)
-
-        reader.shutdown()
-        with pytest.raises(RuntimeError, match="cancelled"):
-            reader.dequeue(timeout=1)
-    finally:
-        writer.shutdown()
-        reader.shutdown()
-        # Explicit cleanup also prevents a failing assertion from retaining
-        # live sockets in its traceback and blocking context destruction.
-        writer.local_socket.context.destroy(linger=0)
-        reader.local_socket.context.destroy(linger=0)
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("pending_notification", [False, True])
-def test_busy_reader_poll_interval(pending_notification):
-    condition = shm_broadcast.SpinCondition.__new__(shm_broadcast.SpinCondition)
-    condition.last_read = condition.last_notify_poll = 10.0
-    condition.local_notify_socket = mock.Mock()
-    condition.local_notify_socket.poll.return_value = pending_notification
-    with mock.patch.object(
-        shm_broadcast.time, "monotonic", side_effect=[11.9, 12.0, 12.1, 14.0]
-    ):
-        for expected_polls in [0, 1, 1, 2]:
-            condition.record_read()
-            assert condition.local_notify_socket.poll.call_count == expected_polls
-    assert condition.last_read == condition.last_notify_poll == 14.0
-    assert condition.local_notify_socket.recv.call_count == (
-        2 if pending_notification else 0
-    )

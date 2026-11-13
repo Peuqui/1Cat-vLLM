@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
     from vllm.platforms.interface import DeviceCapability
     from vllm.v1.attention.backends.utils import KVCacheLayoutType
-    from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, KVQuantMode
 
 from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
@@ -69,6 +69,16 @@ class AttentionBackend(ABC):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(1)]
+
+    @staticmethod
+    def get_hybrid_block_multiple() -> int | None:
+        """Block multiple a hybrid ``align`` prefix grid needs, if any.
+
+        A backend that later resizes attention blocks per cache group (e.g. to
+        share one physical page with a draft cache of another dtype) returns
+        the multiple that keeps every resized group on the Mamba grid.
+        """
+        return None
 
     @staticmethod
     @abstractmethod
@@ -762,6 +772,15 @@ class AttentionImplBase(ABC, Generic[T]):
     standard AttentionImpl and MLAAttentionImpl. Does not define a forward
     method - subclasses define their own forward interfaces.
     """
+
+    def configure_kv_cache_workspace(
+        self, vllm_config: "VllmConfig", kv_cache_spec: "KVCacheSpec"
+    ) -> None:
+        """Bind optional workspace bounds before profiling and KV allocation.
+
+        Backends without a page-dependent workspace need no preparation.
+        """
+        return None
 
     # Required attributes that all impls should have
     num_heads: int

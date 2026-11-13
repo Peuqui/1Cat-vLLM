@@ -10,11 +10,26 @@ from typing import Any, Literal
 
 import torch
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.config.execution_policy import graph_policy
 from vllm.v1.attention.kv_codecs import FP8_E4M3, FP16, KVCodec, resolve_kv_codec
 
 GROUP_ROWS = 8
 MAX_CONTEXT = 266240
+
+
+def model_context_limit(capacity: int | None = None, *, fallback: int) -> int:
+    """Resolve a served window within the native int32 page-arithmetic bound."""
+    if capacity is None:
+        config = get_current_vllm_config_or_none()
+        capacity = (
+            config.model_config.max_model_len
+            if config is not None and config.model_config is not None
+            else fallback
+        )
+    if type(capacity) is not int or not 0 < capacity <= 2**31 - 4096:
+        raise ValueError("SM70 grouped context must fit positive int32 page arithmetic")
+    return capacity
 
 
 @dataclass(frozen=True)
@@ -167,6 +182,9 @@ def grouped_fp32_reason(
     parent_seq = None if explicit else getattr(metadata, "seq_lens", None)
     groups = parent.shape[0] if parent is not None and parent.ndim == 2 else 0
     rows = q.shape[0] if q.ndim == 3 else 0
+    operator = getattr(instance, contract.operator_attr, None)
+    request_query_rows = getattr(operator, "request_query_rows", (GROUP_ROWS,))
+    max_groups = getattr(operator, "max_batch_size", contract.max_groups)
     if explicit and (
         not 1 <= groups <= contract.max_groups or rows != groups * GROUP_ROWS
     ):
@@ -174,7 +192,11 @@ def grouped_fp32_reason(
     # Preserve the native revision query, including its legacy eager evaluation
     # for batched request metadata before the operator/policy guards.
     batch_supported = True
-    if contract.batch_revision is not None and groups > 1:
+    if (
+        contract.batch_revision is not None
+        and groups > 1
+        and not hasattr(operator, "request_query_rows")
+    ):
         module_name, function_name, revision = contract.batch_revision
         capability = _import_symbol(module_name, function_name)
         batch_supported = capability(revision)
@@ -196,13 +218,31 @@ def grouped_fp32_reason(
         return "causal_or_window"
     if parent is None or parent.ndim != 2:
         return "request_metadata"
-    if not 1 <= groups <= contract.max_groups:
+    if not 1 <= groups <= max_groups:
         return "request_group_count"
     if not (
         (groups == 1 and 2 <= rows <= GROUP_ROWS)
-        or (groups > 1 and rows == groups * GROUP_ROWS)
+        or (groups > 1 and rows % groups == 0 and rows // groups in request_query_rows)
     ):
         return "query_rows"
+    if groups > 1 and (
+        hasattr(operator, "request_query_rows") or rows != groups * GROUP_ROWS
+    ):
+        starts = getattr(metadata, "query_start_loc_cpu", None)
+        # Runtime-packed batches must retain request boundaries. CUDA graph
+        # capture supplies these CPU starts before replay; ragged eager input
+        # keeps the existing general fallback until explicitly packed.
+        if (
+            starts is None
+            or starts.device.type != "cpu"
+            or starts.numel() < groups + 1
+            or int(starts[0]) != 0
+            or int(starts[groups]) != rows
+            or not bool(
+                (starts[1 : groups + 1] - starts[:groups] == rows // groups).all()
+            )
+        ):
+            return "request_query_layout"
     if (
         q.shape[1:] != (contract.query_heads, 256)
         if contract.query_heads is not None
@@ -225,7 +265,15 @@ def grouped_fp32_reason(
         return "kv_shape_or_unmeasured_page"
     if contract.early_cache_dtype and not codec.stores(k, v):
         return "kv_layout"
-    if not 0 < parent.shape[1] * k.shape[1] <= MAX_CONTEXT:
+    context_limit = MAX_CONTEXT
+    if parent.shape[1] * k.shape[1] > MAX_CONTEXT:
+        capacity = _import_symbol(contract.loader_module, "grouped_context_limit")()
+        if capacity > MAX_CONTEXT:
+            context_limit = min(
+                ((capacity + k.shape[1] - 1) // k.shape[1]) * k.shape[1],
+                ((2**31 - 4096) // k.shape[1]) * k.shape[1],
+            )
+    if not 0 < parent.shape[1] * k.shape[1] <= context_limit:
         return "context_capacity"
     if not explicit and (parent_seq is None or parent_seq.shape != (groups,)):
         return "request_metadata"

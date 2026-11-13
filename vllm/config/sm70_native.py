@@ -423,6 +423,10 @@ class Sm70NativeConfig:
                 value = "1" if value else "0"
             else:
                 value = str(value)
+            if field == "fp8_tune_small_shapes" and value == UNSET:
+                # Pin the default across native-library versions and include
+                # the effective choice in the engine's graph fingerprint.
+                value = "0"
             values.append(value)
             self.sources[field] = source
         # Legacy combined FASTPATH is an OR, including when a stage alias is 0.
@@ -609,6 +613,9 @@ class CollectiveNativeConfig:
     sm70_profile_trace: str | int | bool | None = None
     """Initialization override for VLLM_SM70_PROFILE_TRACE."""
 
+    sm70_tp4_sum2_push_any: bool | None = None
+    """Opt in to bounded generic FP16 sum2 push (VLLM_V41_SUM2_PUSH_ANY)."""
+
     aliases: ClassVar[dict[str, str]] = {
         "sm70_tp4_push_allreduce_small_messages": (
             "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES"
@@ -636,6 +643,7 @@ class CollectiveNativeConfig:
         "custom_allreduce_algo": "VLLM_CUSTOM_ALLREDUCE_ALGO",
         "sm70_tp4_push_allreduce_sum2_m1": "VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1",
         "sm70_profile_trace": "VLLM_SM70_PROFILE_TRACE",
+        "sm70_tp4_sum2_push_any": "VLLM_V41_SUM2_PUSH_ANY",
     }
 
     values: tuple[str, ...] = Field(default=(), init=False)
@@ -677,7 +685,14 @@ class CollectiveNativeConfig:
                 )
                 value = os.environ.get(alias, default)
                 self.sources[field] = alias if alias in os.environ else "default"
-            values.append(str(int(value) if isinstance(value, bool) else value))
+            serialized = str(int(value) if isinstance(value, bool) else value)
+            if field == "sm70_tp4_sum2_push_any" and serialized not in (
+                "\x1f",
+                "0",
+                "1",
+            ):
+                raise ValueError("VLLM_V41_SUM2_PUSH_ANY must be 0 or 1")
+            values.append(serialized)
         self.values = tuple(values)
 
     def resolve_for_owners(self, overrides, *, layers=None, trace=None):

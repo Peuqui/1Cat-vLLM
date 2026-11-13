@@ -197,11 +197,14 @@ _NATIVE = None
 def _native():
     global _NATIVE
     if _NATIVE is None:
-        try:
-            _NATIVE = importlib.import_module("vllm._gguf_expert_cache_C")
-            return _NATIVE
-        except ImportError:
-            pass
+        # VLLM_GGUF_EXPERT_CACHE_JIT=1 compiles the module from this source
+        # tree even when a prebuilt one is installed (new reader geometry).
+        if envs.VLLM_GGUF_EXPERT_CACHE_JIT != "1":
+            try:
+                _NATIVE = importlib.import_module("vllm._gguf_expert_cache_C")
+                return _NATIVE
+            except ImportError:
+                pass
         # Source checkouts without the prebuilt module compile it on demand.
         from torch.utils.cpp_extension import load
 
@@ -574,8 +577,18 @@ class ExpertCache:
         return dict(zip(names, self.lane.stats())) if self.lane else {}
 
     # -- decode ----------------------------------------------------------
-    def resolve(self, layer: int, ids: torch.Tensor) -> torch.Tensor:
-        """Slot ids for ``ids`` once every routed expert is resident."""
+    def resolve(
+        self,
+        layer: int,
+        ids: torch.Tensor,
+        weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Slot ids for ``ids`` once every routed expert is resident.
+
+        ``weights`` is accepted for signature parity with
+        :meth:`SharedOriginalExpertCache.resolve`, which ``gguf_moe`` calls
+        with the same arguments; slot resolution does not need it.
+        """
         self.start()
         if self.tm is not None and self.tm.preparation is not None:
             self.tm.preparation.wait_decode()

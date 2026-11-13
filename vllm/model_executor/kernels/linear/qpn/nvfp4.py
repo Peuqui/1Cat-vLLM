@@ -45,6 +45,19 @@ def compact_scales_allowed(policy: Sm70NvFp4Config) -> bool:
     )
 
 
+def _bundled_down_layout(layer, config) -> bool:
+    return bool(
+        config.policy.bundled_down_decode
+        and not config.gated_silu
+        and getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "down_proj"
+        and layer.weight.ndim == 2
+        and layer.weight.shape[0] > 0
+        and layer.weight.shape[0] % 32 == 0
+        and layer.weight.shape[1] > 0
+        and layer.weight.shape[1] % 64 == 0
+    )
+
+
 _SM70_NVFP4_QPN4_REQUIRED_OPS = (
     "nvfp4_qpn4_prepare_sm70",
     "nvfp4_qpn4_prepare_scale_code_sm70",
@@ -133,6 +146,7 @@ def _missing_qpn2_prefill_ops() -> list[str]:
 
 
 class TurboMindNvFp4LinearKernel(NvFp4LinearKernel):
+    input_dtype = torch.float16
     config: Sm70NvFp4LinearLayerConfig
 
     @classmethod
@@ -218,12 +232,17 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
                 sm70_nvfp4_native,  # noqa: F401
             )
 
-            workspace = _get_sm70_fp8_prefill_exact_dense_workspace(layer.weight)
             k = layer.input_size_per_partition
             n = (layer.weight.shape[0] + 31) // 32 * 32
+            workspace = _get_sm70_fp8_prefill_exact_dense_workspace(layer.weight)
+            if workspace is not None and workspace.numel() < k * n:
+                workspace = _get_sm70_fp8_prefill_exact_dense_workspace(
+                    layer.weight, k * n
+                )
             if workspace is not None and workspace.numel() >= k * n:
                 bundle_scales = (
-                    (k, n) in {(5120, 8704), (4352, 5120)}
+                    k % 64 == 0
+                    and n % 32 == 0
                     and hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70")
                     and sm70_nvfp4_native._get_bundled_prefill_code_workspace(
                         layer.weight, workspace
@@ -237,7 +256,7 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
                 layer.sm70_nvfp4_qpn2_output_size = n
                 layer.sm70_nvfp4_qpn2_gated_silu = self.config.gated_silu
                 layer.sm70_nvfp4_qpn2_split_k, layer.sm70_nvfp4_qpn2_nacc = (
-                    _qpn2_config(k, n, False)
+                    _qpn2_config(k, n, self.config.gated_silu)
                 )
                 layer.sm70_nvfp4_qpn2 = True
                 logger.info_once(
@@ -267,6 +286,28 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
             qpn2_codes, qpn2_scales = sm70_ops.nvfp4_qpn2_prepare_sm70(
                 qpn2_weight, qpn2_weight_scale
             )
+        if (
+            qpn2_shared
+            # Compact shared scales already retain one TurboMind packing.
+            # Its native projection schedule avoids another weight copy and
+            # preserves the original prefill accumulator/layout contract.
+            and not compact_scales
+            and _bundled_down_layout(layer, self.config)
+            and current_platform.is_device_capability(70)
+            and hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70")
+        ):
+            from vllm.model_executor.layers.quantization.utils import (
+                sm70_nvfp4_native,  # noqa: F401
+            )
+
+            codes, scales = sm70_ops.nvfp4_qpn2_prepare_sm70(
+                layer.weight.data, layer.weight_scale.data
+            )
+            codes, scales = sm70_ops.nvfp4_qpn2_bundle_sm70(codes, scales)
+            layer.register_buffer("sm70_nvfp4_bundled_down", codes, persistent=False)
+            layer.register_buffer(
+                "sm70_nvfp4_bundled_down_scales", scales, persistent=False
+            )
         qpn2_global_scale = float(layer.weight_global_scale.item())
         qpn2_prefill_enabled = False
         if self.config.policy.prefill:
@@ -291,7 +332,7 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
         gated = self.config.gated_silu
         k = layer.input_size_per_partition
         n = qpn2_output_size
-        split_k, nacc = _qpn2_config(k, n, False)
+        split_k, nacc = _qpn2_config(k, n, gated)
         if not qpn2_shared:
             layer.register_buffer("sm70_nvfp4_qpn2_codes", qpn2_codes, persistent=False)
         layer.register_buffer("sm70_nvfp4_qpn2_scales", qpn2_scales, persistent=False)
@@ -337,8 +378,21 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
         layer.sm70_nvfp4_qpn2_prefill_min_m = self.config.policy.prefill_min_m
         self._release_checkpoint_parameters(layer)
 
-    def apply_weights(self, layer, x, bias=None):
-        return self.apply_qpn2(layer, x, bias, gated_silu=False)
+    def supports_direct_output(self, layer: Any) -> bool:
+        return bool(
+            getattr(layer, "sm70_nvfp4_qpn2", False)
+            and int(
+                getattr(
+                    layer,
+                    "sm70_nvfp4_qpn2_output_size",
+                    layer.output_size_per_partition,
+                )
+            )
+            == int(layer.output_size_per_partition)
+        )
+
+    def apply_weights(self, layer, x, bias=None, output=None):
+        return self.apply_qpn2(layer, x, bias, gated_silu=False, output=output)
 
     def apply_fused_silu_and_mul(self, layer, x):
         if not layer.sm70_nvfp4_qpn2_gated_silu:
@@ -352,6 +406,7 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
         bias: torch.Tensor | None,
         *,
         gated_silu: bool,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Linear layers attach their prepared layout and tuning metadata during
         # loading; torch.nn.Module does not describe these dynamic fields.
@@ -369,10 +424,27 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
         if gated_silu:
             logical_output_size //= 2
             kernel_output_size //= 2
-        out_2d = torch.empty(
-            (x_2d.shape[0], kernel_output_size), dtype=x.dtype, device=x.device
-        )
+        if output is not None:
+            expected_shape = (*x.shape[:-1], logical_output_size)
+            if (
+                gated_silu
+                or kernel_output_size != logical_output_size
+                or output.shape != expected_shape
+                or output.dtype != x.dtype
+                or output.device != x.device
+                or not output.is_contiguous()
+            ):
+                raise ValueError(
+                    "Incompatible direct output tensor for SM70 NVFP4 QPN2."
+                )
+            out_2d = output.reshape(x_2d.shape[0], kernel_output_size)
+        else:
+            out_2d = torch.empty(
+                (x_2d.shape[0], kernel_output_size), dtype=x.dtype, device=x.device
+            )
         if x_2d.shape[0] == 0:
+            if output is not None:
+                return output
             return out_2d[:, :logical_output_size].reshape(
                 *x.shape[:-1], logical_output_size
             )
@@ -392,6 +464,29 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
                 split_k,
                 nacc,
                 gated_silu,
+                state.native_ops.arguments,
+            )
+        elif getattr(layer, "sm70_nvfp4_bundled_down", None) is not None:
+            state.native_ops.invoke(
+                torch.ops.vllm.sm70_nvfp4_bundled_down_dispatch,
+                out_2d,
+                x_2d,
+                layer.sm70_nvfp4_bundled_down,
+                layer.sm70_nvfp4_bundled_down_scales,
+                state.weight,
+                layer.sm70_nvfp4_qpn2_scales,
+                float(layer.sm70_nvfp4_qpn2_global_scale),
+                split_k,
+                nacc,
+                state.scales,
+                state.group_size,
+                state.k_ld,
+                state.q_ld,
+                gated_silu,
+                layer.sm70_nvfp4_qpn2_prefill_min_m
+                if layer.sm70_nvfp4_qpn2_prefill_enabled
+                else 0,
+                state.prescaled_scales,
                 state.native_ops.arguments,
             )
         elif getattr(layer, "sm70_nvfp4_qpn2_shared_weight", False):
@@ -453,6 +548,8 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
             out_2d = out_2d[:, :logical_output_size]
         if bias is not None:
             out_2d.add_(bias)
+        if output is not None:
+            return output
         return out_2d.reshape(*x.shape[:-1], logical_output_size)
 
 
@@ -469,19 +566,36 @@ class Qpn4NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
 
     def try_process_weights(self, layer):
         # Capability and qualification were checked by the common selector.
-        workspace = sm70_tm.get_nvfp4_qpn4_dense_workspace(layer.weight)
+        lazy_workspace = self.config.policy.qpn4_lazy_dense_workspace
+        if lazy_workspace:
+            workspace = sm70_tm.get_nvfp4_qpn4_dense_workspace(
+                layer.weight, temporary=True
+            )
+        else:
+            workspace = sm70_tm.get_nvfp4_qpn4_dense_workspace(layer.weight)
         if workspace is None:
             logger.warning_once(
                 "Insufficient memory for the bounded SM70 NVFP4 QPN4 "
                 "prefill workspace; retaining TurboMind."
             )
             return False
+        if lazy_workspace:
+            # Admission must precede conversion/fallback, but the probe must
+            # not become a resident tensor or a registered graph address.
+            del workspace
+            workspace = None
         sm70_tm.prepare_nvfp4_qpn4_linear(
             layer, workspace, gated_silu=self.config.dense_gated_silu
         )
         self._release_checkpoint_parameters(layer)
-        logger.info_once(
-            "Memory-neutral SM70 NVFP4 QPN4 M=1 decode "
-            "path enabled with bounded FP16 prefill workspace."
-        )
+        if workspace is None:
+            logger.info_once(
+                "SM70 NVFP4 QPN4 enabled with native temporary FP16 prefill "
+                "workspace; M=1 decode needs no dense workspace."
+            )
+        else:
+            logger.info_once(
+                "Memory-neutral SM70 NVFP4 QPN4 M=1 decode "
+                "path enabled with bounded FP16 prefill workspace."
+            )
         return True

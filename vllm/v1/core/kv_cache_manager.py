@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Literal, overload
 
 import vllm.envs as envs
+from vllm.config.cache import KVRetentionConfig
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -38,7 +39,7 @@ logger = init_logger(__name__)
 
 
 _V41_SESSION_PREFIX = envs.VLLM_V41_SESSION_PREFIX == "1"
-# A hit at P needs window rows [P - 128, P) still in the 256-row rings.
+# Available rewind behind the last committed token, before rejected drafts.
 _V41_RING_REACH = 128
 
 
@@ -144,8 +145,11 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         prefix_cache_retention_interval: int | None = None,
         partial_prefix_cache: bool = False,
+        num_speculative_tokens: int = 0,
+        retention_policy: KVRetentionConfig | None = None,
     ) -> None:
         self.max_model_len = max_model_len
+        self.num_speculative_tokens = num_speculative_tokens
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
         # always supplies the real value at runtime.
@@ -173,6 +177,7 @@ class KVCacheManager:
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
             use_lookahead_block_hashes=use_lookahead_block_hashes,
+            retention_policy=retention_policy,
         )
         self.coordinator.configure_prefix_cache_retention(
             prefix_cache_retention_interval
@@ -235,7 +240,10 @@ class KVCacheManager:
         if last is None or hit % 2:
             return False
         tokens, processed = last
-        if not processed - _V41_RING_REACH <= hit <= processed:
+        # Rejected drafts after the committed token may have overwritten
+        # older window slots. Reserve their actual configured lookahead.
+        reach = max(0, _V41_RING_REACH - max(0, self.num_speculative_tokens - 1))
+        if not processed - reach <= hit <= processed:
             return False
         return list(request.all_token_ids)[:hit] == tokens[:hit]
 
@@ -376,10 +384,18 @@ class KVCacheManager:
                     [self.block_pool.null_block] * first + entry.blocks[group_id]
                 )
         demand = {group_id: 1 for group_id, copy in enumerate(entry.copy_last) if copy}
-        if not self.block_pool.can_allocate_group_blocks(demand):
+        if not self._can_allocate(demand):
             return None
         request.partial_prefix_entry = entry
         return tuple(blocks), boundary
+
+    def _can_allocate(self, demand: dict[int, int]) -> bool:
+        # Partition quotas alone pass whenever the pool is not partitioned;
+        # an empty pool must skip optional copies, not raise (#1483).
+        num_blocks = sum(demand.values())
+        return num_blocks <= self.block_pool.get_num_free_blocks() and (
+            self.block_pool.can_allocate_group_blocks(demand)
+        )
 
     def _defer_release(self, blocks: list[KVCacheBlock]) -> None:
         # Async scheduling runs up to two steps ahead of the worker; the copy
@@ -432,10 +448,10 @@ class KVCacheManager:
             if len(sources) != len(managers):
                 continue
             demand = {g: len(blocks) for g, blocks in enumerate(sources)}
-            while not self.block_pool.can_allocate_group_blocks(demand):
+            while not self._can_allocate(demand):
                 if not cache.evict_one():
                     break
-            if not self.block_pool.can_allocate_group_blocks(demand):
+            if not self._can_allocate(demand):
                 continue
             targets: list[list[KVCacheBlock]] = []
             for group_id, group_sources in enumerate(sources):

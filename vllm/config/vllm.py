@@ -706,7 +706,13 @@ class VllmConfig:
         is_mrv2_dflash = (
             self.speculative_config is not None and self.speculative_config.use_dflash()
         )
+        has_draft_vocab = (
+            self.speculative_config is not None
+            and self.speculative_config.draft_token_map is not None
+        )
         if use_v2_model_runner is not None:
+            if has_draft_vocab and not use_v2_model_runner:
+                raise ValueError("draft_token_map requires Model Runner V2.")
             if is_qwen4_exp and not use_v2_model_runner:
                 raise ValueError(
                     "Qwen4Exp requires Model Runner V2 for its QSA ring cache "
@@ -722,7 +728,12 @@ class VllmConfig:
         # The old V1 flat-DFlash route is intentionally removed. Force every
         # method='dflash' checkpoint through the MRV2 speculator and fail in
         # _validate_v2_model_runner if another configured feature is unsupported.
-        if is_mrv2_dflash:
+        if is_mrv2_dflash or has_draft_vocab:
+            return True
+
+        # The model adapter qualifies its speculative metadata, graphs and
+        # sampling contract before selecting the runner.
+        if self.kernel_config.prefer_speculative_runner(self):
             return True
 
         if not self._is_default_v2_model_runner_model():
@@ -1142,6 +1153,8 @@ class VllmConfig:
         # unset falls back to the stock ones.
         self.parallel_config.set_dcp_defaults()
 
+        self.kernel_config.resolve_speculative_defaults(self)
+
         if self.kernel_config.resolve_attention_history(self):
             policy = self.kernel_config
             logger.info_once(
@@ -1187,7 +1200,12 @@ class VllmConfig:
         )
         self.kernel_config.capture_provider_inputs()
         self.kernel_config.sm70_nvfp4.resolve(
-            qualified=sm70_dflash2_nvfp4_qualified(self), active=False
+            qualified=sm70_dflash2_nvfp4_qualified(self),
+            active=False,
+            enforce_eager=(
+                self.model_config is not None and self.model_config.enforce_eager
+            ),
+            kv_cache_memory_bytes=self.cache_config.kv_cache_memory_bytes,
         )
         if self.model_config is not None and self.model_config.quantization == "awq":
             self.kernel_config.sm70_awq.resolve()
@@ -1711,7 +1729,12 @@ class VllmConfig:
         bind_moe_diagnostics(
             self.kernel_config, self.observability_config.runtime_trace
         )
-        self.kernel_config.resolve_gdn(self.model_config, self.additional_config)
+        self.kernel_config.resolve_gdn(
+            self.model_config,
+            self.additional_config,
+            self.speculative_config,
+            self.parallel_config,
+        )
         if self.speculative_config is not None:
             self.speculative_config.resolve_execution_policy()
 

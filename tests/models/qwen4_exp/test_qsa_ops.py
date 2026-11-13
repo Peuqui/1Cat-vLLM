@@ -215,6 +215,28 @@ def _install_flash_v100(monkeypatch, flash_cuda) -> None:
     )
 
 
+def test_qsa_page4_head_rows_fall_back_for_strided_output():
+    query = torch.empty((2, 12, 256), dtype=torch.float16)
+    cache = torch.empty((1, 16, 1, 256), dtype=torch.float16)
+    output = torch.empty((4, 12, 256), dtype=torch.float16)[::2]
+    indices = torch.zeros((2, 2051), dtype=torch.int32)
+    result = qsa_ops._qsa_sparse_paged_attention_sm70_xqa_page4(
+        query,
+        cache,
+        cache,
+        indices,
+        torch.zeros((1, 1), dtype=torch.int32),
+        torch.zeros(2, dtype=torch.int32),
+        torch.arange(2, dtype=torch.int64),
+        torch.tensor([16], dtype=torch.int32),
+        output,
+        "auto",
+        1.0,
+        1.0,
+    )
+    assert result is None
+
+
 def test_flash_v100_page4_device_support_asks_the_build_per_device(monkeypatch):
     calls = []
 

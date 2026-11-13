@@ -4,6 +4,7 @@
 import ast
 import json
 import math
+from decimal import Decimal
 from json import JSONDecodeError, JSONDecoder
 from typing import Any, TypeAlias
 
@@ -565,7 +566,11 @@ def _parse_finite_number(value: str) -> int | float | None:
         return None
     if not math.isfinite(number):
         return None
-    return int(number) if number.is_integer() else number
+    if number.is_integer():
+        exact = Decimal(value)
+        if exact == exact.to_integral_value():
+            return int(exact)
+    return number
 
 
 def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:

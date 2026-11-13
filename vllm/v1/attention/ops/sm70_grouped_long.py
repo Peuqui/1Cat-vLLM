@@ -13,14 +13,11 @@ import torch
 from vllm.config.execution_policy import flash_v100_options
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.v1.attention.ops.sm70_grouped import model_context_limit
 
 logger = init_logger("vllm.v1.attention.ops.sm70_e4m3_long")
 
-# Capacity the shipped operator was qualified for. This is a claim about the
-# compiled kernel, not a service limit: the graph bound the route is captured at
-# is the smaller of this and the context the model is actually served with, so a
-# deployment with a different window is routed on its own value and the operator
-# is never asked for more context than it was admitted for.
+# Compatibility capacity of binaries predating the dynamic-context ABI.
 BUILTIN_MAX_CONTEXT = 262144
 MANIFEST_ENV = "VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST"
 DISABLE_ENV = "VLLM_SM70_E4M3_LONG_ATTENTION"
@@ -35,7 +32,7 @@ BUILTIN_OP = "sm70_grouped_long_fwd"
 # route was qualified with. The source digest names that layout so a rebuilt
 # kernel cannot silently inherit the workspace identity of a different one.
 BUILTIN_SOURCE_SHA256 = (
-    "e98db3a38dfae231ec164c3e14c9e755f362af9c089dcc36331b32b7b8d8e55f"
+    "ec65f7f1b0e40efb3b36f6deb1eaaf83bad5ab2c3f5c874a88205cab67111218"
 )
 # Every B1 verifier tail width uses the long-context graph contract at this
 # capacity; q1 additionally has the compact scalar tail.
@@ -114,7 +111,7 @@ def load_long_attention(manifest_name: str):
         raise ValueError("The long-attention serving route requires 80 six-head splits")
     context_limit, query_rows = long_attention_contract(manifest)
     logger.info_once(
-        "Loaded experimental SM70 E4M3 q8 attention: module=%s SHA256=%s "
+        "Loaded experimental SM70 E4M3 attention: module=%s SHA256=%s "
         "max_context=%d query_rows=%s; 80 splits, compensated FP32 state.",
         manifest["module_name"],
         manifest["library_sha256"],
@@ -131,6 +128,40 @@ def long_attention_capability(manifest) -> int:
     if type(capability) is not int or capability <= 0:
         raise ValueError("Unsupported long-attention operator capacity")
     return capability
+
+
+def builtin_dynamic_context(*, scalar: bool = False) -> bool:
+    """The loaded DSO, including each independently built operator, owns its ABI."""
+    name = (
+        "sm70_scalar_attention_workspace_revision"
+        if scalar
+        else "sm70_grouped_long_context_revision"
+    )
+    revision = (
+        getattr(torch.ops._vllm_fa2_C, name, None)
+        if builtin_long_attention() is not None
+        else None
+    )
+    return revision is not None and revision() >= 1
+
+
+def builtin_context_limit(capacity: int | None = None, *, scalar: bool = False) -> int:
+    """Resolve the served window against the loaded operator's workspace ABI."""
+    capacity = model_context_limit(capacity, fallback=BUILTIN_MAX_CONTEXT)
+    return (
+        capacity
+        if builtin_dynamic_context(scalar=scalar)
+        else min(capacity, BUILTIN_MAX_CONTEXT)
+    )
+
+
+def context_table_supported(table, page_size: int, capacity: int) -> bool:
+    """The graph's served window admits its page-rounded table, never wider."""
+    return (
+        table.ndim == 2
+        and page_size > 0
+        and 0 < table.shape[1] <= (capacity + page_size - 1) // page_size
+    )
 
 
 def long_attention_query_rows(manifest) -> tuple[int, ...]:
@@ -158,7 +189,7 @@ def long_attention_contract(manifest, capacity: int | None = None):
     )
 
 
-def resolve_long_attention(policy=None):
+def resolve_long_attention(policy=None, capacity: int | None = None):
     """The route in effect: an explicit manifest candidate, else the shipped one."""
     policy = flash_v100_options() if policy is None else policy
     if not long_attention_enabled(policy):
@@ -169,20 +200,32 @@ def resolve_long_attention(policy=None):
     operator = builtin_long_attention()
     if operator is None:
         return None, None
+    capability = builtin_context_limit(capacity)
+    manifest = dict(BUILTIN_MANIFEST, max_context=capability)
     logger.info_once(
-        "Using the shipped SM70 E4M3 q8 long-context route (%s): capability=%d "
+        "Using the shipped SM70 E4M3 long-context route (%s): capability=%d "
         "query_rows=%s; 80 splits, compensated FP32 state.",
         BUILTIN_OP,
-        BUILTIN_MAX_CONTEXT,
+        capability,
         BUILTIN_QUERY_ROWS,
         scope="process",
     )
-    return operator, BUILTIN_MANIFEST
+    revision = getattr(
+        torch.ops._vllm_fa2_C, "sm70_grouped_long_query_rows_revision", None
+    )
+    if revision is not None:
+        manifest = {**manifest, "query_rows_revision": int(revision())}
+    kv_revision = getattr(
+        torch.ops._vllm_fa2_C, "sm70_grouped_long_kv_heads_revision", None
+    )
+    if kv_revision is not None:
+        manifest = {**manifest, "kv_heads_revision": int(kv_revision())}
+    return operator, manifest
 
 
 def long_attention_graph_contract(capacity: int | None = None, *, policy=None):
     """The captured bound for ``capacity``, or ``(None, ())`` when route is off."""
-    _, manifest = resolve_long_attention(policy)
+    _, manifest = resolve_long_attention(policy, capacity)
     if manifest is None:
         return None, ()
     return long_attention_contract(manifest, capacity)
@@ -198,9 +241,20 @@ def long_attention_max_batch_size(manifest=None, *, policy=None) -> int:
         query = getattr(torch.ops._vllm_fa2_C, "sm70_grouped_long_max_batch_size", None)
         return int(query()) if query is not None else 1
     batch_size = manifest.get("max_batch_size", 1)
-    if type(batch_size) is not int or not 1 <= batch_size <= 16:
+    if type(batch_size) is not int or batch_size < 1:
         raise ValueError("Unsupported long-attention batch contract")
     return batch_size
+
+
+def long_attention_batch_query_rows(manifest=None, *, policy=None) -> tuple[int, ...]:
+    if manifest is None:
+        _, manifest = resolve_long_attention(policy)
+    if manifest is None:
+        return ()
+    rows = long_attention_query_rows(manifest)
+    if manifest.get("query_rows_revision", 1) >= 2:
+        return rows
+    return tuple(row for row in rows if row == 8)
 
 
 # Keep the qualified fixed pages for older native libraries. Rebuilt libraries
@@ -232,12 +286,20 @@ def _report_unadmitted_page_size(page_size: int) -> None:
 
 
 def wrap_long_attention(fallback):
+    from vllm.config import get_current_vllm_config_or_none
+
     operator, manifest = resolve_long_attention()
     if operator is None:
         return fallback
     capability = long_attention_capability(manifest)
     query_rows = long_attention_query_rows(manifest)
     max_batch_size = long_attention_max_batch_size(manifest)
+    request_query_rows = long_attention_batch_query_rows(manifest)
+    config = get_current_vllm_config_or_none()
+    model = getattr(config, "model_config", None)
+    model_capacity = getattr(model, "max_model_len", None)
+    variable_request_rows = manifest.get("query_rows_revision", 1) >= 2
+    parallel_kv_heads = manifest.get("kv_heads_revision", 0) >= 1
 
     def run(
         q, k, v, table, row_lengths, *, out, softmax_scale, k_scale=1.0, v_scale=1.0
@@ -250,10 +312,14 @@ def wrap_long_attention(fallback):
         bucket = getattr(descriptor, "attention_context_bucket", None)
         batch_size = int(table.shape[0]) if table.ndim == 2 else 0
         num_rows = q.shape[0] if q.ndim == 3 else 0
-        request_major_q8 = (
+        if bucket is None and variable_request_rows and table.ndim == 2 and k.ndim == 4:
+            # Bind the loaded model's window once. The physical table supplies
+            # a conservative bound for direct callers without a model config.
+            bucket = model_capacity or int(table.shape[1]) * int(k.shape[1])
+        request_major_batch = (
             2 <= batch_size <= max_batch_size
-            and 8 in query_rows
-            and num_rows == batch_size * 8
+            and num_rows % batch_size == 0
+            and num_rows // batch_size in request_query_rows
         )
         single_request_tail = batch_size == 1 and num_rows in query_rows
         # The graph builder owns the served window: it stamps the bound it
@@ -263,10 +329,11 @@ def wrap_long_attention(fallback):
             bucket is not None
             and bucket <= capability
             and q.ndim == 3
-            and (single_request_tail or request_major_q8)
+            and (single_request_tail or request_major_batch)
             and q.shape[1] > 0
             and q.shape[2] == 256
             and k.ndim == 4
+            and context_table_supported(table, k.shape[1], capability)
             and table.is_contiguous()
             and row_lengths.ndim == 1
             and row_lengths.shape[0] == q.shape[0]
@@ -291,11 +358,12 @@ def wrap_long_attention(fallback):
         # Allocate a fixed workspace once for each warmup/capture stream. Graph
         # replay never allocates. Layers reuse it in stream order; different
         # streams and versions never share the legacy 80-split buffers.
-        if request_major_q8:
+        if request_major_batch:
             logger.info_once(
-                "SM70 E4M3 long q8 request-major route selected: batch=%d "
-                "page=%d bound=%d; shared full-q8 kernel, FP32 state.",
+                "SM70 E4M3 long request-major route selected: batch=%d "
+                "query_rows=%d page=%d bound=%d; FP32 state.",
                 batch_size,
+                num_rows // batch_size,
                 k.shape[1],
                 bucket,
                 scope="process",
@@ -303,24 +371,25 @@ def wrap_long_attention(fallback):
         stream = torch.cuda.current_stream(q.device).cuda_stream
         key = (manifest["source_sha256"], bucket, 80, q.device, stream)
         bank = _WORKSPACES.setdefault(key, [])
+        panels = batch_size * (k.shape[2] if parallel_kv_heads else 1)
         # Full graphs replay in stream order, just like successive layers.
         # Reuse a larger request panel for smaller captures. Keep older panels
         # alive when growing: an earlier graph may still reference them.
         for partial, lse in bank:
-            if partial.shape[0] >= batch_size:
+            if partial.shape[0] >= panels:
                 break
         else:
             partial = torch.empty(
-                (batch_size, 80, 8, 6, 256), dtype=torch.float32, device=q.device
+                (panels, 80, 8, 6, 256), dtype=torch.float32, device=q.device
             )
             lse = torch.empty(
-                (batch_size, 80, 8, 6, 2), dtype=torch.float32, device=q.device
+                (panels, 80, 8, 6, 2), dtype=torch.float32, device=q.device
             )
             bank.append((partial, lse))
-        if batch_size == 1:
+        if panels == 1:
             partial, lse = partial[0], lse[0]
         else:
-            partial, lse = partial[:batch_size], lse[:batch_size]
+            partial, lse = partial[:panels], lse[:panels]
         return run_six_head_groups(
             operator,
             q,
@@ -334,19 +403,27 @@ def wrap_long_attention(fallback):
             float(softmax_scale),
             float(k_scale),
             float(v_scale),
+            parallel_kv_heads=parallel_kv_heads,
         )
 
+    if variable_request_rows and (
+        model_capacity is None or model_capacity <= capability
+    ):
+        run.__dict__.update(
+            request_query_rows=request_query_rows,
+            max_batch_size=max_batch_size,
+        )
     return run
 
 
-def run_six_head_groups(operator, q, k, v, out, *args):
+def run_six_head_groups(operator, q, k, v, out, *args, parallel_kv_heads=False):
     """Reuse the validated six-head kernel without copying the paged KV cache.
 
-    Each group retains the original reduction order. The shared workspace is
-    consumed serially on the current stream; graph capture retains the small
-    query/output buffers used for the individual groups.
+    Rebuilt operators parallelize KV heads in one grid and own a workspace
+    panel per head/request. Older binaries consume one shared panel serially;
+    graph capture retains their per-group query/output buffers.
     """
-    if k.shape[2] == 1:
+    if k.shape[2] == 1 or parallel_kv_heads:
         return operator(q, k, v, out, *args)
     for head in range(k.shape[2]):
         group_q = q[:, head * 6 : (head + 1) * 6].contiguous()

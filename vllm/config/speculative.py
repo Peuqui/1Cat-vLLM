@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import hashlib
 import math
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from pydantic import Field, SkipValidation, field_validator, model_validator
@@ -267,6 +269,8 @@ class SpeculativeConfig:
     `--speculative-token-map` file (`.pt`) or a JSON list; EOS ids are always
     included. Requires method 'mtp', an unquantized lm_head shared with the
     target, and Model Runner V2. Backport of vllm-project/vllm#59740."""
+    draft_token_map_sha256: str | None = Field(default=None, init=False)
+    """Initialization-bound token-map identity, checked again by each worker."""
 
     # Alternative drafting strategies
     parallel_drafting: bool = False
@@ -457,6 +461,8 @@ class SpeculativeConfig:
         factors: list[Any] = [
             ("use_local_argmax_reduction", self.use_local_argmax_reduction)
         ]
+        if self.draft_token_map is not None:
+            factors.append(("draft_token_map_sha256", self.draft_token_map_sha256))
         if self.method == "dspark":
             factors.append(
                 ("diagnostic_confidence_logits", self.diagnostic_confidence_logits)
@@ -514,7 +520,7 @@ class SpeculativeConfig:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
 
-        if self.use_dflash_ddtree() and not self.ddtree_disable_tree_verify:
+        if self.uses_tree_verification():
             factors.append(
                 (
                     "dflash_ddtree",
@@ -1163,12 +1169,16 @@ class SpeculativeConfig:
                         self.draft_model_config.max_model_len,
                         self.target_model_config.max_model_len,
                     )
-                if (
-                    self.method == "dspark"
-                    and __import__("os").environ.get("VLLM_V41_PACKED_KV", "0") == "1"
+                if self.method == "dspark" and (
+                    __import__("os").environ.get("VLLM_V41_PACKED_KV", "0") == "1"
+                    or getattr(
+                        self.target_model_config.hf_text_config, "model_type", None
+                    )
+                    == "deepseek_v41_text"
                 ):
                     # V4.1 DSpark attends only its sliding window and rotates
-                    # RoPE on the fly past its table: it covers the target length.
+                    # RoPE on the fly past its table: it covers the target length
+                    # (without this, requests past its 16K table get no drafts).
                     self.draft_model_config.max_model_len = max(
                         self.draft_model_config.max_model_len,
                         self.target_model_config.max_model_len,
@@ -1539,6 +1549,10 @@ class SpeculativeConfig:
             raise ValueError(
                 f"draft_token_map requires method 'mtp', got {self.method!r}."
             )
+        if self.draft_token_map is not None and self.draft_token_map_sha256 is None:
+            self.draft_token_map_sha256 = hashlib.sha256(
+                Path(self.draft_token_map).read_bytes()
+            ).hexdigest()
         if self.ngram_assist:
             if not self.use_dflash():
                 raise ValueError("ngram_assist is only supported with method='dflash'.")
@@ -1720,9 +1734,16 @@ class SpeculativeConfig:
     def use_dspark(self) -> bool:
         return self.method == "dspark"
 
+    def uses_tree_verification(self) -> bool:
+        return self.use_dflash_ddtree() and not self.ddtree_disable_tree_verify
+
+    def supports_pp_row_retention(self) -> bool:
+        """Incremental GPU drafting and tree-path acceptance need other state."""
+        return not (self.use_ngram_gpu() or self.use_dflash_ddtree())
+
     def num_speculative_state_tokens(self) -> int:
         num_spec_tokens = self.num_speculative_tokens or 0
-        if self.use_dflash_ddtree() and not self.ddtree_disable_tree_verify:
+        if self.uses_tree_verification():
             return max(num_spec_tokens, self.ddtree_budget or num_spec_tokens)
         return num_spec_tokens
 

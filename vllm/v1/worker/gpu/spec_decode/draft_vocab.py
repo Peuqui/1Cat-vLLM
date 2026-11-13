@@ -5,7 +5,10 @@
 Only drafting changes: the target still verifies with its full lm_head.
 """
 
+import hashlib
+import io
 import json
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -24,7 +27,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def load_draft_token_ids(path: str, extra_ids: list[int]) -> torch.Tensor:
+def load_draft_token_ids(
+    path: str, extra_ids: list[int], expected_sha256: str | None = None
+) -> torch.Tensor:
     """Load a draft token map and return its sorted, unique target ids.
 
     Args:
@@ -35,17 +40,28 @@ def load_draft_token_ids(path: str, extra_ids: list[int]) -> torch.Tensor:
         int64 CPU tensor of target token ids.
 
     """
+    payload = Path(path).read_bytes()
+    if (
+        expected_sha256 is not None
+        and hashlib.sha256(payload).hexdigest() != expected_sha256
+    ):
+        raise ValueError("draft_token_map changed after configuration initialization.")
     if path.endswith(".json"):
-        with open(path) as f:
-            ids = json.load(f)
+        ids = json.loads(payload)
     else:
-        ids = torch.load(path, map_location="cpu", weights_only=True)
+        ids = torch.load(io.BytesIO(payload), map_location="cpu", weights_only=True)
         if isinstance(ids, torch.Tensor):
-            ids = ids.flatten().tolist()
+            if ids.ndim != 1:
+                raise ValueError(
+                    "draft_token_map must hold a flat list of integer ids."
+                )
+            ids = ids.tolist()
     if not isinstance(ids, (list, tuple)):
         raise ValueError(f"draft_token_map {path!r} must hold a flat list of ids.")
 
-    token_ids = torch.tensor([int(i) for i in ids] + extra_ids, dtype=torch.int64)
+    if any(not isinstance(i, int) or isinstance(i, bool) for i in [*ids, *extra_ids]):
+        raise ValueError("draft_token_map must hold a flat list of integer ids.")
+    token_ids = torch.tensor([*ids, *extra_ids], dtype=torch.int64)
     if token_ids.numel() == 0:
         raise ValueError("draft_token_map is empty.")
     return torch.unique(token_ids, sorted=True)
@@ -84,7 +100,15 @@ class DraftVocab:
     """
 
     def __init__(self, token_ids: torch.Tensor, lm_head: nn.Module):
-        lm_head = getattr(lm_head, "base_layer", lm_head)
+        if hasattr(lm_head, "base_layer"):
+            raise ValueError("draft_token_map does not support an adapted lm_head.")
+        if (
+            token_ids.ndim != 1
+            or token_ids.dtype != torch.int64
+            or not token_ids.numel()
+        ):
+            raise ValueError("draft_token_map needs a nonempty int64 vector.")
+        token_ids = torch.unique(token_ids.cpu(), sorted=True)
         if not hasattr(lm_head, "shard_indices"):
             raise ValueError(
                 "draft_token_map needs a vocab-parallel lm_head, got "
@@ -177,6 +201,7 @@ def make_draft_vocab(
     model_config: "ModelConfig",
     draft_model: nn.Module,
     target_lm_head: nn.Module,
+    expected_sha256: str | None = None,
 ) -> DraftVocab:
     """Build a draft vocabulary, always including EOS, and install it."""
     eos_ids: list[int] = []
@@ -186,7 +211,7 @@ def make_draft_vocab(
     ):
         if eos is not None:
             eos_ids.extend(eos if isinstance(eos, (list, tuple)) else [eos])
-    token_ids = load_draft_token_ids(token_map, eos_ids)
+    token_ids = load_draft_token_ids(token_map, eos_ids, expected_sha256)
     draft_vocab = DraftVocab(token_ids, target_lm_head)
     draft_vocab.install(draft_model, target_lm_head)
     return draft_vocab

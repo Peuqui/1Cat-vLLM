@@ -15,7 +15,7 @@ def _config() -> VllmConfig:
 def test_replace_alone_drops_the_runtime_resources():
     # The reason share_runtime_resources exists: a drafter built from this copy
     # would register its native owners in a map the target's forward never
-    # activates (GLM-5.3 DFlash2 drafter in block FP8, 2026-11-06).
+    # activates (seen with a block-FP8 GLM-5.3-Flash DFlash2 drafter).
     parent = _config()
     copy = replace(parent, is_speculative_draft=True)
     assert runtime_resources_for(copy) is not runtime_resources_for(parent)

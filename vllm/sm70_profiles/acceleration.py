@@ -708,7 +708,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         report["linear_kernel_policy"] = {
             "scope": "ct_nvfp4_linear",
             "status": "runtime_guarded",
-            "configuration": json.loads(json.dumps(asdict(policy))),
+            "configuration": json.loads(
+                json.dumps(asdict(policy), default=_json_default)
+            ),
             "qpn2_reason": (
                 "configuration_not_resolved"
                 if not policy.resolved
@@ -853,7 +855,8 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         fp16_reason,
         kv_cache_dtype=dtype,
         runtime_guards="FP16 operands; local Q/KV heads=6/1, D=256; page=832; "
-        "causal full context; B1 q2..8 or B2..4 q8; capacity<=266240",
+        "causal full context; B1 q2..8 or B2..4 q8; "
+        "served-window capacity requires the FP16 context revision",
         arithmetic="FP32 probability/PV/numerator/max/sum",
         short_context_splits=_row(
             fp16_reason

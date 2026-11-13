@@ -6,6 +6,8 @@ from dataclasses import replace
 from math import lcm
 from typing import NamedTuple
 
+from vllm.config.cache import KVRetentionConfig
+from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -28,6 +30,8 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 
+logger = init_logger(__name__)
+
 
 class KVCacheCoordinator(ABC):
     """
@@ -47,6 +51,7 @@ class KVCacheCoordinator(ABC):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         use_lookahead_block_hashes: bool = False,
+        retention_policy: KVRetentionConfig | None = None,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -63,6 +68,7 @@ class KVCacheCoordinator(ABC):
             device_state_blocks=kv_cache_config.device_state_blocks,
             device_state_group_ids=kv_cache_config.device_state_group_ids,
             use_lookahead_block_hashes=use_lookahead_block_hashes,
+            retention_policy=retention_policy,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -392,6 +398,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         use_lookahead_block_hashes: bool = False,
+        retention_policy: KVRetentionConfig | None = None,
     ):
         super().__init__(
             kv_cache_config,
@@ -405,6 +412,7 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             use_lookahead_block_hashes=use_lookahead_block_hashes,
+            retention_policy=retention_policy,
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -442,6 +450,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         use_lookahead_block_hashes: bool = False,
+        retention_policy: KVRetentionConfig | None = None,
     ):
         super().__init__(
             kv_cache_config,
@@ -455,6 +464,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             use_lookahead_block_hashes=use_lookahead_block_hashes,
+            retention_policy=retention_policy,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.global_block_size(
@@ -526,6 +536,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
         use_lookahead_block_hashes: bool = False,
+        retention_policy: KVRetentionConfig | None = None,
     ):
         super().__init__(
             kv_cache_config,
@@ -539,6 +550,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             use_lookahead_block_hashes=use_lookahead_block_hashes,
+            retention_policy=retention_policy,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -621,6 +633,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # block cache hit yet.
         block_sizes = [group.spec.block_size for group in self.attention_groups]
         self.lcm_block_size = lcm(*block_sizes)
+        if self.lcm_block_size > max(block_sizes):
+            # Not nested: every hit must span the whole LCM (#1422).
+            logger.warning(
+                "Prefix-cache block sizes %s do not divide each other, so a "
+                "cache hit needs a %d-token prefix. Pass --block-size and "
+                "--mamba-block-size explicitly (for example both 2048) to "
+                "reuse shorter prefixes.",
+                sorted(set(block_sizes)),
+                self.lcm_block_size,
+            )
 
         # Propagate the eagle bit to each manager (default to ``use_eagle=False``).
         for group in self.attention_groups:
@@ -782,6 +804,7 @@ def get_kv_cache_coordinator(
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
     use_lookahead_block_hashes: bool = False,
+    retention_policy: KVRetentionConfig | None = None,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -795,6 +818,7 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             use_lookahead_block_hashes=use_lookahead_block_hashes,
+            retention_policy=retention_policy,
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
@@ -809,6 +833,7 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
             use_lookahead_block_hashes=use_lookahead_block_hashes,
+            retention_policy=retention_policy,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,
@@ -822,4 +847,5 @@ def get_kv_cache_coordinator(
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
         use_lookahead_block_hashes=use_lookahead_block_hashes,
+        retention_policy=retention_policy,
     )

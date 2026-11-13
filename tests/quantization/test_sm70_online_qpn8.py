@@ -200,6 +200,50 @@ def test_online_qpn8_apply_uses_prepared_state(monkeypatch):
     assert calls[0][-1] is False
 
 
+@pytest.mark.parametrize(
+    "rows,compiling", [(1, False), (8, False), (17, False), (8, True), (17, True)]
+)
+def test_linear_respects_requantized_weights_with_old_fp16_cache(
+    monkeypatch, rows, compiling
+):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    layer = torch.nn.Module()
+    layer.register_buffer("weight", torch.zeros((32, 128), dtype=torch.uint8))
+    layer.register_buffer(
+        "_sm70_dflash2_fp16_packed", torch.empty(32, 128, dtype=torch.float16)
+    )
+    layer._sm70_dflash2_fp16_geometry = (16, 16)
+    layer._sm70_mtp_draft_qpn8_ready = True
+    layer._sm70_mtp_draft_qpn8_shape = (32, 128)
+    layer._sm70_mtp_draft_qpn8_config = (4, 2, False)
+    layer.register_buffer("_sm70_mtp_draft_qpn8_scales", torch.ones(32))
+    calls = []
+
+    def dispatch(output, x, weight, scales, *configuration):
+        assert weight is layer.weight
+        calls.append(x.shape[0])
+        output.fill_(2)
+
+    def stale_fp16_dispatch(*args):
+        pytest.fail("The cached FP16 layout belongs to replaced weights")
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: compiling)
+    monkeypatch.setattr(
+        torch.ops.vllm, "sm70_ct_fp8_qpn8_dispatch", dispatch, raising=False
+    )
+    monkeypatch.setattr(
+        torch.ops._C,
+        "sm70_dflash2_fp16_dispatch_out",
+        stale_fp16_dispatch,
+        raising=False,
+    )
+    x = torch.ones(rows, 128, dtype=torch.float16)
+    output = UnquantizedLinearMethod().apply(layer, x)
+    assert calls == [rows]
+    assert torch.equal(output, torch.full((rows, 32), 2, dtype=torch.float16))
+
+
 def test_fused_hc_uses_prepared_partials_without_global_lookup(monkeypatch):
     down = torch.nn.Module()
     up = torch.nn.Module()
@@ -273,3 +317,46 @@ def test_channel_qpn8_accepts_k16_n32_alignment():
     torch.accelerator.synchronize()
     relative_l2 = (out.float() - reference.float()).norm() / reference.float().norm()
     assert float(relative_l2) < 5e-3
+
+
+def test_mtp_draft_qpn8_fc_and_fused_gated_silu(monkeypatch):
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization import (
+        sm70_mtp_draft_qpn8 as draft_qpn8,
+    )
+
+    assert "fc" in draft_qpn8._SUFFIXES
+
+    layer = torch.nn.Module()
+    layer.prefix = "mtp.layers.0.mlp.gate_up_proj"
+    layer.weight = torch.nn.Parameter(
+        torch.zeros((128 * 128,), dtype=torch.uint8), requires_grad=False
+    )
+    layer.register_buffer(
+        "_sm70_mtp_draft_qpn8_scales",
+        torch.ones((1, 128), dtype=torch.float16),
+        persistent=False,
+    )
+    layer._sm70_mtp_draft_qpn8_shape = (128, 128)
+    layer._sm70_mtp_draft_qpn8_config = (16, 2, False)
+    layer._unquantized_fused_silu_and_mul = draft_qpn8.apply_mtp_draft_qpn8_fused_silu
+    setattr(layer, draft_qpn8._READY, True)
+
+    calls = []
+
+    def fake_ct_dispatch(
+        out, x, codes, scales, split_k, nacc, prefetch, gated_silu, policy=None
+    ):
+        calls.append((split_k, nacc, prefetch, gated_silu, tuple(out.shape)))
+        out.fill_(1.5)
+
+    monkeypatch.setattr(
+        torch.ops.vllm, "sm70_ct_fp8_qpn8_dispatch", fake_ct_dispatch, raising=False
+    )
+    x = torch.ones((2, 3, 128), dtype=torch.float16)
+    fused = UnquantizedLinearMethod().apply_fused_silu_and_mul(layer, x)
+    assert fused is not None and fused.shape == (2, 3, 64)
+    assert calls == [(8, 2, False, True, (6, 64))]
+
+    layer.prefix = "mtp.fc"
+    assert UnquantizedLinearMethod().apply_fused_silu_and_mul(layer, x) is None

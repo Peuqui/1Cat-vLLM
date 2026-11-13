@@ -1194,10 +1194,10 @@ def test_no_spec_tokens_scheduled_for_prefill_chunks():
 
 
 def test_sync_pp_spec_decode_waits_for_in_flight_step(monkeypatch):
-    """Sync scheduling under PP keeps several steps in flight, and a step's drafts
-    reach the scheduler before its sampled token. A request must not be
-    scheduled again in that window: it would carry the drafts without the token
-    they follow (draft_len rows for draft_len drafts)."""
+    """Sync scheduling under PP keeps several steps in flight. A request must not
+    be scheduled again while its step is in flight, even when drafts reach the
+    scheduler before that step's sampled token: it would carry the drafts
+    without the token they follow (draft_len rows for draft_len drafts)."""
     # Scheduler bookkeeping is CPU-only; do not require two physical GPUs.
     pretend_gpu_count(monkeypatch, 2)
     num_spec_tokens = 3
@@ -1222,7 +1222,7 @@ def test_sync_pp_spec_decode_waits_for_in_flight_step(monkeypatch):
     prefill = scheduler.schedule()
     scheduler.update_from_output(prefill, model_output([42]))
 
-    # A plain decode step goes into the pipeline; its drafts arrive before its
+    # A plain decode step goes into the pipeline; drafts arrive before its
     # sampled token.
     decode = scheduler.schedule()
     assert decode.num_scheduled_tokens[req.request_id] == 1
@@ -4578,23 +4578,6 @@ def test_eagle3_mm_encoder_cache_with_shift():
     )
 
 
-def test_new_block_ids_drained_without_kv_cache_zeroing():
-    """Without Mamba layers nothing zeroes new blocks, but the managers still
-    record them; the scheduler must drain the list every step or it grows for
-    the lifetime of the engine (vllm-project/vllm#44490)."""
-    scheduler = create_scheduler(max_num_batched_tokens=64)
-    assert not scheduler.needs_kv_cache_zeroing
-    (request,) = create_requests(num_requests=1, num_tokens=100)
-    scheduler.add_request(request)
-
-    # Two prefill chunks, each allocating blocks.
-    for _ in range(2):
-        output = scheduler.schedule()
-        assert output.new_block_ids_to_zero is None
-        managers = scheduler.kv_cache_manager.coordinator.single_type_managers
-        assert all(not manager.new_block_ids for manager in managers)
-
-
 @pytest.mark.parametrize("is_async", [False, True])
 def test_kv_connector_honors_skip_reading_prefix_cache(is_async):
     """A request that must score every prompt row takes no external hit."""
@@ -4618,3 +4601,20 @@ def test_kv_connector_honors_skip_reading_prefix_cache(is_async):
         assert output.num_scheduled_tokens[plain.request_id] == BLOCK_SIZE * 2
     assert output.num_scheduled_tokens[scoring.request_id] == BLOCK_SIZE * 4
     assert scoring.status == RequestStatus.RUNNING
+
+
+def test_new_block_ids_drained_without_kv_cache_zeroing():
+    """Without Mamba layers nothing zeroes new blocks, but the managers still
+    record them; the scheduler must drain the list every step or it grows for
+    the lifetime of the engine (vllm-project/vllm#44490)."""
+    scheduler = create_scheduler(max_num_batched_tokens=64)
+    assert not scheduler.needs_kv_cache_zeroing
+    (request,) = create_requests(num_requests=1, num_tokens=100)
+    scheduler.add_request(request)
+
+    # Two prefill chunks, each allocating blocks.
+    for _ in range(2):
+        output = scheduler.schedule()
+        assert output.new_block_ids_to_zero is None
+        managers = scheduler.kv_cache_manager.coordinator.single_type_managers
+        assert all(not manager.new_block_ids for manager in managers)

@@ -1038,6 +1038,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
+        self.model_state.remove_request(req_idx)
         if self.pp_handler is not None:
             self.pp_handler.on_req_idx_freed(req_idx)
         if self.encoder_cache is not None:
@@ -1392,7 +1393,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         sampler_output = None
         cached_logits = None
-        if input_batch.num_draft_tokens > 0:
+        # The sparse target path projects with the base lm_head, so batches
+        # with an active LoRA request use dense LoRA-aware logits instead.
+        if input_batch.num_draft_tokens > 0 and not (
+            self.lora_config is not None
+            and self.lora_state.lora_ids[input_batch.idx_mapping_np].any()
+        ):
             assert self.rejection_sampler is not None
             assert self.speculator is not None
             sparse_result = self.speculator.try_sample_target(
@@ -1626,6 +1632,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch.req_ids,
                     input_batch.idx_mapping_np,
                     input_batch.num_scheduled_tokens,
+                    num_logits=(
+                        np.diff(input_batch.cu_num_logits_np)
+                        if input_batch.num_draft_tokens > 0
+                        else None
+                    ),
                 )
                 self._set_active_loras(*lora_inputs)
         else:
@@ -2092,6 +2103,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.use_async_scheduling:
             return async_output
+        if self.use_pp and self.num_speculative_steps:
+            model_runner_output.set_draft_token_ids(self.take_draft_token_ids())
         return async_output.get_output()
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

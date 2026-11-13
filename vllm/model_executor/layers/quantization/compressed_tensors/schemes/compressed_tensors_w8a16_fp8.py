@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from typing import Any
 
 import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
@@ -23,6 +24,9 @@ from vllm.model_executor.kernels.linear.qpn.fp8 import (
     _is_sm70_fp8_qpn8_runtime_contract,
     _missing_sm70_fp8_qpn8_ops,
     _try_sm70_fp8_prescaled_decode_scales,
+)
+from vllm.model_executor.kernels.linear.qpn.fp8 import (
+    dispatch_channel_rows as _sm70_ct_fp8_qpn8_dispatch,
 )
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
@@ -51,38 +55,6 @@ from vllm.platforms import current_platform
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
 logger = init_logger(__name__)
-
-
-def _sm70_ct_fp8_qpn8_dispatch(
-    out: torch.Tensor,
-    x: torch.Tensor,
-    codes: torch.Tensor,
-    scales: torch.Tensor,
-    split_k: int,
-    accumulator_chains: int,
-    prefetch_codes: bool,
-    gated_silu: bool,
-    native_policy: list[str] | None = None,
-) -> None:
-    # Resolve scratch storage inside the opaque op. Passing its data_ptr as an
-    # integer from apply_weights embeds a process-local address in AOT artifacts.
-    # Weight preparation already reserves this shared, bounded workspace.
-    workspace = _get_sm70_fp8_prefill_exact_dense_workspace(codes)
-    if workspace is None:
-        raise RuntimeError("SM70 channel-FP8 QPN8 prefill workspace is unavailable")
-    call_native(
-        sm70_ops.fp8_qpn8_dispatch_sm70_out,
-        native_policy,
-        out,
-        workspace.data_ptr(),
-        x,
-        codes,
-        scales,
-        split_k,
-        accumulator_chains,
-        prefetch_codes,
-        gated_silu,
-    )
 
 
 def _sm70_ct_fp8_qpn8_dispatch_fake(
@@ -579,6 +551,17 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
 
         self.linear_kernel.process_weights_after_loading(layer)
 
+    def supports_direct_output(self, layer: torch.nn.Module) -> bool:
+        from vllm.model_executor.kernels.linear.qpn.fp8 import (
+            layer_supports_direct_output,
+        )
+
+        if layer_supports_direct_output(layer):
+            return True
+        kernel = getattr(self, "linear_kernel", None)
+        check = getattr(kernel, "supports_direct_output", None)
+        return bool(callable(check) and check(layer))
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -586,6 +569,11 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         bias: torch.Tensor | None = None,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from vllm.model_executor.kernels.linear.qpn.fp8 import has_block_qpn8_codes
+
+        if has_block_qpn8_codes(layer):
+            linear_kernel: Any = self.linear_kernel
+            return linear_kernel.apply_weights(layer, x, bias, output=output)
         if output is not None and not getattr(layer, "sm70_fp8_turbomind", False):
             raise ValueError("Output buffers require the SM70 FP8 route")
         if getattr(layer, "sm70_fp8_fp16_dequant", False):

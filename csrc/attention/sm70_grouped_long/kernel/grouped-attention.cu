@@ -8,8 +8,10 @@
 #include <climits>
 #include <cmath>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -721,7 +723,7 @@ fp8_e4m3fn_vector_to_half8_fast(const uint64_t raw) {
       fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 48)));
 }
 
-__device__ __forceinline__ uint4 fp8_e4m3fn_vector_to_half8_lut(
+__device__ __forceinline__ uint4 fp8_e4m3fn_vector_to_half8_lookup(
     const uint64_t raw, const uint16_t* __restrict__ lut) {
   return make_uint4(
       static_cast<uint32_t>(lut[static_cast<uint8_t>(raw)]) |
@@ -732,6 +734,37 @@ __device__ __forceinline__ uint4 fp8_e4m3fn_vector_to_half8_lut(
           (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 40)]) << 16),
       static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 48)]) |
           (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 56)]) << 16));
+}
+
+// Each input byte occupies the low half of a separate 16-bit lane.
+__device__ __forceinline__ uint32_t
+fp8_e4m3fn_expanded_pair_to_half2_bits(const uint32_t expanded) {
+  union {
+    uint32_t bits;
+    __half2 values;
+  } pair;
+  pair.bits = ((expanded & 0x007f007fu) << 7) | ((expanded & 0x00800080u) << 8);
+  pair.values = __hmul2(pair.values, __float2half2_rn(256.0f));
+  return pair.bits;
+}
+
+__device__ __forceinline__ uint4 fp8_e4m3fn_vector_to_half8_lut(
+    const uint64_t raw, const uint16_t* __restrict__ lut) {
+  const uint32_t low = static_cast<uint32_t>(raw);
+  const uint32_t high = static_cast<uint32_t>(raw >> 32);
+  // Detect either signed NaN code across all eight bytes. Each masked byte
+  // is below 0x80, so packed subtraction identifies a zero byte by its borrow.
+  const uint32_t low_check = (low ^ 0x7f7f7f7fu) & 0x7f7f7f7fu;
+  const uint32_t high_check = (high ^ 0x7f7f7f7fu) & 0x7f7f7f7fu;
+  if (((low_check - 0x01010101u) | (high_check - 0x01010101u)) & 0x80808080u)
+    return fp8_e4m3fn_vector_to_half8_lookup(raw, lut);
+  // Byte permutations expand two codes at once. The exact half2 scaling
+  // handles finite normals, subnormals and signed zeros.
+  return make_uint4(
+      fp8_e4m3fn_expanded_pair_to_half2_bits(__byte_perm(low, 0, 0x4140)),
+      fp8_e4m3fn_expanded_pair_to_half2_bits(__byte_perm(low, 0, 0x4342)),
+      fp8_e4m3fn_expanded_pair_to_half2_bits(__byte_perm(high, 0, 0x4140)),
+      fp8_e4m3fn_expanded_pair_to_half2_bits(__byte_perm(high, 0, 0x4342)));
 }
 
 template <int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT,
@@ -838,9 +871,9 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
     static_assert(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
                       KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
                   "Paired XQA loads require FP8 KV");
-    static_assert(!E4M3_SHARED_LUT ||
-                      KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
-                  "Paired LUT conversion requires E4M3");
+    static_assert(
+        !E4M3_SHARED_LUT || KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
+        "Paired LUT conversion requires E4M3");
     const int pair_stride = panel_d_stride_uint4 / 2;
     const int pair_count = valid_kv_tile_rows * pair_stride;
     for (int pair_idx = copy_thread_idx; pair_idx < pair_count;
@@ -976,10 +1009,10 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel_and_zero(
   }
 }
 
-// Keep the next compressed K panel in registers while the current P @ V
-// runs. Conversion still happens at the original shared-memory handoff.
+// Keep compressed K/V panels in registers across matrix operations.
+// Conversion happens at the original shared-memory handoff.
 template <int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT>
-__device__ __forceinline__ uint4 prefetch_k_pair(
+__device__ __forceinline__ uint4 prefetch_kv_pair(
     const void* __restrict__ kv_cache, const int* __restrict__ page_ids,
     int pair_idx, int pair_stride, int tile_page_offset, int block_size,
     int64_t block_stride, int64_t token_stride) {
@@ -1889,22 +1922,60 @@ struct GroupedVerifyTraits {
                 "q8 and q16 workspaces must have equal element counts");
 };
 
-struct alignas(256) GroupedVerifySmem {
+template <int ROWS = kGroupedVerifyRows, int Q_STRIDE = kGroupedVerifyQStride>
+struct alignas(256) GroupedVerifySmemLayout {
   union {
     struct {
-      alignas(16) __half q[kGroupedVerifyRows * kGroupedVerifyQStride];
+      alignas(16) __half q[ROWS * Q_STRIDE];
       alignas(16) __half kv[kGroupedVerifyBlockN * kGroupedVerifyKVStride];
-      alignas(16) float scores[kGroupedVerifyRows * kGroupedVerifyScoreStride];
-      alignas(16) __half probs[kGroupedVerifyRows * kGroupedVerifyProbStride];
+      alignas(16) float scores[ROWS * kGroupedVerifyScoreStride];
+      alignas(16) __half probs[ROWS * kGroupedVerifyProbStride];
     } compute;
-    alignas(16) float output[kGroupedVerifyRows * kGroupedVerifyHeadDim];
+    alignas(16) float output[ROWS * kGroupedVerifyHeadDim];
   } storage;
-  alignas(16) float row_max[kGroupedVerifyRows];
-  alignas(16) float row_sum[kGroupedVerifyRows];
-  alignas(16) float row_scale[kGroupedVerifyRows];
+  alignas(16) float row_max[ROWS];
+  alignas(16) float row_sum[ROWS];
+  alignas(16) float row_scale[ROWS];
   alignas(16) int page_ids[kGroupedVerifyPageIdsCapacity];
   alignas(16) uint32_t sparse_token_masks[kGroupedVerifyBlockN / 4];
 };
+
+// E4M3 staging follows the physical tile geometry. Wider QK tiles reuse
+// one shared K/V panel after QK consumers finish.
+template <int ROWS, int Q_STRIDE>
+struct alignas(256) GroupedE4M3SmemLayout {
+  // QK geometry follows the packed query/head rows. Online reductions
+  // retain their original 32-token boundaries for every physical tile.
+  static constexpr int kContextTile = ROWS == 32 ? 64 : 32;
+  static constexpr int kKVStride = 272;
+  struct DistinctPanels {
+    alignas(16) __half keys[kContextTile * kKVStride];
+    alignas(16) __half values[kContextTile * kKVStride];
+  };
+  union ReusedPanel {
+    alignas(16) __half keys[kContextTile * kKVStride];
+    alignas(16) __half values[kContextTile * kKVStride];
+  };
+  using Panels =
+      std::conditional_t<kContextTile == 64, ReusedPanel, DistinctPanels>;
+  union {
+    struct {
+      alignas(16) __half q[ROWS * Q_STRIDE];
+      Panels panels;
+      alignas(16) float scores[ROWS * kContextTile];
+      alignas(16) __half probs[ROWS * kContextTile];
+      alignas(16) __half residual[ROWS * kContextTile];
+    } compute;
+    alignas(16) float output[ROWS * kGroupedVerifyHeadDim];
+  } storage;
+  alignas(16) float row_max[ROWS];
+  alignas(16) float row_sum[ROWS];
+  alignas(16) float row_scale[ROWS];
+  alignas(16) int page_ids[kGroupedVerifyPageIdsCapacity];
+  alignas(16) uint32_t sparse_token_masks[kContextTile / 4];
+};
+
+using GroupedVerifySmem = GroupedVerifySmemLayout<>;
 
 static_assert(sizeof(GroupedVerifySmem) <= 64 * 1024,
               "packed grouped verifier must fit Volta's 64 KiB opt-in budget");
@@ -1927,23 +1998,22 @@ __device__ __forceinline__ int grouped_verify_active_splits(
   return total_kv <= kGroupedVerifyShortContextMaxTokens ? 1 : active_splits;
 }
 
-
 // Device lengths keep the short-context policy valid as a captured graph grows.
-__device__ __forceinline__ int fp16_grouped_active_splits(
-    int total_kv, int query_len, int requests) {
+__device__ __forceinline__ int fp16_grouped_active_splits(int total_kv,
+                                                          int query_len,
+                                                          int requests) {
   if (query_len == 8 && requests == 1 && total_kv > 128 && total_kv <= 2048)
     return min(80, (total_kv + 31) / 32);
   return grouped_verify_active_splits<8, false>(total_kv);
 }
 
-
 // Same SM70 matrix-A word map as the validated native prefill layout.
 __device__ __forceinline__ int grouped_a_offset(int row, int col, int width) {
   const int local_row = row & 15;
-  const int slot = (local_row & 3) | ((local_row & 8) >> 1) |
-                   ((local_row & 4) << 1);
-  return (row / 16) * 16 * width + (col / 16) * 256 +
-         ((col & 15) / 8) * 128 + slot * 8 + (col & 7);
+  const int slot =
+      (local_row & 3) | ((local_row & 8) >> 1) | ((local_row & 4) << 1);
+  return (row / 16) * 16 * width + (col / 16) * 256 + ((col & 15) / 8) * 128 +
+         slot * 8 + (col & 7);
 }
 
 __device__ __forceinline__ void load_grouped_a_swizzled(
@@ -1952,24 +2022,66 @@ __device__ __forceinline__ void load_grouped_a_swizzled(
   const int lane = threadIdx.x & 31;
   const int row = (lane & 3) + ((lane >> 4) & 1) * 4 + ((lane >> 2) & 1) * 8;
   const int slot = (row & 3) | ((row & 8) >> 1) | ((row & 4) << 1);
-  uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(
-      matrix_tile + (k_offset / 16) * 256 + slot * 8));
+  uint32_t address = static_cast<uint32_t>(
+      __cvta_generic_to_shared(matrix_tile + (k_offset / 16) * 256 + slot * 8));
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-      : "=r"(frag.x[0]), "=r"(frag.x[1]), "=r"(frag.x[2]), "=r"(frag.x[3])
-      : "r"(address) : "memory");
+               : "=r"(frag.x[0]), "=r"(frag.x[1]), "=r"(frag.x[2]),
+                 "=r"(frag.x[3])
+               : "r"(address)
+               : "memory");
   address += 128 * sizeof(__half);
   asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
-      : "=r"(frag.x[4]), "=r"(frag.x[5]), "=r"(frag.x[6]), "=r"(frag.x[7])
-      : "r"(address) : "memory");
+               : "=r"(frag.x[4]), "=r"(frag.x[5]), "=r"(frag.x[6]),
+                 "=r"(frag.x[7])
+               : "r"(address)
+               : "memory");
 }
 
-template <bool COMPENSATE = false>
+// Explicit shared addressing avoids generic 64-bit address arithmetic in the
+// Packed-row QK/PV loops retain the WMMA register map and arithmetic.
+template <typename Layout>
+__device__ __forceinline__ void load_grouped_b_shared(
+    volta::fragment<volta::matrix_b, 16, 16, 16, half, Layout>& fragment,
+    const __half* pointer, unsigned stride) {
+  const uint32_t address =
+      static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
+  if constexpr (std::is_same_v<Layout, volta::row_major>) {
+    asm volatile(
+        "wmma.load.b.sync.aligned.row.m16n16k16.shared.f16 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7}, [%8], %9;"
+        : "=r"(fragment.x[0]), "=r"(fragment.x[1]), "=r"(fragment.x[2]),
+          "=r"(fragment.x[3]), "=r"(fragment.x[4]), "=r"(fragment.x[5]),
+          "=r"(fragment.x[6]), "=r"(fragment.x[7])
+        : "r"(address), "r"(stride)
+        : "memory");
+  } else {
+    static_assert(std::is_same_v<Layout, volta::col_major>);
+    asm volatile(
+        "wmma.load.b.sync.aligned.col.m16n16k16.shared.f16 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7}, [%8], %9;"
+        : "=r"(fragment.x[0]), "=r"(fragment.x[1]), "=r"(fragment.x[2]),
+          "=r"(fragment.x[3]), "=r"(fragment.x[4]), "=r"(fragment.x[5]),
+          "=r"(fragment.x[6]), "=r"(fragment.x[7])
+        : "r"(address), "r"(stride)
+        : "memory");
+  }
+}
+
+template <bool COMPENSATE = false, int PACKED_ROWS = 0,
+          int CONTEXT_TILE = kGroupedVerifyBlockN,
+          int KV_STRIDE = kGroupedVerifyKVStride>
 __device__ __forceinline__ void grouped_verify_qk(
     const __half* __restrict__ shared_q, const __half* __restrict__ shared_k,
     float* __restrict__ shared_scores, const float qk_scale,
     const int active_m_tiles) {
+  constexpr int kGroupedVerifyBlockN = CONTEXT_TILE;
+  constexpr int kGroupedVerifyKVStride = KV_STRIDE;
+  constexpr int kGroupedVerifyScoreStride = CONTEXT_TILE;
+  constexpr int kGroupedVerifyQKWarps =
+      (kGroupedVerifyRows / 16) * (CONTEXT_TILE / 16);
   const int warp_id = threadIdx.x / kWarpSize;
-  if (warp_id >= kGroupedVerifyQKWarps) {
+  if (warp_id >= (PACKED_ROWS ? (PACKED_ROWS / 16) * (CONTEXT_TILE / 16)
+                              : kGroupedVerifyQKWarps)) {
     return;
   }
 
@@ -1988,14 +2100,27 @@ __device__ __forceinline__ void grouped_verify_qk(
 
 #pragma unroll 2
   for (int k_offset = 0; k_offset < kGroupedVerifyHeadDim; k_offset += 16) {
-    volta::load_matrix_sync(
-        q_fragment, shared_q + m_tile * 16 * kGroupedVerifyQStride + k_offset,
-        kGroupedVerifyQStride);
+    if constexpr (PACKED_ROWS > 0) {
+      load_grouped_a_swizzled(q_fragment, shared_q + m_tile * 16 * 256,
+                              k_offset);
+    } else {
+      volta::load_matrix_sync(
+          q_fragment, shared_q + m_tile * 16 * kGroupedVerifyQStride + k_offset,
+          kGroupedVerifyQStride);
+    }
     // K is row-major [N, D].  The same bytes represent K^T as a col-major
     // [D, N] matrix, which is the B operand needed by Q @ K^T.
-    volta::load_matrix_sync(
-        k_fragment, shared_k + n_tile * 16 * kGroupedVerifyKVStride + k_offset,
-        kGroupedVerifyKVStride);
+    if constexpr (PACKED_ROWS > 0) {
+      load_grouped_b_shared(
+          k_fragment,
+          shared_k + n_tile * 16 * kGroupedVerifyKVStride + k_offset,
+          kGroupedVerifyKVStride);
+    } else {
+      volta::load_matrix_sync(
+          k_fragment,
+          shared_k + n_tile * 16 * kGroupedVerifyKVStride + k_offset,
+          kGroupedVerifyKVStride);
+    }
     if constexpr (COMPENSATE) {
       // E4M3 x FP16 products fit comfortably in FP32, but a D256 Tensor
       // Core accumulation can still lose low bits. Sum short K16 products
@@ -2085,593 +2210,11 @@ template <int MAX_QUERY_TOKENS, bool TWO_PASS, int PAGE_BLOCK_SIZE = 0,
           bool STAGE_PARTITION_PAGE_IDS = false,
           int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
           bool SPARSE_PAGE4 = false, typename PARTIAL_T = __half,
-          bool ROW_SEQLENS = false, bool COMPENSATE_P = false, bool PAIR_E4M3 = false>
+          bool ROW_SEQLENS = false, bool COMPENSATE_P = false,
+          bool PAIR_E4M3 = false, int PACKED_ROWS = 0,
+          bool FULL_QUERY_TILE = false>
 __global__
-__launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_e5m2_partial_kernel(
-    const __half* __restrict__ q, const void* __restrict__ k_cache,
-    const void* __restrict__ v_cache, const int* __restrict__ block_table,
-    const int* __restrict__ seq_lens, PARTIAL_T* __restrict__ partial_out,
-    float* __restrict__ partial_lse, const int query_len,
-    const int max_num_blocks, const int page_block_size,
-    const int64_t k_block_stride, const int64_t k_token_stride,
-    const int64_t k_head_stride, const int64_t v_block_stride,
-    const int64_t v_token_stride, const int64_t v_head_stride,
-    const float qk_scale, const float v_scale,
-    const uint32_t* __restrict__ sparse_token_masks = nullptr,
-    const int num_groups = 1, const int* row_lengths = nullptr) {
-  static_assert(!ROW_SEQLENS || !SPARSE_PAGE4,
-                "explicit row lengths apply to dense causal groups only");
-  static_assert(
-      !COMPENSATE_P || (!TWO_PASS && ROW_SEQLENS &&
-                        KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
-                        std::is_same_v<PARTIAL_T, float>),
-      "probability compensation is isolated to E4M3 FP32 groups");
-  using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;
-  const int head_group = blockIdx.x;
-  const int split_id = blockIdx.y;
-  const int group_idx = blockIdx.z;
-  if (head_group >= Traits::kHeadGroups || split_id >= Traits::kSplits ||
-      group_idx >= num_groups || query_len <= 0 ||
-      query_len > MAX_QUERY_TOKENS) {
-    return;
-  }
-
-  if constexpr (ROW_SEQLENS) {
-    // Request-major q8 batches carry one contiguous row-length panel per
-    // request. Keep the per-group pointer aligned with the q/block-table
-    // offsets before any visibility or max-length reads.
-    row_lengths += static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS;
-  }
-
-  if constexpr (!SPARSE_PAGE4) {
-    partial_out += static_cast<int64_t>(group_idx) * Traits::kSplits *
-                   MAX_QUERY_TOKENS * kGroupedVerifyHeads *
-                   kGroupedVerifyHeadDim;
-    partial_lse += static_cast<int64_t>(group_idx) * Traits::kSplits *
-                   MAX_QUERY_TOKENS * kGroupedVerifyHeads *
-                   (ROW_SEQLENS ? 2 : 1);
-  }
-
-  int total_kv = seq_lens[group_idx];
-  if constexpr (ROW_SEQLENS) {
-    total_kv = 0;
-    for (int i = 0; i < query_len; ++i)
-      total_kv = max(total_kv, row_lengths[i]);
-  }
-  if (total_kv <= 0) {
-    if constexpr (SPARSE_PAGE4) {
-      constexpr int kGroupOutputElements =
-          kGroupedVerifyQ8MaxQ * kGroupedVerifyHeads * kGroupedVerifyHeadDim;
-      const int64_t group_output_offset =
-          static_cast<int64_t>(group_idx) * kGroupOutputElements;
-      for (int idx = threadIdx.x; idx < kGroupOutputElements;
-           idx += kGroupedVerifyThreads) {
-        partial_out[group_output_offset + idx] = __float2half_rn(0.0f);
-      }
-      constexpr int kGroupLseElements =
-          kGroupedVerifyQ8MaxQ * kGroupedVerifyHeads;
-      if (threadIdx.x < kGroupLseElements) {
-        partial_lse[static_cast<int64_t>(group_idx) * kGroupLseElements +
-                    threadIdx.x] = kXQANegInf;
-      }
-    }
-    return;
-  }
-  const int active_splits =
-      SPARSE_PAGE4
-          ? 1
-          : grouped_verify_active_splits<MAX_QUERY_TOKENS, SINGLE_QUERY>(
-                total_kv);
-  if (split_id >= active_splits) {
-    return;
-  }
-  const int total_tiles =
-      (total_kv + kGroupedVerifyBlockN - 1) / kGroupedVerifyBlockN;
-  const int base_tiles = total_tiles / active_splits;
-  const int extra_tiles = total_tiles - base_tiles * active_splits;
-  const int split_tile_start =
-      split_id * base_tiles + min(split_id, extra_tiles);
-  const int split_tiles = base_tiles + (split_id < extra_tiles ? 1 : 0);
-  const int split_start = split_tile_start * kGroupedVerifyBlockN;
-  const int split_end =
-      min(total_kv, split_start + split_tiles * kGroupedVerifyBlockN);
-  const int prefix_kv_len = max(0, total_kv - query_len);
-  const int head_start = head_group * Traits::kHeadsPerCta;
-  const int tid = threadIdx.x;
-  const int warp_id = tid / kWarpSize;
-  const int lane_id = tid % kWarpSize;
-
-  __shared__ uint16_t e4m3_lut[256];
-  if (tid < 256)
-    e4m3_lut[tid] = fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(tid));
-  extern __shared__ char grouped_verify_smem_raw[];
-  GroupedVerifySmem& smem =
-      *reinterpret_cast<GroupedVerifySmem*>(grouped_verify_smem_raw);
-  __half* shared_q = smem.storage.compute.q;
-  __half* shared_kv = smem.storage.compute.kv;
-  float* shared_scores = smem.storage.compute.scores;
-  __half* shared_probs = smem.storage.compute.probs;
-  // The compensated entry reserves one padded probability panel after the
-  // legacy layout. Match P's shared-memory stride without aliasing live QK
-  // rows. Legacy entries retain their existing shared-memory footprint.
-  __half* shared_prob_residual = reinterpret_cast<__half*>(
-      grouped_verify_smem_raw + sizeof(GroupedVerifySmem));
-  constexpr int kResidualStride = kGroupedVerifyProbStride;
-  __half* shared_values = shared_prob_residual + kGroupedVerifyRows * kResidualStride;
-  const int* page_ids =
-      block_table + static_cast<int64_t>(group_idx) * max_num_blocks;
-  int split_page_offset = 0;
-  bool use_staged_page_ids = false;
-  if constexpr (STAGE_PARTITION_PAGE_IDS) {
-    static_assert(PAGE_BLOCK_SIZE > 0,
-                  "partition page staging requires a specialized page size");
-    const int split_start_page = split_start / PAGE_BLOCK_SIZE;
-    split_page_offset = split_start - split_start_page * PAGE_BLOCK_SIZE;
-    const int split_page_count =
-        (split_page_offset + split_end - split_start + PAGE_BLOCK_SIZE - 1) /
-        PAGE_BLOCK_SIZE;
-    use_staged_page_ids = split_page_count <= kGroupedVerifyPageIdsCapacity;
-    if (use_staged_page_ids) {
-      for (int idx = tid; idx < split_page_count;
-           idx += kGroupedVerifyThreads) {
-        smem.page_ids[idx] = __ldg(&page_ids[split_start_page + idx]);
-      }
-    }
-    if (use_staged_page_ids) {
-      page_ids = smem.page_ids;
-    }
-  }
-
-  constexpr int kVecsPerRow = kGroupedVerifyHeadDim / 8;
-  constexpr int kSharedQVecsPerRow = kGroupedVerifyQStride / 8;
-  const uint4* q_vec = reinterpret_cast<const uint4*>(q);
-  uint4* shared_q_vec = reinterpret_cast<uint4*>(shared_q);
-  for (int idx = tid; idx < kGroupedVerifyRows * kVecsPerRow;
-       idx += kGroupedVerifyThreads) {
-    const int row = idx / kVecsPerRow;
-    const int vec_col = idx % kVecsPerRow;
-    const int token_idx = row / Traits::kHeadsPerCta;
-    const int local_head = row % Traits::kHeadsPerCta;
-    const int head_idx = head_start + local_head;
-    if (token_idx < query_len && head_idx < kGroupedVerifyHeads) {
-      const int64_t query_row =
-          static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS + token_idx;
-      shared_q_vec[row * kSharedQVecsPerRow + vec_col] = __ldg(
-          q_vec + (query_row * kGroupedVerifyHeads + head_idx) * kVecsPerRow +
-          vec_col);
-    } else {
-      shared_q_vec[row * kSharedQVecsPerRow + vec_col] = make_uint4(0, 0, 0, 0);
-    }
-  }
-  if (tid < kGroupedVerifyRows) {
-    smem.row_max[tid] = kXQANegInf;
-    smem.row_sum[tid] = 0.0f;
-    smem.row_scale[tid] = 1.0f;
-  }
-  // This barrier publishes both Q and the optional split-local page IDs.
-  __syncthreads();
-
-  constexpr int kPanelStrideVec = kGroupedVerifyHeadDim / 8;
-  constexpr int kSharedStrideVec = kGroupedVerifyKVStride / 8;
-
-  volta::fragment<volta::accumulator, 16, 16, 16, float>
-      output_fragments[kGroupedVerifyOutputTilesPerWarp];
-#pragma unroll
-  for (int fragment_idx = 0; fragment_idx < kGroupedVerifyOutputTilesPerWarp;
-       ++fragment_idx) {
-    volta::fill_fragment(output_fragments[fragment_idx], 0.0f);
-  }
-
-  // The conservative baseline computes exact per-split FP32 max/sum in a
-  // separate pass. The candidate below fuses this state update with P x V.
-  if constexpr (TWO_PASS) {
-    for (int tile_start = split_start; tile_start < split_end;
-         tile_start += kGroupedVerifyBlockN) {
-      const int valid_k_rows =
-          min(kGroupedVerifyBlockN, split_end - tile_start);
-      if constexpr (SPARSE_PAGE4) {
-        const int valid_sparse_pages = (valid_k_rows + 3) / 4;
-        if (tid < kGroupedVerifyBlockN / 4) {
-          smem.sparse_token_masks[tid] =
-              tid < valid_sparse_pages
-                  ? __ldg(sparse_token_masks +
-                          static_cast<int64_t>(group_idx) * max_num_blocks +
-                          (tile_start >> 2) + tid)
-                  : 0;
-        }
-      }
-      const int tile_page_offset =
-          use_staged_page_ids ? split_page_offset + tile_start - split_start
-                              : tile_start;
-      load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,
-                           kGroupedVerifyThreads, KV_DTYPE,
-                           KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
-                               (KV_DTYPE ==
-                                    flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
-                                !SPARSE_PAGE4 && (!ROW_SEQLENS || PAIR_E4M3)), true>(
-          shared_kv, k_cache, page_ids, valid_k_rows, kPanelStrideVec,
-          kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
-          k_block_stride, k_token_stride, k_head_stride, 0, tid, e4m3_lut);
-      for (int idx = tid + valid_k_rows * kSharedStrideVec;
-           idx < kGroupedVerifyBlockN * kSharedStrideVec;
-           idx += kGroupedVerifyThreads) {
-        reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
-      }
-      __syncthreads();
-
-      int active_m_tiles = 0x7;
-      if constexpr (SPARSE_PAGE4) {
-        uint32_t active_query_nibbles = 0;
-#pragma unroll
-        for (int page = 0; page < kGroupedVerifyBlockN / 4; ++page) {
-          active_query_nibbles |= smem.sparse_token_masks[page];
-        }
-        active_m_tiles = 0;
-#pragma unroll
-        for (int token = 0; token < kGroupedVerifyQ8MaxQ; ++token) {
-          if ((active_query_nibbles & (0xFu << (token * 4))) != 0) {
-            const int first_row = token * kGroupedVerifyHeads;
-            const int last_row = first_row + kGroupedVerifyHeads - 1;
-            active_m_tiles |= 1 << (first_row / 16);
-            active_m_tiles |= 1 << (last_row / 16);
-          }
-        }
-      }
-      grouped_verify_qk(shared_q, shared_kv, shared_scores, qk_scale,
-                        active_m_tiles);
-      __syncthreads();
-
-#pragma unroll
-      for (int row = warp_id; row < kGroupedVerifyRows;
-           row += kGroupedVerifyWarps) {
-        const int token_idx = row / Traits::kHeadsPerCta;
-        const int local_head = row % Traits::kHeadsPerCta;
-        const int head_idx = head_start + local_head;
-        const int kv_idx = tile_start + lane_id;
-        const bool visible =
-            grouped_verify_key_visible<SPARSE_PAGE4, ROW_SEQLENS>(
-                smem.sparse_token_masks, token_idx, query_len, head_idx, kv_idx,
-                valid_k_rows, lane_id, prefix_kv_len, row_lengths);
-        const float score =
-            visible ? shared_scores[row * kGroupedVerifyScoreStride + lane_id]
-                    : kXQANegInf;
-        const float tile_max_lane = warp_reduce_max(score);
-        const float tile_max = __shfl_sync(0xffffffffu, tile_max_lane, 0);
-        const float probability =
-            visible ? __expf(fmaxf(score - tile_max, -80.0f)) : 0.0f;
-        const float tile_sum_lane = warp_reduce_sum(probability);
-        const float tile_sum = __shfl_sync(0xffffffffu, tile_sum_lane, 0);
-        if (lane_id == 0 && tile_sum > 0.0f) {
-          const float old_max = smem.row_max[row];
-          const float old_sum = smem.row_sum[row];
-          const float new_max = fmaxf(old_max, tile_max);
-          smem.row_sum[row] =
-              old_sum * __expf(fmaxf(old_max - new_max, -80.0f)) +
-              tile_sum * __expf(fmaxf(tile_max - new_max, -80.0f));
-          smem.row_max[row] = new_max;
-        }
-      }
-      __syncthreads();
-    }
-  }
-
-  // Recompute QK for the conservative path, or consume it once while updating
-  // the online state for the fused path. Both form half P and use identical
-  // Volta WMMA P @ V arithmetic.
-  for (int tile_start = split_start; tile_start < split_end;
-       tile_start += kGroupedVerifyBlockN) {
-    const int valid_k_rows = min(kGroupedVerifyBlockN, split_end - tile_start);
-    if constexpr (SPARSE_PAGE4) {
-      const int valid_sparse_pages = (valid_k_rows + 3) / 4;
-      if (tid < kGroupedVerifyBlockN / 4) {
-        smem.sparse_token_masks[tid] =
-            tid < valid_sparse_pages
-                ? __ldg(sparse_token_masks +
-                        static_cast<int64_t>(group_idx) * max_num_blocks +
-                        (tile_start >> 2) + tid)
-                : 0;
-      }
-    }
-    const int tile_page_offset =
-        use_staged_page_ids ? split_page_offset + tile_start - split_start
-                            : tile_start;
-    load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,
-                         kGroupedVerifyThreads, KV_DTYPE,
-                         KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
-                             (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
-                              !SPARSE_PAGE4 && (!ROW_SEQLENS || PAIR_E4M3)), true>(
-        shared_kv, k_cache, page_ids, valid_k_rows, kPanelStrideVec,
-        kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
-        k_block_stride, k_token_stride, k_head_stride, 0, tid, e4m3_lut);
-    for (int idx = tid + valid_k_rows * kSharedStrideVec;
-         idx < kGroupedVerifyBlockN * kSharedStrideVec;
-         idx += kGroupedVerifyThreads) {
-      reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
-    }
-    __syncthreads();
-
-    int active_m_tiles = 0x7;
-    if constexpr (COMPENSATE_P) {
-      // Native MTP4 supplies five rows: only 30 of the 48 packed rows are
-      // live. Avoid QK/PV for wholly padded M tiles to pay for the residual
-      // product without changing arithmetic in any live row.
-      active_m_tiles =
-          (1 << ((query_len * Traits::kHeadsPerCta + 15) / 16)) - 1;
-    }
-    if constexpr (SPARSE_PAGE4) {
-      uint32_t active_query_nibbles = 0;
-#pragma unroll
-      for (int page = 0; page < kGroupedVerifyBlockN / 4; ++page) {
-        active_query_nibbles |= smem.sparse_token_masks[page];
-      }
-      active_m_tiles = 0;
-#pragma unroll
-      for (int token = 0; token < kGroupedVerifyQ8MaxQ; ++token) {
-        if ((active_query_nibbles & (0xFu << (token * 4))) != 0) {
-          const int first_row = token * kGroupedVerifyHeads;
-          const int last_row = first_row + kGroupedVerifyHeads - 1;
-          active_m_tiles |= 1 << (first_row / 16);
-          active_m_tiles |= 1 << (last_row / 16);
-        }
-      }
-    }
-    grouped_verify_qk<COMPENSATE_P>(shared_q, shared_kv, shared_scores,
-                                    qk_scale, active_m_tiles);
-    if (warp_id >= kGroupedVerifyQKWarps) {
-      constexpr int kValueLoadThreads = kGroupedVerifyThreads - kGroupedVerifyQKWarps * kWarpSize;
-      const int value_load_tid = tid - kGroupedVerifyQKWarps * kWarpSize;
-    load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,
-                         kValueLoadThreads, KV_DTYPE,
-                         KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
-                             (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
-                              !SPARSE_PAGE4 && (!ROW_SEQLENS || PAIR_E4M3)), true>(
-        shared_values, v_cache, page_ids, valid_k_rows, kPanelStrideVec,
-        kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
-        v_block_stride, v_token_stride, v_head_stride, 0, value_load_tid, e4m3_lut);
-    for (int idx = value_load_tid + valid_k_rows * kSharedStrideVec;
-         idx < kGroupedVerifyBlockN * kSharedStrideVec;
-         idx += kValueLoadThreads) {
-      reinterpret_cast<uint4*>(shared_values)[idx] = make_uint4(0, 0, 0, 0);
-    }
-    }
-
-    __syncthreads();
-
-    if constexpr (TWO_PASS) {
-      for (int idx = tid; idx < kGroupedVerifyRows * kGroupedVerifyBlockN;
-           idx += kGroupedVerifyThreads) {
-        const int row = idx / kGroupedVerifyBlockN;
-        const int col = idx % kGroupedVerifyBlockN;
-        const int token_idx = row / Traits::kHeadsPerCta;
-        const int local_head = row % Traits::kHeadsPerCta;
-        const int head_idx = head_start + local_head;
-        const int kv_idx = tile_start + col;
-        const bool visible =
-            grouped_verify_key_visible<SPARSE_PAGE4, ROW_SEQLENS>(
-                smem.sparse_token_masks, token_idx, query_len, head_idx, kv_idx,
-                valid_k_rows, col, prefix_kv_len, row_lengths) &&
-            smem.row_sum[row] > 0.0f;
-        const float probability =
-            visible ? __expf(fmaxf(
-                          shared_scores[row * kGroupedVerifyScoreStride + col] -
-                              smem.row_max[row],
-                          -80.0f))
-                    : 0.0f;
-        shared_probs[grouped_a_offset(row, col, 32)] =
-            __float2half_rn(probability);
-      }
-      __syncthreads();
-    } else {
-#pragma unroll
-      for (int row = warp_id; row < kGroupedVerifyRows;
-           row += kGroupedVerifyWarps) {
-        if constexpr (COMPENSATE_P) {
-          if ((active_m_tiles & (1 << (row / 16))) == 0) {
-            continue;
-          }
-        }
-        const int token_idx = row / Traits::kHeadsPerCta;
-        const int local_head = row % Traits::kHeadsPerCta;
-        const int head_idx = head_start + local_head;
-        const int kv_idx = tile_start + lane_id;
-        const bool visible =
-            grouped_verify_key_visible<SPARSE_PAGE4, ROW_SEQLENS>(
-                smem.sparse_token_masks, token_idx, query_len, head_idx, kv_idx,
-                valid_k_rows, lane_id, prefix_kv_len, row_lengths);
-        const float score =
-            visible ? shared_scores[row * kGroupedVerifyScoreStride + lane_id]
-                    : kXQANegInf;
-        const float tile_max_lane = warp_reduce_max(score);
-        const float tile_max = __shfl_sync(0xffffffffu, tile_max_lane, 0);
-        const float old_max = smem.row_max[row];
-        const float new_max = fmaxf(old_max, tile_max);
-        const float probability =
-            visible ? __expf(fmaxf(score - new_max, -80.0f)) : 0.0f;
-        shared_probs[grouped_a_offset(row, lane_id, 32)] =
-            __float2half_rn(probability);
-        if constexpr (COMPENSATE_P) {
-          const float rounded = __half2float(__float2half_rn(probability));
-          shared_prob_residual[grouped_a_offset(row, lane_id, 32)] =
-              __float2half_rn((probability - rounded) * 2048.0f);
-        }
-        const float tile_sum_lane = warp_reduce_sum(probability);
-        const float tile_sum = __shfl_sync(0xffffffffu, tile_sum_lane, 0);
-        const float exp_diff =
-            tile_sum > 0.0f ? __expf(fmaxf(old_max - new_max, -80.0f)) : 1.0f;
-        // Finish every lane's shared-state reads before lane 0 overwrites the
-        // online maximum. Shuffle synchronization does not order memory.
-        __syncwarp();
-        if (lane_id == 0) {
-          if (tile_sum > 0.0f) {
-            smem.row_sum[row] = smem.row_sum[row] * exp_diff + tile_sum;
-            smem.row_max[row] = new_max;
-          }
-          smem.row_scale[row] = exp_diff;
-        }
-      }
-      __syncthreads();
-      if constexpr (!COMPENSATE_P) {
-#pragma unroll
-        for (int fragment_idx = 0;
-             fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
-          const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
-          const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
-          grouped_verify_scale_output_fragment(output_fragments[fragment_idx],
-                                               smem.row_scale, m_tile * 16);
-        }
-      }
-    }
-
-
-
-    static_assert(COMPENSATE_P && kGroupedVerifyWarps == 16,
-                  "PV reuse is isolated to six-head compensated E4M3");
-    volta::fragment<volta::accumulator, 16, 16, 16, float>
-        tile_fragments[kGroupedVerifyOutputTilesPerWarp];
-#pragma unroll
-    for (int i = 0; i < kGroupedVerifyOutputTilesPerWarp; ++i)
-      volta::fill_fragment(tile_fragments[i], 0.0f);
-    const int d_tile = warp_id;
-#pragma unroll
-    for (int k_offset = 0; k_offset < kGroupedVerifyBlockN; k_offset += 16) {
-      volta::fragment<volta::matrix_b, 16, 16, 16, half, volta::row_major>
-          value_fragment;
-      volta::load_matrix_sync(
-          value_fragment,
-          shared_values + k_offset * kGroupedVerifyKVStride + d_tile * 16,
-          kGroupedVerifyKVStride);
-      auto residual_value_fragment = value_fragment;
-#pragma unroll
-      for (int i = 0; i < value_fragment.num_elements / 2; ++i) {
-        union {
-          uint32_t bits;
-          __half2 pair;
-        } packed_value;
-        packed_value.bits = value_fragment.x[i];
-        packed_value.pair =
-            __hmul2(packed_value.pair, __float2half2_rn(1.0f / 2048.0f));
-        residual_value_fragment.x[i] = packed_value.bits;
-      }
-#pragma unroll
-      for (int fragment_idx = 0;
-           fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
-        const int m_tile = fragment_idx;
-        if ((active_m_tiles & (1 << m_tile)) == 0) continue;
-        volta::fragment<volta::matrix_a, 16, 16, 16, half, volta::row_major>
-            probability_fragment;
-        load_grouped_a_swizzled(
-            probability_fragment,
-            shared_probs + m_tile * 16 * kGroupedVerifyProbStride, k_offset);
-        volta::mma_sync(tile_fragments[fragment_idx], probability_fragment,
-                        value_fragment, tile_fragments[fragment_idx]);
-        load_grouped_a_swizzled(
-            probability_fragment,
-            shared_prob_residual + m_tile * 16 * kResidualStride, k_offset);
-        volta::mma_sync(tile_fragments[fragment_idx], probability_fragment,
-                        residual_value_fragment, tile_fragments[fragment_idx]);
-      }
-    }
-#pragma unroll
-    for (int fragment_idx = 0;
-         fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
-      const int m_tile = fragment_idx;
-      if ((active_m_tiles & (1 << m_tile)) == 0) continue;
-      grouped_verify_add_output_tile(output_fragments[fragment_idx],
-                                     tile_fragments[fragment_idx],
-                                     smem.row_scale, m_tile * 16);
-    }
-    __syncthreads();
-  }
-
-  // The compute buffers are dead. Reuse their storage for the dense FP32
-  // partial output, then normalize and write only real query/head rows.
-  __syncthreads();
-  float* shared_output = smem.storage.output;
-#pragma unroll
-  for (int fragment_idx = 0; fragment_idx < kGroupedVerifyOutputTilesPerWarp;
-       ++fragment_idx) {
-    const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
-    const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
-    const int d_tile = output_tile % (kGroupedVerifyHeadDim / 16);
-    volta::store_matrix_sync(
-        shared_output + m_tile * 16 * kGroupedVerifyHeadDim + d_tile * 16,
-        output_fragments[fragment_idx], kGroupedVerifyHeadDim,
-        volta::mem_row_major);
-  }
-  __syncthreads();
-
-  for (int idx = tid; idx < kGroupedVerifyRows * kGroupedVerifyHeadDim;
-       idx += kGroupedVerifyThreads) {
-    const int row = idx / kGroupedVerifyHeadDim;
-    const int d = idx % kGroupedVerifyHeadDim;
-    const int token_idx = row / Traits::kHeadsPerCta;
-    const int local_head = row % Traits::kHeadsPerCta;
-    const int head_idx = head_start + local_head;
-    if (token_idx < query_len && head_idx < kGroupedVerifyHeads) {
-      const float sum = smem.row_sum[row];
-      // Explicit-row FP32 groups retain the numerator until the final merge.
-      // Normalizing each partition and encoding its weight as m+log(sum)
-      // introduces avoidable rounding, including at FP16 output midpoints.
-      const float scale =
-          sum > 0.0f ? (ROW_SEQLENS ? v_scale : v_scale / sum) : 0.0f;
-      int64_t output_idx;
-      if constexpr (SPARSE_PAGE4) {
-        const int64_t global_token_idx =
-            static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS + token_idx;
-        output_idx = (global_token_idx * kGroupedVerifyHeads + head_idx) *
-                         kGroupedVerifyHeadDim +
-                     d;
-      } else {
-        output_idx =
-            (((static_cast<int64_t>(split_id) * MAX_QUERY_TOKENS + token_idx) *
-                  kGroupedVerifyHeads +
-              head_idx) *
-                 kGroupedVerifyHeadDim +
-             d);
-      }
-      if constexpr (std::is_same_v<PARTIAL_T, float>) {
-        partial_out[output_idx] = shared_output[idx] * scale;
-      } else {
-        partial_out[output_idx] = __float2half_rn(shared_output[idx] * scale);
-      }
-    }
-  }
-  if (tid < kGroupedVerifyRows) {
-    const int token_idx = tid / Traits::kHeadsPerCta;
-    const int local_head = tid % Traits::kHeadsPerCta;
-    const int head_idx = head_start + local_head;
-    if (token_idx < query_len && head_idx < kGroupedVerifyHeads) {
-      const float sum = smem.row_sum[tid];
-      int64_t lse_idx;
-      if constexpr (SPARSE_PAGE4) {
-        const int64_t global_token_idx =
-            static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS + token_idx;
-        lse_idx = global_token_idx * kGroupedVerifyHeads + head_idx;
-      } else {
-        lse_idx =
-            (static_cast<int64_t>(split_id) * MAX_QUERY_TOKENS + token_idx) *
-                kGroupedVerifyHeads +
-            head_idx;
-      }
-      if constexpr (ROW_SEQLENS) {
-        partial_lse[2 * lse_idx] = sum > 0.0f ? smem.row_max[tid] : kXQANegInf;
-        partial_lse[2 * lse_idx + 1] = sum;
-      } else {
-        partial_lse[lse_idx] =
-            sum > 0.0f ? smem.row_max[tid] + logf(sum) : kXQANegInf;
-      }
-    }
-  }
-}
-
-template <int MAX_QUERY_TOKENS, bool TWO_PASS, int PAGE_BLOCK_SIZE = 0,
-          bool SINGLE_QUERY = false, bool CONTIGUOUS_HKV1_LAYOUT = false,
-          bool STAGE_PARTITION_PAGE_IDS = false,
-          int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
-          bool SPARSE_PAGE4 = false, typename PARTIAL_T = __half,
-          bool ROW_SEQLENS = false, bool COMPENSATE_P = false, bool PAIR_E4M3 = false>
-__global__
-__launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_e4m3_full_q8_kernel(
+__launch_bounds__(512, 1) void flash_attention_grouped_verify_e5m2_partial_kernel(
     const __half* __restrict__ q, const void* __restrict__ k_cache,
     const void* __restrict__ v_cache, const int* __restrict__ block_table,
     const int* __restrict__ seq_lens, PARTIAL_T* __restrict__ partial_out,
@@ -2682,7 +2225,28 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     const int64_t v_token_stride, const int64_t v_head_stride,
     const float qk_scale, const float v_scale,
     const uint32_t* __restrict__ sparse_token_masks = nullptr,
-    const int num_groups = 1, const int* row_lengths = nullptr) {
+    const int num_groups = 1, const int* row_lengths = nullptr,
+    const int kv_heads = 1) {
+  constexpr int kGroupedVerifyBlockN =
+      GroupedE4M3SmemLayout<PACKED_ROWS, 256>::kContextTile;
+  constexpr int kGroupedVerifyKVStride =
+      GroupedE4M3SmemLayout<16, 256>::kKVStride;
+  constexpr int kGroupedVerifyScoreStride = kGroupedVerifyBlockN;
+  constexpr int kGroupedVerifyProbStride = kGroupedVerifyBlockN;
+  static_assert(PACKED_ROWS == 0 ||
+                (PACKED_ROWS % 16 == 0 && COMPENSATE_P && ROW_SEQLENS &&
+                 !SPARSE_PAGE4 && !TWO_PASS && !CONTIGUOUS_HKV1_LAYOUT &&
+                 !STAGE_PARTITION_PAGE_IDS));
+  static_assert(!FULL_QUERY_TILE || PACKED_ROWS > 0);
+  const int query_len =
+      FULL_QUERY_TILE ? PACKED_ROWS / kGroupedVerifyHeads : runtime_query_len;
+  constexpr int kGroupedVerifyRows = PACKED_ROWS ? PACKED_ROWS : 48;
+  constexpr bool kCompactLayout = PACKED_ROWS > 0 && PACKED_ROWS < 48;
+  constexpr int kGroupedVerifyQStride = kCompactLayout ? 256 : 264;
+  constexpr int kGroupedVerifyQKWarps =
+      (kGroupedVerifyRows / 16) * (kGroupedVerifyBlockN / 16);
+  constexpr int kGroupedVerifyOutputTilesPerWarp = kGroupedVerifyRows / 16;
+  using Smem = GroupedE4M3SmemLayout<kGroupedVerifyRows, kGroupedVerifyQStride>;
   static_assert(!ROW_SEQLENS || !SPARSE_PAGE4,
                 "explicit row lengths apply to dense causal groups only");
   static_assert(
@@ -2690,31 +2254,37 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                         KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
                         std::is_same_v<PARTIAL_T, float>),
       "probability compensation is isolated to E4M3 FP32 groups");
-  static_assert(MAX_QUERY_TOKENS == 8 && COMPENSATE_P &&
-      ROW_SEQLENS && !SPARSE_PAGE4, "Full q8 compensated contract");
-  if (runtime_query_len != 8) return;
-  constexpr int query_len = 8;
   using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;
-  const int head_group = blockIdx.x;
+  const int head_group = blockIdx.x % Traits::kHeadGroups;
+  const int kv_head = blockIdx.x / Traits::kHeadGroups;
   const int split_id = blockIdx.y;
   const int group_idx = blockIdx.z;
-  if (head_group >= Traits::kHeadGroups || split_id >= Traits::kSplits ||
+  if (kv_head >= kv_heads || split_id >= Traits::kSplits ||
       group_idx >= num_groups || query_len <= 0 ||
-      query_len > MAX_QUERY_TOKENS) {
+      query_len > MAX_QUERY_TOKENS ||
+      query_len * Traits::kHeadsPerCta > kGroupedVerifyRows) {
     return;
   }
 
   if constexpr (ROW_SEQLENS) {
-    row_lengths += static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS;
+    // Runtime request width owns Q and length strides. The padded workspace
+    // capacity remains independent of the live query rows.
+    row_lengths += static_cast<int64_t>(group_idx) * query_len;
   }
 
   if constexpr (!SPARSE_PAGE4) {
-    partial_out += static_cast<int64_t>(group_idx) * Traits::kSplits *
-                   MAX_QUERY_TOKENS * kGroupedVerifyHeads *
-                   kGroupedVerifyHeadDim;
-    partial_lse += static_cast<int64_t>(group_idx) * Traits::kSplits *
-                   MAX_QUERY_TOKENS * kGroupedVerifyHeads *
-                   (ROW_SEQLENS ? 2 : 1);
+    const int64_t panel = static_cast<int64_t>(group_idx) * kv_heads + kv_head;
+    partial_out += panel * Traits::kSplits * MAX_QUERY_TOKENS *
+                   kGroupedVerifyHeads * kGroupedVerifyHeadDim;
+    partial_lse += panel * Traits::kSplits * MAX_QUERY_TOKENS *
+                   kGroupedVerifyHeads * (ROW_SEQLENS ? 2 : 1);
+  }
+
+  // The public multi-KV entry uses byte caches. Offset the shared six-head
+  // computation to its KV head without packing queries or copying outputs.
+  if (kv_head != 0) {
+    k_cache = static_cast<const uint8_t*>(k_cache) + kv_head * k_head_stride;
+    v_cache = static_cast<const uint8_t*>(v_cache) + kv_head * v_head_stride;
   }
 
   int total_kv = seq_lens[group_idx];
@@ -2750,18 +2320,30 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
   if (split_id >= active_splits) {
     return;
   }
-  const int total_tiles =
-      (total_kv + kGroupedVerifyBlockN - 1) / kGroupedVerifyBlockN;
+  constexpr int kReductionTile = 32;
+  const int total_tiles = (total_kv + kReductionTile - 1) / kReductionTile;
   const int base_tiles = total_tiles / active_splits;
   const int extra_tiles = total_tiles - base_tiles * active_splits;
   const int split_tile_start =
       split_id * base_tiles + min(split_id, extra_tiles);
   const int split_tiles = base_tiles + (split_id < extra_tiles ? 1 : 0);
-  const int split_start = split_tile_start * kGroupedVerifyBlockN;
+  const int split_start = split_tile_start * kReductionTile;
   const int split_end =
-      min(total_kv, split_start + split_tiles * kGroupedVerifyBlockN);
+      min(total_kv, split_start + split_tiles * kReductionTile);
   const int prefix_kv_len = max(0, total_kv - query_len);
   const int head_start = head_group * Traits::kHeadsPerCta;
+  constexpr int kTileQueryCapacity =
+      PACKED_ROWS ? PACKED_ROWS / Traits::kHeadsPerCta : MAX_QUERY_TOKENS;
+  __shared__ int tile_row_lengths[PACKED_ROWS ? kTileQueryCapacity : 1];
+  const int* visible_row_lengths = row_lengths;
+  if constexpr (PACKED_ROWS > 0 && !FULL_QUERY_TILE) {
+    if (threadIdx.x < kTileQueryCapacity) {
+      tile_row_lengths[threadIdx.x] =
+          threadIdx.x < query_len ? row_lengths[threadIdx.x] : 0;
+    }
+    visible_row_lengths = tile_row_lengths;
+  }
+  const int visible_query_rows = PACKED_ROWS ? kTileQueryCapacity : query_len;
   const int tid = threadIdx.x;
   const int warp_id = tid / kWarpSize;
   const int lane_id = tid % kWarpSize;
@@ -2770,19 +2352,17 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
   if (tid < 256)
     e4m3_lut[tid] = fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(tid));
   extern __shared__ char grouped_verify_smem_raw[];
-  GroupedVerifySmem& smem =
-      *reinterpret_cast<GroupedVerifySmem*>(grouped_verify_smem_raw);
+  Smem& smem = *reinterpret_cast<Smem*>(grouped_verify_smem_raw);
   __half* shared_q = smem.storage.compute.q;
-  __half* shared_kv = smem.storage.compute.kv;
+  __half* shared_kv = smem.storage.compute.panels.keys;
   float* shared_scores = smem.storage.compute.scores;
   __half* shared_probs = smem.storage.compute.probs;
   // The compensated entry reserves one padded probability panel after the
   // legacy layout. Match P's shared-memory stride without aliasing live QK
   // rows. Legacy entries retain their existing shared-memory footprint.
-  __half* shared_prob_residual = reinterpret_cast<__half*>(
-      grouped_verify_smem_raw + sizeof(GroupedVerifySmem));
+  __half* shared_prob_residual = smem.storage.compute.residual;
   constexpr int kResidualStride = kGroupedVerifyProbStride;
-  __half* shared_values = shared_prob_residual + kGroupedVerifyRows * kResidualStride;
+  __half* shared_values = smem.storage.compute.panels.values;
   const int* page_ids =
       block_table + static_cast<int64_t>(group_idx) * max_num_blocks;
   int split_page_offset = 0;
@@ -2818,14 +2398,21 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     const int token_idx = row / Traits::kHeadsPerCta;
     const int local_head = row % Traits::kHeadsPerCta;
     const int head_idx = head_start + local_head;
+    const int shared_offset = kCompactLayout
+                                  ? grouped_a_offset(row, vec_col * 8, 256) / 8
+                                  : row * kSharedQVecsPerRow + vec_col;
     if (token_idx < query_len && head_idx < kGroupedVerifyHeads) {
       const int64_t query_row =
-          static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS + token_idx;
-      shared_q_vec[row * kSharedQVecsPerRow + vec_col] = __ldg(
-          q_vec + (query_row * kGroupedVerifyHeads + head_idx) * kVecsPerRow +
+          static_cast<int64_t>(group_idx) *
+              (ROW_SEQLENS ? query_len : MAX_QUERY_TOKENS) +
+          token_idx;
+      shared_q_vec[shared_offset] = __ldg(
+          q_vec +
+          ((query_row * kv_heads + kv_head) * kGroupedVerifyHeads + head_idx) *
+              kVecsPerRow +
           vec_col);
     } else {
-      shared_q_vec[row * kSharedQVecsPerRow + vec_col] = make_uint4(0, 0, 0, 0);
+      shared_q_vec[shared_offset] = make_uint4(0, 0, 0, 0);
     }
   }
   if (tid < kGroupedVerifyRows) {
@@ -2873,7 +2460,8 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                            KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
                                (KV_DTYPE ==
                                     flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
-                                !SPARSE_PAGE4 && (!ROW_SEQLENS || PAIR_E4M3)), true>(
+                                !SPARSE_PAGE4 && (!ROW_SEQLENS || PAIR_E4M3)),
+                           true>(
           shared_kv, k_cache, page_ids, valid_k_rows, kPanelStrideVec,
           kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
           k_block_stride, k_token_stride, k_head_stride, 0, tid, e4m3_lut);
@@ -2915,8 +2503,9 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         const int kv_idx = tile_start + lane_id;
         const bool visible =
             grouped_verify_key_visible<SPARSE_PAGE4, ROW_SEQLENS>(
-                smem.sparse_token_masks, token_idx, query_len, head_idx, kv_idx,
-                valid_k_rows, lane_id, prefix_kv_len, row_lengths);
+                smem.sparse_token_masks, token_idx, visible_query_rows,
+                head_idx, kv_idx, valid_k_rows, lane_id, prefix_kv_len,
+                visible_row_lengths);
         const float score =
             visible ? shared_scores[row * kGroupedVerifyScoreStride + lane_id]
                     : kXQANegInf;
@@ -2940,28 +2529,40 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     }
   }
 
-  int minimum_visible_length = row_lengths[0];
+  int minimum_visible_length = 0;
+  if constexpr (PACKED_ROWS > 0) {
+    minimum_visible_length = visible_row_lengths[0];
 #pragma unroll
-  for (int i = 1; i < 8; ++i)
-    minimum_visible_length =
-        min(minimum_visible_length, row_lengths[i]);
+    for (int i = 1; i < kTileQueryCapacity; ++i)
+      minimum_visible_length =
+          min(minimum_visible_length, visible_row_lengths[i]);
+  }
 
   static_assert(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3);
   constexpr int kRawPairStride = kGroupedVerifyHeadDim / 16;
-  uint4 prefetched_k = make_uint4(0, 0, 0, 0);
-  if (PAIR_E4M3 && tid < min(kGroupedVerifyBlockN, split_end - split_start) *
-                             kRawPairStride) {
-    prefetched_k = prefetch_k_pair<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT>(
-        k_cache, page_ids, tid, kRawPairStride,
-        use_staged_page_ids ? split_page_offset : split_start, page_block_size,
-        k_block_stride, k_token_stride);
-  }
+
   // Recompute QK for the conservative path, or consume it once while updating
   // the online state for the fused path. Both form half P and use identical
   // Volta WMMA P @ V arithmetic.
   for (int tile_start = split_start; tile_start < split_end;
        tile_start += kGroupedVerifyBlockN) {
     const int valid_k_rows = min(kGroupedVerifyBlockN, split_end - tile_start);
+
+    // Overlap compressed V reads with QK before reusing the shared K panel.
+    uint4 prefetched_values[kGroupedVerifyBlockN / 32];
+    if constexpr (PAIR_E4M3 && kGroupedVerifyBlockN > 32) {
+#pragma unroll
+      for (int part = 0; part < kGroupedVerifyBlockN / 32; ++part) {
+        const int index = tid + part * kGroupedVerifyThreads;
+        prefetched_values[part] = make_uint4(0, 0, 0, 0);
+        if (tile_start + index / 16 < split_end)
+          prefetched_values[part] =
+              prefetch_kv_pair<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT>(
+                  v_cache, page_ids, index, 16, tile_start, page_block_size,
+                  v_block_stride, v_token_stride);
+      }
+    }
+
     if constexpr (SPARSE_PAGE4) {
       const int valid_sparse_pages = (valid_k_rows + 3) / 4;
       if (tid < kGroupedVerifyBlockN / 4) {
@@ -2976,22 +2577,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     const int tile_page_offset =
         use_staged_page_ids ? split_page_offset + tile_start - split_start
                             : tile_start;
-
-    if constexpr (PAIR_E4M3) {
-      if (tid < valid_k_rows * kRawPairStride) {
-        const int row = tid / kRawPairStride;
-        const int pair = tid % kRawPairStride;
-        const uint64_t lo = static_cast<uint64_t>(prefetched_k.x) |
-                            (static_cast<uint64_t>(prefetched_k.y) << 32);
-        const uint64_t hi = static_cast<uint64_t>(prefetched_k.z) |
-                            (static_cast<uint64_t>(prefetched_k.w) << 32);
-        uint4* dst = reinterpret_cast<uint4*>(shared_kv);
-        dst[row * kSharedStrideVec + pair * 2] =
-            fp8_e4m3fn_vector_to_half8_lut(lo, e4m3_lut);
-        dst[row * kSharedStrideVec + pair * 2 + 1] =
-            fp8_e4m3fn_vector_to_half8_lut(hi, e4m3_lut);
-      }
-    } else {
+    if (!PAIR_E4M3 || tile_start == split_start) {
       load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,
                            kGroupedVerifyThreads, KV_DTYPE,
                            KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
@@ -3002,19 +2588,21 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
           shared_kv, k_cache, page_ids, valid_k_rows, kPanelStrideVec,
           kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
           k_block_stride, k_token_stride, k_head_stride, 0, tid, e4m3_lut);
+      for (int idx = tid + valid_k_rows * kSharedStrideVec;
+           idx < kGroupedVerifyBlockN * kSharedStrideVec;
+           idx += kGroupedVerifyThreads) {
+        reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
+      }
+      __syncthreads();
     }
-    for (int idx = tid + valid_k_rows * kSharedStrideVec;
-         idx < kGroupedVerifyBlockN * kSharedStrideVec;
-         idx += kGroupedVerifyThreads) {
-      reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
-    }
-    __syncthreads();
-
     int active_m_tiles = 0x7;
-    if constexpr (COMPENSATE_P) {
-      // Native MTP4 supplies five rows: only 30 of the 48 packed rows are
-      // live. Avoid QK/PV for wholly padded M tiles to pay for the residual
-      // product without changing arithmetic in any live row.
+    if constexpr (PACKED_ROWS > 0) {
+      // The host selects the smallest physical tile covering the request.
+      // Every tile contains live rows; row predicates mask its trailing lanes.
+      active_m_tiles = (1 << (PACKED_ROWS / 16)) - 1;
+    } else if constexpr (COMPENSATE_P) {
+      // The tile capacity rounds up the live query/head rows. Skip wholly
+      // padded M tiles while retaining every live row's ordered arithmetic.
       active_m_tiles =
           (1 << ((query_len * Traits::kHeadsPerCta + 15) / 16)) - 1;
     }
@@ -3035,215 +2623,370 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         }
       }
     }
-    grouped_verify_qk<COMPENSATE_P>(shared_q, shared_kv, shared_scores,
-                                    qk_scale, active_m_tiles);
-    if (warp_id >= kGroupedVerifyQKWarps) {
-      constexpr int kValueLoadThreads = kGroupedVerifyThreads - kGroupedVerifyQKWarps * kWarpSize;
-      const int value_load_tid = tid - kGroupedVerifyQKWarps * kWarpSize;
-    load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,
-                         kValueLoadThreads, KV_DTYPE,
-                         KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
-                             (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
-                              !SPARSE_PAGE4 && (!ROW_SEQLENS || PAIR_E4M3)), true>(
-        shared_values, v_cache, page_ids, valid_k_rows, kPanelStrideVec,
-        kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
-        v_block_stride, v_token_stride, v_head_stride, 0, value_load_tid, e4m3_lut);
-    for (int idx = value_load_tid + valid_k_rows * kSharedStrideVec;
-         idx < kGroupedVerifyBlockN * kSharedStrideVec;
-         idx += kValueLoadThreads) {
-      reinterpret_cast<uint4*>(shared_values)[idx] = make_uint4(0, 0, 0, 0);
-    }
-    }
+    grouped_verify_qk<COMPENSATE_P, kCompactLayout ? PACKED_ROWS : 0,
+                      kGroupedVerifyBlockN, kGroupedVerifyKVStride>(
+        shared_q, shared_kv, shared_scores, qk_scale, active_m_tiles);
 
+    if constexpr (kGroupedVerifyBlockN == kReductionTile) {
+      if (warp_id >= kGroupedVerifyQKWarps) {
+        constexpr int kValueLoadThreads =
+            kGroupedVerifyThreads - kGroupedVerifyQKWarps * 32;
+        const int value_load_tid = tid - kGroupedVerifyQKWarps * 32;
+        load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,
+                             kValueLoadThreads, KV_DTYPE,
+                             KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
+                                 (KV_DTYPE ==
+                                      flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
+                                  !SPARSE_PAGE4 && (!ROW_SEQLENS || PAIR_E4M3)),
+                             true>(
+            shared_values, v_cache, page_ids, valid_k_rows, kPanelStrideVec,
+            kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
+            v_block_stride, v_token_stride, v_head_stride, 0, value_load_tid,
+            e4m3_lut);
+        for (int idx = value_load_tid + valid_k_rows * kSharedStrideVec;
+             idx < kGroupedVerifyBlockN * kSharedStrideVec;
+             idx += kValueLoadThreads) {
+          reinterpret_cast<uint4*>(shared_values)[idx] = make_uint4(0, 0, 0, 0);
+        }
+      }
+    }
     __syncthreads();
 
-    if constexpr (TWO_PASS) {
-      for (int idx = tid; idx < kGroupedVerifyRows * kGroupedVerifyBlockN;
-           idx += kGroupedVerifyThreads) {
-        const int row = idx / kGroupedVerifyBlockN;
-        const int col = idx % kGroupedVerifyBlockN;
-        const int token_idx = row / Traits::kHeadsPerCta;
-        const int local_head = row % Traits::kHeadsPerCta;
-        const int head_idx = head_start + local_head;
-        const int kv_idx = tile_start + col;
-        const bool visible =
-            grouped_verify_key_visible<SPARSE_PAGE4, ROW_SEQLENS>(
-                smem.sparse_token_masks, token_idx, query_len, head_idx, kv_idx,
-                valid_k_rows, col, prefix_kv_len, row_lengths) &&
-            smem.row_sum[row] > 0.0f;
-        const float probability =
-            visible ? __expf(fmaxf(
-                          shared_scores[row * kGroupedVerifyScoreStride + col] -
-                              smem.row_max[row],
-                          -80.0f))
-                    : 0.0f;
-        shared_probs[grouped_a_offset(row, col, 32)] =
-            __float2half_rn(probability);
-      }
-      __syncthreads();
-    } else {
-
-      // Four independent softmax rows share a warp. Keep the original
-      // 32-column reduction tree: combine columns 16 and 8 apart locally,
-      // then use eight-lane shuffles for offsets 4, 2, and 1. This removes
-      // repeated warp reductions without changing probability compensation.
-      auto online_update = [&](auto full_visible) {
-        constexpr int Width = 8;
-        constexpr int Values = 32 / Width;
-        constexpr bool FullVisible = decltype(full_visible)::value;
-        const int subgroup_lane = lane_id % Width;
-        const int subgroup_base = (lane_id / Width) * Width;
-        for (int row = warp_id * Values + lane_id / Width;
-             row < kGroupedVerifyRows; row += kGroupedVerifyWarps * Values) {
-          float scores[Values];
-          bool visible[Values];
-#pragma unroll
-          for (int j = 0; j < Values; ++j) {
-            const int col = subgroup_lane + j * Width;
-            visible[j] = FullVisible || grouped_verify_key_visible<false, true>(
-                smem.sparse_token_masks, row / Traits::kHeadsPerCta, query_len,
-                head_start + row % Traits::kHeadsPerCta, tile_start + col,
-                valid_k_rows, col, prefix_kv_len, row_lengths);
-            scores[j] = visible[j]
-                ? shared_scores[row * kGroupedVerifyScoreStride + col]
-                : kXQANegInf;
-          }
-          float maxima[Values];
-#pragma unroll
-          for (int j = 0; j < Values; ++j) maxima[j] = scores[j];
-#pragma unroll
-          for (int stride = Values / 2; stride > 0; stride /= 2) {
-#pragma unroll
-            for (int j = 0; j < stride; ++j)
-              maxima[j] = fmaxf(maxima[j], maxima[j + stride]);
-          }
-          float maximum = maxima[0];
-#pragma unroll
-          for (int stride = Width / 2; stride > 0; stride /= 2)
-            maximum = fmaxf(maximum,
-                __shfl_down_sync(0xffffffffu, maximum, stride, Width));
-          const float tile_max =
-              __shfl_sync(0xffffffffu, maximum, subgroup_base);
-          const float old_max = smem.row_max[row];
-          const float new_max = fmaxf(old_max, tile_max);
-          float probabilities[Values];
-#pragma unroll
-          for (int j = 0; j < Values; ++j) {
-            const int col = subgroup_lane + j * Width;
-            const float probability = visible[j]
-                ? __expf(fmaxf(scores[j] - new_max, -80.f)) : 0.f;
-            probabilities[j] = probability;
-            const half rounded = __float2half_rn(probability);
-            shared_probs[grouped_a_offset(row, col, 32)] = rounded;
-            shared_prob_residual[grouped_a_offset(row, col, 32)] =
-                __float2half_rn((probability - __half2float(rounded)) * 2048.f);
-          }
-#pragma unroll
-          for (int stride = Values / 2; stride > 0; stride /= 2) {
-#pragma unroll
-            for (int j = 0; j < stride; ++j)
-              probabilities[j] = __fadd_rn(probabilities[j], probabilities[j + stride]);
-          }
-          float sum = probabilities[0];
-#pragma unroll
-          for (int stride = Width / 2; stride > 0; stride /= 2)
-            sum += __shfl_down_sync(0xffffffffu, sum, stride, Width);
-          const float tile_sum = __shfl_sync(0xffffffffu, sum, subgroup_base);
-          const float exp_diff = tile_sum > 0.f
-              ? __expf(fmaxf(old_max - new_max, -80.f)) : 1.f;
-          __syncwarp();
-          if (subgroup_lane == 0) {
-            if (tile_sum > 0.f) {
-              smem.row_sum[row] = smem.row_sum[row] * exp_diff + tile_sum;
-              smem.row_max[row] = new_max;
-            }
-            smem.row_scale[row] = exp_diff;
-          }
-        }
-      };
-      if (tile_start + kGroupedVerifyBlockN <= minimum_visible_length)
-        online_update(std::true_type{});
-      else
-        online_update(std::false_type{});
-      __syncthreads();
-      if constexpr (!COMPENSATE_P) {
-#pragma unroll
-        for (int fragment_idx = 0;
-             fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
-          const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
-          const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
-          grouped_verify_scale_output_fragment(output_fragments[fragment_idx],
-                                               smem.row_scale, m_tile * 16);
-        }
-      }
-    }
-
+    // Prefetch the next K panel while PV consumes the shared buffer.
     const int next_tile = tile_start + kGroupedVerifyBlockN;
-    if (PAIR_E4M3 && tid < min(kGroupedVerifyBlockN, split_end - next_tile) *
-                               kRawPairStride) {
-      const int next_offset = use_staged_page_ids
-                                  ? split_page_offset + next_tile - split_start
-                                  : next_tile;
-      prefetched_k = prefetch_k_pair<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT>(
-          k_cache, page_ids, tid, kRawPairStride, next_offset, page_block_size,
-          k_block_stride, k_token_stride);
+
+    if constexpr (kGroupedVerifyBlockN > kReductionTile) {
+      if constexpr (PAIR_E4M3) {
+#pragma unroll
+        for (int part = 0; part < kGroupedVerifyBlockN / 32; ++part) {
+          const int index = tid + part * kGroupedVerifyThreads;
+          const int offset = (index / 16) * kSharedStrideVec + (index % 16) * 2;
+          const uint4 raw = prefetched_values[part];
+          const uint64_t lo = uint64_t(raw.x) | (uint64_t(raw.y) << 32);
+          const uint64_t hi = uint64_t(raw.z) | (uint64_t(raw.w) << 32);
+          reinterpret_cast<uint4*>(shared_values)[offset] =
+              fp8_e4m3fn_vector_to_half8_lut(lo, e4m3_lut);
+          reinterpret_cast<uint4*>(shared_values)[offset + 1] =
+              fp8_e4m3fn_vector_to_half8_lut(hi, e4m3_lut);
+        }
+      } else {
+        constexpr int kValueLoadThreads = kGroupedVerifyThreads;
+        const int value_load_tid = tid;
+        load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,
+                             kValueLoadThreads, KV_DTYPE,
+                             KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
+                                 (KV_DTYPE ==
+                                      flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
+                                  !SPARSE_PAGE4 && (!ROW_SEQLENS || PAIR_E4M3)),
+                             true>(
+            shared_values, v_cache, page_ids, valid_k_rows, kPanelStrideVec,
+            kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
+            v_block_stride, v_token_stride, v_head_stride, 0, value_load_tid,
+            e4m3_lut);
+        for (int idx = value_load_tid + valid_k_rows * kSharedStrideVec;
+             idx < kGroupedVerifyBlockN * kSharedStrideVec;
+             idx += kValueLoadThreads) {
+          reinterpret_cast<uint4*>(shared_values)[idx] = make_uint4(0, 0, 0, 0);
+        }
+      }
+      __syncthreads();
     }
-    static_assert(COMPENSATE_P && kGroupedVerifyWarps == 16,
-                  "PV reuse is isolated to six-head compensated E4M3");
-    volta::fragment<volta::accumulator, 16, 16, 16, float>
-        tile_fragments[kGroupedVerifyOutputTilesPerWarp];
+
+    uint4 next_keys[kGroupedVerifyBlockN / 32];
+    if constexpr (PAIR_E4M3) {
 #pragma unroll
-    for (int i = 0; i < kGroupedVerifyOutputTilesPerWarp; ++i)
-      volta::fill_fragment(tile_fragments[i], 0.0f);
-    const int d_tile = warp_id;
+      for (int part = 0; part < kGroupedVerifyBlockN / 32; ++part) {
+        next_keys[part] = make_uint4(0, 0, 0, 0);
+        const int index = tid + part * kGroupedVerifyThreads;
+        if (next_tile + index / 16 < split_end) {
+          next_keys[part] =
+              prefetch_kv_pair<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT>(
+                  k_cache, page_ids, index, 16, next_tile, page_block_size,
+                  k_block_stride, k_token_stride);
+        }
+      }
+    }
+    // Wide QK work preserves each original N32 online reduction boundary.
+    for (int context_offset = 0; context_offset < valid_k_rows;
+         context_offset += kReductionTile) {
+      if constexpr (TWO_PASS) {
+        for (int idx = tid; idx < kGroupedVerifyRows * kGroupedVerifyBlockN;
+             idx += kGroupedVerifyThreads) {
+          const int row = idx / kGroupedVerifyBlockN;
+          const int col = idx % kGroupedVerifyBlockN;
+          const int token_idx = row / Traits::kHeadsPerCta;
+          const int local_head = row % Traits::kHeadsPerCta;
+          const int head_idx = head_start + local_head;
+          const int kv_idx = tile_start + context_offset + col;
+          const bool visible =
+              grouped_verify_key_visible<SPARSE_PAGE4, ROW_SEQLENS>(
+                  smem.sparse_token_masks, token_idx, visible_query_rows,
+                  head_idx, kv_idx, valid_k_rows, context_offset + col,
+                  prefix_kv_len, visible_row_lengths) &&
+              smem.row_sum[row] > 0.0f;
+          const float probability =
+              visible
+                  ? __expf(fmaxf(shared_scores[row * kGroupedVerifyScoreStride +
+                                               context_offset + col] -
+                                     smem.row_max[row],
+                                 -80.0f))
+                  : 0.0f;
+          shared_probs[grouped_a_offset(row, context_offset + col,
+                                        kGroupedVerifyBlockN)] =
+              __float2half_rn(probability);
+        }
+        __syncthreads();
+      } else {
+        if constexpr (PACKED_ROWS > 0) {
+          // Four independent rows share a warp. Each lane contributes the
+          // same number of context columns before the eight-lane reduction.
+          auto online_update = [&](auto full_visible) {
+            constexpr int Width =
+                kGroupedVerifyBlockN == 32 && kGroupedVerifyRows < 48 ? 32 : 8;
+            constexpr int Values = kReductionTile / Width;
+            constexpr bool FullVisible = decltype(full_visible)::value;
+            const int subgroup_lane = lane_id % Width;
+            const int subgroup_base = (lane_id / Width) * Width;
+            for (int row = warp_id * (32 / Width) + lane_id / Width;
+                 row < kGroupedVerifyRows;
+                 row += kGroupedVerifyWarps * (32 / Width)) {
+              float scores[Values];
+              bool visible[Values];
 #pragma unroll
-    for (int k_offset = 0; k_offset < kGroupedVerifyBlockN; k_offset += 16) {
-      volta::fragment<volta::matrix_b, 16, 16, 16, half, volta::row_major>
-          value_fragment;
-      volta::load_matrix_sync(
-          value_fragment,
-          shared_values + k_offset * kGroupedVerifyKVStride + d_tile * 16,
-          kGroupedVerifyKVStride);
-      auto residual_value_fragment = value_fragment;
+              for (int j = 0; j < Values; ++j) {
+                const int col = subgroup_lane + j * Width;
+                visible[j] = FullVisible ||
+                             grouped_verify_key_visible<false, true>(
+                                 smem.sparse_token_masks,
+                                 row / Traits::kHeadsPerCta, visible_query_rows,
+                                 head_start + row % Traits::kHeadsPerCta,
+                                 tile_start + context_offset + col,
+                                 valid_k_rows, context_offset + col,
+                                 prefix_kv_len, visible_row_lengths);
+                scores[j] =
+                    visible[j] ? shared_scores[row * kGroupedVerifyScoreStride +
+                                               context_offset + col]
+                               : kXQANegInf;
+              }
+              float maxima[Values];
 #pragma unroll
-      for (int i = 0; i < value_fragment.num_elements / 2; ++i) {
-        union {
-          uint32_t bits;
-          __half2 pair;
-        } packed_value;
-        packed_value.bits = value_fragment.x[i];
-        packed_value.pair =
-            __hmul2(packed_value.pair, __float2half2_rn(1.0f / 2048.0f));
-        residual_value_fragment.x[i] = packed_value.bits;
+              for (int j = 0; j < Values; ++j) maxima[j] = scores[j];
+#pragma unroll
+              for (int stride = Values / 2; stride > 0; stride /= 2) {
+#pragma unroll
+                for (int j = 0; j < stride; ++j)
+                  maxima[j] = fmaxf(maxima[j], maxima[j + stride]);
+              }
+              float maximum = maxima[0];
+#pragma unroll
+              for (int stride = Width / 2; stride > 0; stride /= 2)
+                maximum = fmaxf(maximum, __shfl_down_sync(0xffffffffu, maximum,
+                                                          stride, Width));
+              const float tile_max =
+                  __shfl_sync(0xffffffffu, maximum, subgroup_base);
+              const float old_max = smem.row_max[row];
+              const float new_max = fmaxf(old_max, tile_max);
+              float probabilities[Values];
+#pragma unroll
+              for (int j = 0; j < Values; ++j) {
+                const int col = subgroup_lane + j * Width;
+                const float probability =
+                    visible[j] ? __expf(fmaxf(scores[j] - new_max, -80.f))
+                               : 0.f;
+                probabilities[j] = probability;
+                const half rounded = __float2half_rn(probability);
+                shared_probs[grouped_a_offset(row, context_offset + col,
+                                              kGroupedVerifyBlockN)] = rounded;
+                shared_prob_residual[grouped_a_offset(row, context_offset + col,
+                                                      kGroupedVerifyBlockN)] =
+                    __float2half_rn((probability - __half2float(rounded)) *
+                                    2048.f);
+              }
+#pragma unroll
+              for (int stride = Values / 2; stride > 0; stride /= 2) {
+#pragma unroll
+                for (int j = 0; j < stride; ++j)
+                  probabilities[j] =
+                      __fadd_rn(probabilities[j], probabilities[j + stride]);
+              }
+              float sum = probabilities[0];
+#pragma unroll
+              for (int stride = Width / 2; stride > 0; stride /= 2)
+                sum += __shfl_down_sync(0xffffffffu, sum, stride, Width);
+              const float tile_sum =
+                  __shfl_sync(0xffffffffu, sum, subgroup_base);
+              const float exp_diff =
+                  tile_sum > 0.f ? __expf(fmaxf(old_max - new_max, -80.f))
+                                 : 1.f;
+              __syncwarp();
+              if (subgroup_lane == 0) {
+                if (tile_sum > 0.f) {
+                  smem.row_sum[row] = smem.row_sum[row] * exp_diff + tile_sum;
+                  smem.row_max[row] = new_max;
+                }
+                smem.row_scale[row] = exp_diff;
+              }
+            }
+          };
+          if (tile_start + context_offset + kReductionTile <=
+              minimum_visible_length)
+            online_update(std::true_type{});
+          else
+            online_update(std::false_type{});
+        } else {
+#pragma unroll
+          for (int row = warp_id; row < kGroupedVerifyRows;
+               row += kGroupedVerifyWarps) {
+            if constexpr (COMPENSATE_P) {
+              if ((active_m_tiles & (1 << (row / 16))) == 0) {
+                continue;
+              }
+            }
+            const int token_idx = row / Traits::kHeadsPerCta;
+            const int local_head = row % Traits::kHeadsPerCta;
+            const int head_idx = head_start + local_head;
+            const int kv_idx = tile_start + context_offset + lane_id;
+            const bool visible =
+                grouped_verify_key_visible<SPARSE_PAGE4, ROW_SEQLENS>(
+                    smem.sparse_token_masks, token_idx, visible_query_rows,
+                    head_idx, kv_idx, valid_k_rows, context_offset + lane_id,
+                    prefix_kv_len, visible_row_lengths);
+            const float score =
+                visible ? shared_scores[row * kGroupedVerifyScoreStride +
+                                        context_offset + lane_id]
+                        : kXQANegInf;
+            const float tile_max_lane = warp_reduce_max(score);
+            const float tile_max = __shfl_sync(0xffffffffu, tile_max_lane, 0);
+            const float old_max = smem.row_max[row];
+            const float new_max = fmaxf(old_max, tile_max);
+            const float probability =
+                visible ? __expf(fmaxf(score - new_max, -80.0f)) : 0.0f;
+            shared_probs[grouped_a_offset(row, context_offset + lane_id,
+                                          kGroupedVerifyBlockN)] =
+                __float2half_rn(probability);
+            if constexpr (COMPENSATE_P) {
+              const float rounded = __half2float(__float2half_rn(probability));
+              shared_prob_residual[grouped_a_offset(
+                  row, context_offset + lane_id, kGroupedVerifyBlockN)] =
+                  __float2half_rn((probability - rounded) * 2048.0f);
+            }
+            const float tile_sum_lane = warp_reduce_sum(probability);
+            const float tile_sum = __shfl_sync(0xffffffffu, tile_sum_lane, 0);
+            const float exp_diff =
+                tile_sum > 0.0f ? __expf(fmaxf(old_max - new_max, -80.0f))
+                                : 1.0f;
+            // Finish every lane's shared-state reads before lane 0 overwrites
+            // the online maximum. Shuffle synchronization does not order
+            // memory.
+            __syncwarp();
+            if (lane_id == 0) {
+              if (tile_sum > 0.0f) {
+                smem.row_sum[row] = smem.row_sum[row] * exp_diff + tile_sum;
+                smem.row_max[row] = new_max;
+              }
+              smem.row_scale[row] = exp_diff;
+            }
+          }
+        }
+        __syncthreads();
+        if constexpr (!COMPENSATE_P) {
+#pragma unroll
+          for (int fragment_idx = 0;
+               fragment_idx < kGroupedVerifyOutputTilesPerWarp;
+               ++fragment_idx) {
+            const int output_tile =
+                warp_id + fragment_idx * kGroupedVerifyWarps;
+            const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
+            grouped_verify_scale_output_fragment(output_fragments[fragment_idx],
+                                                 smem.row_scale, m_tile * 16);
+          }
+        }
+      }
+
+      volta::fragment<volta::accumulator, 16, 16, 16, float>
+          tile_fragments[(kGroupedVerifyRows / 16)];
+#pragma unroll
+      for (int i = 0; i < (kGroupedVerifyRows / 16); ++i)
+        volta::fill_fragment(tile_fragments[i], 0.0f);
+      const int d_tile = warp_id;
+#pragma unroll
+      for (int k_offset = context_offset;
+           k_offset < context_offset + kReductionTile; k_offset += 16) {
+        volta::fragment<volta::matrix_b, 16, 16, 16, half, volta::row_major>
+            value_fragment;
+        const __half* value_pointer =
+            shared_values + k_offset * kGroupedVerifyKVStride + d_tile * 16;
+        if constexpr (kCompactLayout) {
+          load_grouped_b_shared(value_fragment, value_pointer,
+                                kGroupedVerifyKVStride);
+        } else {
+          volta::load_matrix_sync(value_fragment, value_pointer,
+                                  kGroupedVerifyKVStride);
+        }
+        auto residual_value_fragment = value_fragment;
+#pragma unroll
+        for (int i = 0; i < value_fragment.num_elements / 2; ++i) {
+          union {
+            uint32_t bits;
+            __half2 pair;
+          } packed_value;
+          packed_value.bits = value_fragment.x[i];
+          packed_value.pair =
+              __hmul2(packed_value.pair, __float2half2_rn(1.0f / 2048.0f));
+          residual_value_fragment.x[i] = packed_value.bits;
+        }
+#pragma unroll
+        for (int fragment_idx = 0; fragment_idx < (kGroupedVerifyRows / 16);
+             ++fragment_idx) {
+          const int m_tile = fragment_idx;
+          if ((active_m_tiles & (1 << m_tile)) == 0) continue;
+          volta::fragment<volta::matrix_a, 16, 16, 16, half, volta::row_major>
+              probability_fragment;
+          load_grouped_a_swizzled(
+              probability_fragment,
+              shared_probs + m_tile * 16 * kGroupedVerifyProbStride, k_offset);
+          volta::mma_sync(tile_fragments[fragment_idx], probability_fragment,
+                          value_fragment, tile_fragments[fragment_idx]);
+          load_grouped_a_swizzled(
+              probability_fragment,
+              shared_prob_residual + m_tile * 16 * kResidualStride, k_offset);
+          volta::mma_sync(tile_fragments[fragment_idx], probability_fragment,
+                          residual_value_fragment,
+                          tile_fragments[fragment_idx]);
+        }
       }
 #pragma unroll
-      for (int fragment_idx = 0;
-           fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
+      for (int fragment_idx = 0; fragment_idx < (kGroupedVerifyRows / 16);
+           ++fragment_idx) {
         const int m_tile = fragment_idx;
         if ((active_m_tiles & (1 << m_tile)) == 0) continue;
-        volta::fragment<volta::matrix_a, 16, 16, 16, half, volta::row_major>
-            probability_fragment;
-        load_grouped_a_swizzled(
-            probability_fragment,
-            shared_probs + m_tile * 16 * kGroupedVerifyProbStride, k_offset);
-        volta::mma_sync(tile_fragments[fragment_idx], probability_fragment,
-                        value_fragment, tile_fragments[fragment_idx]);
-        load_grouped_a_swizzled(
-            probability_fragment,
-            shared_prob_residual + m_tile * 16 * kResidualStride, k_offset);
-        volta::mma_sync(tile_fragments[fragment_idx], probability_fragment,
-                        residual_value_fragment, tile_fragments[fragment_idx]);
+        grouped_verify_add_output_tile(output_fragments[fragment_idx],
+                                       tile_fragments[fragment_idx],
+                                       smem.row_scale, m_tile * 16);
+      }
+
+      if constexpr (kGroupedVerifyBlockN > kReductionTile) __syncthreads();
+    }
+    if constexpr (PAIR_E4M3) {
+      // Reused panels retire V consumers before publishing the next K.
+      if (next_tile < split_end) {
+#pragma unroll
+        for (int part = 0; part < kGroupedVerifyBlockN / 32; ++part) {
+          const int index = tid + part * kGroupedVerifyThreads;
+          const int offset = (index / 16) * kSharedStrideVec + (index % 16) * 2;
+          const uint4 raw = next_keys[part];
+          const uint64_t lo = static_cast<uint64_t>(raw.x) |
+                              (static_cast<uint64_t>(raw.y) << 32);
+          const uint64_t hi = static_cast<uint64_t>(raw.z) |
+                              (static_cast<uint64_t>(raw.w) << 32);
+          reinterpret_cast<uint4*>(shared_kv)[offset] =
+              fp8_e4m3fn_vector_to_half8_lut(lo, e4m3_lut);
+          reinterpret_cast<uint4*>(shared_kv)[offset + 1] =
+              fp8_e4m3fn_vector_to_half8_lut(hi, e4m3_lut);
+        }
       }
     }
-#pragma unroll
-    for (int fragment_idx = 0;
-         fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
-      const int m_tile = fragment_idx;
-      if ((active_m_tiles & (1 << m_tile)) == 0) continue;
-      grouped_verify_add_output_tile(output_fragments[fragment_idx],
-                                     tile_fragments[fragment_idx],
-                                     smem.row_scale, m_tile * 16);
-    }
+
     __syncthreads();
   }
 
@@ -3332,13 +3075,32 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
 // softmax probability, PV products, numerator and partition state in FP32.
 // Padded rows retain their explicit zero lengths throughout graph replay.
 template <bool SHORT_SPLITS>
-__global__
-__launch_bounds__(kGroupedVerifyThreads, 1)
-void flash_attention_grouped_verify_fp16_fp32_partial_kernel(
-    const __half* q, const void* k, const void* v, const int* blocks,
-    const int* lengths, float* partial, float* lse, int query_len,
-    int max_blocks, int page, int64_t kb, int64_t kt, int64_t kh,
-    int64_t vb, int64_t vt, int64_t vh, float scale) {
+__global__ __launch_bounds__(
+    kGroupedVerifyThreads,
+    1) void flash_attention_grouped_verify_fp16_fp32_partial_kernel(const __half*
+                                                                        q,
+                                                                    const void*
+                                                                        k,
+                                                                    const void*
+                                                                        v,
+                                                                    const int*
+                                                                        blocks,
+                                                                    const int*
+                                                                        lengths,
+                                                                    float*
+                                                                        partial,
+                                                                    float* lse,
+                                                                    int query_len,
+                                                                    int max_blocks,
+                                                                    int page,
+                                                                    int64_t kb,
+                                                                    int64_t kt,
+                                                                    int64_t kh,
+                                                                    int64_t vb,
+                                                                    int64_t vt,
+                                                                    int64_t vh,
+                                                                    float
+                                                                        scale) {
   const int split = blockIdx.x, request = blockIdx.y;
   lengths += request * 8;
   blocks += request * max_blocks;
@@ -3348,9 +3110,9 @@ void flash_attention_grouped_verify_fp16_fp32_partial_kernel(
   int total = 0;
   for (int r = 0; r < query_len; r++) total = max(total, lengths[r]);
   if (total <= 0) return;
-  const int active = SHORT_SPLITS
-      ? fp16_grouped_active_splits(total, query_len, gridDim.y)
-      : grouped_verify_active_splits<8, false>(total);
+  const int active =
+      SHORT_SPLITS ? fp16_grouped_active_splits(total, query_len, gridDim.y)
+                   : grouped_verify_active_splits<8, false>(total);
   if (split >= active) return;
   const int tiles = (total + 31) / 32, base = tiles / active,
             extra = tiles % active;
@@ -3462,25 +3224,26 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
     const PARTIAL_T* __restrict__ partial_out,
     const float* __restrict__ partial_lse, const int* __restrict__ seq_lens,
     __half* __restrict__ out, const int query_len,
-    const int* row_lengths = nullptr) {
+    const int* row_lengths = nullptr, const int kv_heads = 1) {
   using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;
   const int token_idx = blockIdx.x;
-  const int head_idx = blockIdx.y;
+  const int head_idx = blockIdx.y % kGroupedVerifyHeads;
+  const int kv_head = blockIdx.y / kGroupedVerifyHeads;
   const int request_idx = blockIdx.z;
-  if (token_idx >= query_len || head_idx >= kGroupedVerifyHeads) {
+  if (token_idx >= query_len || kv_head >= kv_heads) {
     return;
   }
-  partial_out += static_cast<int64_t>(request_idx) * Traits::kSplits *
-                 MAX_QUERY_TOKENS * kGroupedVerifyHeads * kGroupedVerifyHeadDim;
-  partial_lse += static_cast<int64_t>(request_idx) * Traits::kSplits *
-                 MAX_QUERY_TOKENS * kGroupedVerifyHeads *
-                 (ROW_SEQLENS ? 2 : 1);
+  const int64_t panel = static_cast<int64_t>(request_idx) * kv_heads + kv_head;
+  partial_out += panel * Traits::kSplits * MAX_QUERY_TOKENS *
+                 kGroupedVerifyHeads * kGroupedVerifyHeadDim;
+  partial_lse += panel * Traits::kSplits * MAX_QUERY_TOKENS *
+                 kGroupedVerifyHeads * (ROW_SEQLENS ? 2 : 1);
   seq_lens += request_idx;
-  out += static_cast<int64_t>(request_idx) * query_len * kGroupedVerifyHeads *
-         kGroupedVerifyHeadDim;
+  out += (static_cast<int64_t>(request_idx) * query_len * kv_heads + kv_head) *
+         kGroupedVerifyHeads * kGroupedVerifyHeadDim;
 
   if constexpr (ROW_SEQLENS) {
-    row_lengths += static_cast<int64_t>(request_idx) * MAX_QUERY_TOKENS;
+    row_lengths += static_cast<int64_t>(request_idx) * query_len;
   }
 
   int total_kv = seq_lens[0];
@@ -3491,7 +3254,7 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
     // Padding may leave every partial unwritten. Never read stale workspace.
     if (row_lengths[token_idx] <= 0) {
       for (int d = threadIdx.x; d < kGroupedVerifyHeadDim; d += blockDim.x)
-        out[(token_idx * kGroupedVerifyHeads + head_idx) *
+        out[(token_idx * kv_heads * kGroupedVerifyHeads + head_idx) *
                 kGroupedVerifyHeadDim +
             d] = __float2half_rn(0.0f);
       return;
@@ -3500,7 +3263,8 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
   const int active_splits =
       FP16_SHORT_SPLITS
           ? fp16_grouped_active_splits(total_kv, query_len, gridDim.z)
-          : grouped_verify_active_splits<MAX_QUERY_TOKENS, SINGLE_QUERY>(total_kv);
+          : grouped_verify_active_splits<MAX_QUERY_TOKENS, SINGLE_QUERY>(
+                total_kv);
   __shared__ float split_lse[Traits::kSplits];
   __shared__ float split_sum[ROW_SEQLENS ? Traits::kSplits : 1];
   __shared__ float split_weight[Traits::kSplits];
@@ -3565,7 +3329,8 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
         }
       }
     }
-    out[(token_idx * kGroupedVerifyHeads + head_idx) * kGroupedVerifyHeadDim +
+    out[(token_idx * kv_heads * kGroupedVerifyHeads + head_idx) *
+            kGroupedVerifyHeadDim +
         d] = __float2half_rn(accumulator);
   }
 }
@@ -3734,7 +3499,6 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
 
   const int tid = threadIdx.x;
   const int warp_id = tid / kWarpSize;
-  const int lane_id = tid % kWarpSize;
   const int part_tokens = min(PARTITION_SIZE, seq_len - start_token_idx);
   const int num_k_tiles = (part_tokens + kXQATCBlockN - 1) / kXQATCBlockN;
   const int* block_table_seq = block_table + batch_idx * max_num_blocks;
@@ -5073,6 +4837,811 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
   }
 }
 
+__device__ __forceinline__ uint4 e4m3_2cta_vec8_to_half8(uint64_t raw) {
+  const uint32_t low = static_cast<uint32_t>(raw);
+  const uint32_t high = static_cast<uint32_t>(raw >> 32);
+  const uint32_t low_check = (low ^ 0x7f7f7f7fu) & 0x7f7f7f7fu;
+  const uint32_t high_check = (high ^ 0x7f7f7f7fu) & 0x7f7f7f7fu;
+  if (__builtin_expect(
+          ((low_check - 0x01010101u) | (high_check - 0x01010101u)) &
+              0x80808080u,
+          0)) {
+    return fp8_e4m3fn_vector_to_half8(raw);
+  }
+  return make_uint4(
+      fp8_e4m3fn_expanded_pair_to_half2_bits(__byte_perm(low, 0, 0x4140)),
+      fp8_e4m3fn_expanded_pair_to_half2_bits(__byte_perm(low, 0, 0x4342)),
+      fp8_e4m3fn_expanded_pair_to_half2_bits(__byte_perm(high, 0, 0x4140)),
+      fp8_e4m3fn_expanded_pair_to_half2_bits(__byte_perm(high, 0, 0x4342)));
+}
+
+__device__ __forceinline__ void e4m3_2cta_mma_m8n8k4_rc(float c[8], uint32_t a0,
+                                                        uint32_t a1,
+                                                        uint32_t b0,
+                                                        uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+      "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+      "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]),
+        "+f"(c[6]), "+f"(c[7])
+      : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void e4m3_2cta_mma_m8n8k4_rr(float c[8], uint32_t a0,
+                                                        uint32_t a1,
+                                                        uint32_t b0,
+                                                        uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32 "
+      "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+      "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]),
+        "+f"(c[6]), "+f"(c[7])
+      : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ __half* e4m3_2cta_kv_row_ptr(__half* smem_kv,
+                                                        int tok) {
+  return smem_kv + (tok >> 2) * 1092 + (tok & 2) * 272 + (tok & 1) * 260;
+}
+
+template <bool PAIRED>
+__device__ __forceinline__ void e4m3_2cta_load_kv_32B(
+    uint64_t& lo0, uint64_t& hi0, uint64_t& lo1, uint64_t& hi1,
+    const uint8_t* row_base, int ld_sub, bool valid) {
+  if (!valid) {
+    lo0 = hi0 = lo1 = hi1 = 0ull;
+    return;
+  }
+  const int off0 = ld_sub << 4;
+  if constexpr (PAIRED) {
+    const uint4 r0 = __ldg(reinterpret_cast<const uint4*>(row_base + off0));
+    const uint4 r1 =
+        __ldg(reinterpret_cast<const uint4*>(row_base + 128 + off0));
+    lo0 = static_cast<uint64_t>(r0.x) | (static_cast<uint64_t>(r0.y) << 32);
+    hi0 = static_cast<uint64_t>(r0.z) | (static_cast<uint64_t>(r0.w) << 32);
+    lo1 = static_cast<uint64_t>(r1.x) | (static_cast<uint64_t>(r1.y) << 32);
+    hi1 = static_cast<uint64_t>(r1.z) | (static_cast<uint64_t>(r1.w) << 32);
+  } else {
+    const uint64_t* p0 = reinterpret_cast<const uint64_t*>(row_base + off0);
+    const uint64_t* p1 =
+        reinterpret_cast<const uint64_t*>(row_base + 128 + off0);
+    lo0 = __ldg(p0 + 0);
+    hi0 = __ldg(p0 + 1);
+    lo1 = __ldg(p1 + 0);
+    hi1 = __ldg(p1 + 1);
+  }
+}
+
+__device__ __forceinline__ void e4m3_2cta_store_kv_half8_u2(uint2* dst,
+                                                            uint64_t raw) {
+  const uint4 h8 = e4m3_2cta_vec8_to_half8(raw);
+  dst[0] = make_uint2(h8.x, h8.y);
+  dst[1] = make_uint2(h8.z, h8.w);
+}
+
+__device__ __forceinline__ void e4m3_2cta_unpack_kv_32B(
+    __half* smem_kv, int tok, int ld_sub, uint64_t lo0, uint64_t hi0,
+    uint64_t lo1, uint64_t hi1) {
+  uint2* dst = reinterpret_cast<uint2*>(e4m3_2cta_kv_row_ptr(smem_kv, tok)) +
+               (ld_sub << 2);
+  e4m3_2cta_store_kv_half8_u2(dst + 0, lo0);
+  e4m3_2cta_store_kv_half8_u2(dst + 2, hi0);
+  e4m3_2cta_store_kv_half8_u2(dst + 32, lo1);
+  e4m3_2cta_store_kv_half8_u2(dst + 34, hi1);
+}
+
+__device__ __forceinline__ int e4m3_2cta_active_splits(int total_kv,
+                                                       int max_splits,
+                                                       int min_tok_per_split,
+                                                       int query_len = 1) {
+  if (total_kv <= 256) return 1;
+  if (query_len >= 4 && total_kv <= 65536) {
+    max_splits = min(max_splits, 80);
+  }
+  const int min_tok = total_kv <= 4096
+                          ? max(64, min_tok_per_split)
+                          : (total_kv <= 16384 ? max(128, min_tok_per_split)
+                                               : max(256, min_tok_per_split));
+  return min(max_splits, max(1, (total_kv + min_tok - 1) / min_tok));
+}
+
+template <int ROW_TILES, bool COMPENSATE_P>
+struct E4M3Long2CtaSmem {
+  static constexpr int Q_STRIDE = ROW_TILES <= 4 ? 264 : 256;
+  static constexpr int P_STRIDE = ROW_TILES <= 4 ? 36 : 32;
+  static constexpr int K_WARPS =
+      ROW_TILES == 1 ? 8 : (ROW_TILES == 2 ? 4 : (ROW_TILES <= 4 ? 2 : 1));
+  alignas(16) __half q[ROW_TILES * 8 * Q_STRIDE];
+  alignas(16) __half kv[8704];
+  alignas(16) float scores[K_WARPS > 1 ? 8 * 256 : 4];
+  alignas(16) __half p_hi[ROW_TILES * 8 * P_STRIDE];
+  alignas(16) __half p_lo[COMPENSATE_P ? (ROW_TILES * 8 * P_STRIDE) : 8];
+  alignas(16) float row_max[ROW_TILES * 8];
+  alignas(16) float row_sum[ROW_TILES * 8];
+  alignas(16) float row_scale[ROW_TILES * 8];
+  alignas(16) int row_lens[8];
+  uint32_t p_nz_mask;
+};
+
+template <bool COMPENSATE_P, int P_STRIDE>
+__device__ __forceinline__ uint32_t e4m3_2cta_softmax_subrow(
+    int row, int c0, float v0, float v1, float v2, float v3, int valid_k,
+    int tile_start, int query_len, const int* row_lens, float* row_max,
+    float* row_sum, float* row_scale, __half* p_hi, __half* p_lo, int lane) {
+  const int tok_idx = row / 6;
+  const bool row_valid = tok_idx < query_len;
+  const int rlen = row_valid ? row_lens[tok_idx] : 0;
+
+  const bool vis0 =
+      row_valid && (c0 + 0 < valid_k) && (tile_start + c0 + 0 < rlen);
+  const bool vis1 =
+      row_valid && (c0 + 1 < valid_k) && (tile_start + c0 + 1 < rlen);
+  const bool vis2 =
+      row_valid && (c0 + 4 < valid_k) && (tile_start + c0 + 4 < rlen);
+  const bool vis3 =
+      row_valid && (c0 + 5 < valid_k) && (tile_start + c0 + 5 < rlen);
+
+  v0 = vis0 ? v0 : kXQANegInf;
+  v1 = vis1 ? v1 : kXQANegInf;
+  v2 = vis2 ? v2 : kXQANegInf;
+  v3 = vis3 ? v3 : kXQANegInf;
+
+  float m = fmaxf(fmaxf(v0, v1), fmaxf(v2, v3));
+  m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+  m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 4));
+  const float tile_max = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 8));
+
+  const float old_max = row_max[row];
+  const float new_max = fmaxf(old_max, tile_max);
+
+  const float p0 = vis0 ? __expf(fmaxf(v0 - new_max, -80.0f)) : 0.0f;
+  const float p1 = vis1 ? __expf(fmaxf(v1 - new_max, -80.0f)) : 0.0f;
+  const float p2 = vis2 ? __expf(fmaxf(v2 - new_max, -80.0f)) : 0.0f;
+  const float p3 = vis3 ? __expf(fmaxf(v3 - new_max, -80.0f)) : 0.0f;
+
+  const __half h0 = __float2half_rn(p0), h1 = __float2half_rn(p1);
+  const __half h2 = __float2half_rn(p2), h3 = __float2half_rn(p3);
+  const __half2 hi01 = __halves2half2(h0, h1);
+  const __half2 hi23 = __halves2half2(h2, h3);
+  *reinterpret_cast<__half2*>(p_hi + row * P_STRIDE + c0) = hi01;
+  *reinterpret_cast<__half2*>(p_hi + row * P_STRIDE + c0 + 4) = hi23;
+  uint32_t nz_flags = (((*reinterpret_cast<const uint32_t*>(&hi01) |
+                         *reinterpret_cast<const uint32_t*>(&hi23)) &
+                        0x7fff7fffu) != 0u)
+                          ? 1u
+                          : 0u;
+
+  float s;
+  if constexpr (COMPENSATE_P) {
+    s = (p0 + p1) + (p2 + p3);
+    const __half l0 = __float2half_rn((p0 - __half2float(h0)) * 2048.0f);
+    const __half l1 = __float2half_rn((p1 - __half2float(h1)) * 2048.0f);
+    const __half l2 = __float2half_rn((p2 - __half2float(h2)) * 2048.0f);
+    const __half l3 = __float2half_rn((p3 - __half2float(h3)) * 2048.0f);
+    const __half2 lo01 = __halves2half2(l0, l1);
+    const __half2 lo23 = __halves2half2(l2, l3);
+    *reinterpret_cast<__half2*>(p_lo + row * P_STRIDE + c0) = lo01;
+    *reinterpret_cast<__half2*>(p_lo + row * P_STRIDE + c0 + 4) = lo23;
+    if (((*reinterpret_cast<const uint32_t*>(&lo01) |
+          *reinterpret_cast<const uint32_t*>(&lo23)) &
+         0x7fff7fffu) != 0u) {
+      nz_flags |= 2u;
+    }
+  } else {
+    s = (__half2float(h0) + __half2float(h1)) +
+        (__half2float(h2) + __half2float(h3));
+  }
+  s += __shfl_xor_sync(0xffffffffu, s, 2);
+  s += __shfl_xor_sync(0xffffffffu, s, 4);
+  const float tile_sum = s + __shfl_xor_sync(0xffffffffu, s, 8);
+  const float exp_diff =
+      tile_sum > 0.0f ? __expf(fmaxf(old_max - new_max, -80.0f)) : 1.0f;
+
+  if ((lane & 14) == 0) {
+    if (tile_sum > 0.0f) {
+      row_sum[row] = fmaf(row_sum[row], exp_diff, tile_sum);
+      row_max[row] = new_max;
+    }
+    row_scale[row] = exp_diff;
+  }
+  return nz_flags;
+}
+
+template <int ROW_TILES, bool PAIRED, bool COMPENSATE_P>
+__global__ __launch_bounds__(256, 2) void grouped_e4m3_2cta_partial_kernel(
+    const __half* __restrict__ q, const uint8_t* __restrict__ k_cache,
+    const uint8_t* __restrict__ v_cache, const int* __restrict__ block_table,
+    const int* __restrict__ row_lengths, float* __restrict__ partial_out,
+    float* __restrict__ partial_lse, int query_len, int max_splits,
+    int min_tok_per_split, int max_num_blocks, int page_size, int64_t kb,
+    int64_t kt, int64_t kh, int64_t vb, int64_t vt, int64_t vh, float qk_scale,
+    float v_scale, int batch_size, int kv_heads) {
+  using Smem = E4M3Long2CtaSmem<ROW_TILES, COMPENSATE_P>;
+  constexpr int Q_STRIDE = Smem::Q_STRIDE;
+  constexpr int K_WARPS = Smem::K_WARPS;
+  constexpr int K_SLICE = 256 / K_WARPS;
+  constexpr int P_STRIDE = Smem::P_STRIDE;
+
+  const int kv_head = blockIdx.x;
+  const int split_id = blockIdx.y;
+  const int group_idx = blockIdx.z;
+  if (kv_head >= kv_heads || split_id >= max_splits ||
+      group_idx >= batch_size) {
+    return;
+  }
+
+  extern __shared__ char smem_raw[];
+  auto& smem = *reinterpret_cast<Smem*>(smem_raw);
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int qp = (lane >> 2) & 3;
+  const int a_row = ((lane & 16) ? 4 : 0) + (lane & 3);
+  const int b_tok = qp * 8 + a_row;
+  const int c0 = qp * 8 + (((lane >> 1) & 1) << 1);
+
+  const int* req_lens =
+      row_lengths + static_cast<int64_t>(group_idx) * query_len;
+  int total_kv = 0;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    if (i < query_len) total_kv = max(total_kv, __ldg(req_lens + i));
+  }
+  if (total_kv <= 0) return;
+
+  const int active_splits = e4m3_2cta_active_splits(
+      total_kv, max_splits, min_tok_per_split, query_len);
+  if (split_id >= active_splits) return;
+
+  if (tid < 8) {
+    smem.row_lens[tid] = tid < query_len ? req_lens[tid] : 0;
+  }
+  if (tid < ROW_TILES * 8) {
+    smem.row_max[tid] = kXQANegInf;
+    smem.row_sum[tid] = 0.0f;
+    smem.row_scale[tid] = 1.0f;
+  }
+  __syncthreads();
+
+  const int total_tiles = (total_kv + 31) >> 5;
+  const int base_tiles = total_tiles / active_splits;
+  const int extra_tiles = total_tiles - base_tiles * active_splits;
+  const int split_tile_start =
+      split_id * base_tiles + min(split_id, extra_tiles);
+  const int split_tiles = base_tiles + (split_id < extra_tiles ? 1 : 0);
+  const int split_start = split_tile_start << 5;
+  const int split_end = min(total_kv, split_start + (split_tiles << 5));
+
+  const int64_t panel = static_cast<int64_t>(group_idx) * kv_heads + kv_head;
+  partial_out += panel * max_splits * query_len * 6 * 256;
+  partial_lse += panel * max_splits * query_len * 6 * 2;
+
+  if (split_start >= split_end) {
+    if (tid < ROW_TILES * 8) {
+      const int tok_idx = tid / 6;
+      const int h_idx = tid % 6;
+      if (tok_idx < query_len) {
+        const int64_t lse_idx =
+            (static_cast<int64_t>(split_id) * query_len + tok_idx) * 6 + h_idx;
+        partial_lse[2 * lse_idx] = kXQANegInf;
+        partial_lse[2 * lse_idx + 1] = 0.0f;
+      }
+    }
+    return;
+  }
+
+  const uint4* q_vec = reinterpret_cast<const uint4*>(q);
+  for (int idx = tid; idx < ROW_TILES * 8 * 32; idx += 256) {
+    const int row = idx >> 5;
+    const int vcol = idx & 31;
+    const int tok_idx = row / 6;
+    const int h_idx = row % 6;
+    uint4 val = make_uint4(0, 0, 0, 0);
+    if (tok_idx < query_len) {
+      const int64_t q_row =
+          static_cast<int64_t>(group_idx) * query_len + tok_idx;
+      val = __ldg(q_vec + (((q_row * kv_heads + kv_head) * 6 + h_idx) << 5) +
+                  vcol);
+    }
+    *reinterpret_cast<uint4*>(smem.q + row * Q_STRIDE + (vcol << 3)) = val;
+  }
+
+  if (kv_head != 0) {
+    k_cache += kv_head * kh;
+    v_cache += kv_head * vh;
+  }
+  const int* page_ids =
+      block_table + static_cast<int64_t>(group_idx) * max_num_blocks;
+
+  float out_acc[ROW_TILES][8] = {};
+  const int ld_tok = tid >> 3;
+  const int ld_sub = tid & 7;
+  const int qk_rt = warp / K_WARPS;
+  const int qk_kw = warp % K_WARPS;
+
+  {
+    const int kv_idx = split_start + ld_tok;
+    const bool valid_kv = kv_idx < split_end;
+    int64_t k_off = 0;
+    if (valid_kv) {
+      const int page = __ldg(&page_ids[kv_idx / page_size]);
+      k_off = page * kb + (kv_idx % page_size) * kt;
+    }
+    uint64_t lo0, hi0, lo1, hi1;
+    e4m3_2cta_load_kv_32B<PAIRED>(lo0, hi0, lo1, hi1, k_cache + k_off, ld_sub,
+                                  valid_kv);
+    e4m3_2cta_unpack_kv_32B(smem.kv, ld_tok, ld_sub, lo0, hi0, lo1, hi1);
+  }
+  __syncthreads();
+
+  for (int tile_start = split_start; tile_start < split_end; tile_start += 32) {
+    const int valid_k = min(32, split_end - tile_start);
+    const int next_tile = tile_start + 32;
+
+    uint64_t v_lo0, v_hi0, v_lo1, v_hi1;
+    {
+      const int kv_idx = tile_start + ld_tok;
+      const bool valid_kv = ld_tok < valid_k;
+      int64_t v_off = 0;
+      if (valid_kv) {
+        const int page = __ldg(&page_ids[kv_idx / page_size]);
+        v_off = page * vb + (kv_idx % page_size) * vt;
+      }
+      e4m3_2cta_load_kv_32B<PAIRED>(v_lo0, v_hi0, v_lo1, v_hi1, v_cache + v_off,
+                                    ld_sub, valid_kv);
+    }
+
+    float s_acc[8] = {};
+    if (qk_rt < ROW_TILES) {
+      const __half* q_row_ptr =
+          smem.q + (qk_rt * 8 + a_row) * Q_STRIDE + qk_kw * K_SLICE;
+      const __half* k_row_ptr =
+          e4m3_2cta_kv_row_ptr(smem.kv, b_tok) + qk_kw * K_SLICE;
+#pragma unroll
+      for (int s = 0; s < (K_SLICE / 4); ++s) {
+        const uint2 a = *reinterpret_cast<const uint2*>(q_row_ptr + s * 4);
+        const uint2 b = *reinterpret_cast<const uint2*>(k_row_ptr + s * 4);
+        e4m3_2cta_mma_m8n8k4_rc(s_acc, a.x, a.y, b.x, b.y);
+      }
+      if constexpr (K_WARPS > 1) {
+        float* s_dst0 =
+            &smem.scores[((qk_rt * 2 + 0) * K_WARPS + qk_kw) * 128 + lane * 4];
+        float* s_dst1 =
+            &smem.scores[((qk_rt * 2 + 1) * K_WARPS + qk_kw) * 128 + lane * 4];
+        *reinterpret_cast<float4*>(s_dst0) =
+            make_float4(s_acc[0], s_acc[1], s_acc[4], s_acc[5]);
+        *reinterpret_cast<float4*>(s_dst1) =
+            make_float4(s_acc[2], s_acc[3], s_acc[6], s_acc[7]);
+      }
+    }
+    if (tid == 0) smem.p_nz_mask = 0u;
+    __syncthreads();
+
+    e4m3_2cta_unpack_kv_32B(smem.kv, ld_tok, ld_sub, v_lo0, v_hi0, v_lo1,
+                            v_hi1);
+
+    constexpr bool kEarlyPrefetchK = (ROW_TILES <= 4);
+    uint64_t nk_lo0 = 0, nk_hi0 = 0, nk_lo1 = 0, nk_hi1 = 0;
+    if constexpr (kEarlyPrefetchK) {
+      if (next_tile < split_end) {
+        const int kv_idx = next_tile + ld_tok;
+        const bool valid_kv = kv_idx < split_end;
+        int64_t k_off = 0;
+        if (valid_kv) {
+          const int page = __ldg(&page_ids[kv_idx / page_size]);
+          k_off = page * kb + (kv_idx % page_size) * kt;
+        }
+        e4m3_2cta_load_kv_32B<PAIRED>(nk_lo0, nk_hi0, nk_lo1, nk_hi1,
+                                      k_cache + k_off, ld_sub, valid_kv);
+      }
+    }
+
+    if constexpr (K_WARPS == 1) {
+      if (warp < ROW_TILES) {
+        const int r0 = warp * 8 + ((lane & 16) ? 4 : 0) + (lane & 1);
+        uint32_t nz = e4m3_2cta_softmax_subrow<COMPENSATE_P, P_STRIDE>(
+            r0, c0, s_acc[0] * qk_scale, s_acc[1] * qk_scale,
+            s_acc[4] * qk_scale, s_acc[5] * qk_scale, valid_k, tile_start,
+            query_len, smem.row_lens, smem.row_max, smem.row_sum,
+            smem.row_scale, smem.p_hi, smem.p_lo, lane);
+        nz |= e4m3_2cta_softmax_subrow<COMPENSATE_P, P_STRIDE>(
+            r0 + 2, c0, s_acc[2] * qk_scale, s_acc[3] * qk_scale,
+            s_acc[6] * qk_scale, s_acc[7] * qk_scale, valid_k, tile_start,
+            query_len, smem.row_lens, smem.row_max, smem.row_sum,
+            smem.row_scale, smem.p_hi, smem.p_lo, lane);
+        uint32_t wmask = 0u;
+        if (__any_sync(0xffffffffu, (nz & 1u) != 0u)) wmask |= (1u << warp);
+        if constexpr (COMPENSATE_P) {
+          if (__any_sync(0xffffffffu, (nz & 2u) != 0u))
+            wmask |= (1u << (warp + 8));
+        }
+        if (lane == 0 && wmask != 0u) atomicOr(&smem.p_nz_mask, wmask);
+      }
+    } else {
+      if (warp < ROW_TILES * 2) {
+        float4 sum4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+        for (int kw = 0; kw < K_WARPS; ++kw) {
+          const float4 p4 = *reinterpret_cast<const float4*>(
+              &smem.scores[(warp * K_WARPS + kw) * 128 + lane * 4]);
+          sum4.x += p4.x;
+          sum4.y += p4.y;
+          sum4.z += p4.z;
+          sum4.w += p4.w;
+        }
+        const int rt = warp >> 1;
+        const int sr = warp & 1;
+        const int r0 = rt * 8 + sr * 2 + ((lane & 16) ? 4 : 0) + (lane & 1);
+        const uint32_t nz = e4m3_2cta_softmax_subrow<COMPENSATE_P, P_STRIDE>(
+            r0, c0, sum4.x * qk_scale, sum4.y * qk_scale, sum4.z * qk_scale,
+            sum4.w * qk_scale, valid_k, tile_start, query_len, smem.row_lens,
+            smem.row_max, smem.row_sum, smem.row_scale, smem.p_hi, smem.p_lo,
+            lane);
+        uint32_t wmask = 0u;
+        if (__any_sync(0xffffffffu, (nz & 1u) != 0u)) wmask |= (1u << rt);
+        if constexpr (COMPENSATE_P) {
+          if (__any_sync(0xffffffffu, (nz & 2u) != 0u))
+            wmask |= (1u << (rt + 8));
+        }
+        if (lane == 0 && wmask != 0u) atomicOr(&smem.p_nz_mask, wmask);
+      }
+    }
+    __syncthreads();
+
+    const uint32_t p_nz_mask = smem.p_nz_mask;
+    if (p_nz_mask != 0u) {
+      const int v_bk = lane & 3;
+      const int v_bc = warp * 32 + qp * 8 + ((lane & 16) ? 4 : 0);
+      const __half* v_base_ptr =
+          smem.kv + (v_bk & 2) * 272 + (v_bk & 1) * 260 + v_bc;
+      uint2 v_hi_all[8];
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        v_hi_all[s] = *reinterpret_cast<const uint2*>(v_base_ptr + s * 1092);
+      }
+      const __half2 scale_lo = __float2half2_rn(1.0f / 2048.0f);
+#pragma unroll
+      for (int rt = 0; rt < ROW_TILES; ++rt) {
+        const bool has_phi = (p_nz_mask & (1u << rt)) != 0u;
+        const bool has_plo =
+            COMPENSATE_P && ((p_nz_mask & (1u << (rt + 8))) != 0u);
+        const int r0 = rt * 8 + ((lane & 16) ? 4 : 0) + (lane & 1);
+        const float s0 = smem.row_scale[r0];
+        const float s1 = smem.row_scale[r0 + 2];
+        if (!has_phi && !has_plo) {
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            out_acc[rt][i] *= (i & 2) ? s1 : s0;
+          }
+          continue;
+        }
+        float tile_acc[8] = {};
+        float tile_acc_lo[ROW_TILES > 1 ? 8 : 1] = {};
+        const int pr = rt * 8 + a_row;
+        if (has_phi) {
+#pragma unroll
+          for (int s = 0; s < 8; ++s) {
+            const uint2 phi = *reinterpret_cast<const uint2*>(
+                smem.p_hi + pr * P_STRIDE + s * 4);
+            e4m3_2cta_mma_m8n8k4_rr(tile_acc, phi.x, phi.y, v_hi_all[s].x,
+                                    v_hi_all[s].y);
+          }
+        }
+        if constexpr (COMPENSATE_P) {
+          if (has_plo) {
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+              const uint2 plo = *reinterpret_cast<const uint2*>(
+                  smem.p_lo + pr * P_STRIDE + s * 4);
+              if constexpr (ROW_TILES == 1) {
+                union {
+                  uint32_t u;
+                  __half2 h2;
+                } p0{v_hi_all[s].x}, p1{v_hi_all[s].y};
+                p0.h2 = __hmul2(p0.h2, scale_lo);
+                p1.h2 = __hmul2(p1.h2, scale_lo);
+                e4m3_2cta_mma_m8n8k4_rr(tile_acc, plo.x, plo.y, p0.u, p1.u);
+              } else {
+                e4m3_2cta_mma_m8n8k4_rr(tile_acc_lo, plo.x, plo.y,
+                                        v_hi_all[s].x, v_hi_all[s].y);
+              }
+            }
+          }
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          float t = tile_acc[i];
+          if constexpr (COMPENSATE_P && ROW_TILES > 1) {
+            if (has_plo) t = fmaf(tile_acc_lo[i], 1.0f / 2048.0f, t);
+          }
+          out_acc[rt][i] = fmaf(out_acc[rt][i], (i & 2) ? s1 : s0, t);
+        }
+      }
+    } else {
+#pragma unroll
+      for (int rt = 0; rt < ROW_TILES; ++rt) {
+        const int r0 = rt * 8 + ((lane & 16) ? 4 : 0) + (lane & 1);
+        const float s0 = smem.row_scale[r0];
+        const float s1 = smem.row_scale[r0 + 2];
+        if (s0 != 1.0f || s1 != 1.0f) {
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            out_acc[rt][i] *= (i & 2) ? s1 : s0;
+          }
+        }
+      }
+    }
+
+    if (next_tile < split_end) {
+      if constexpr (!kEarlyPrefetchK) {
+        const int kv_idx = next_tile + ld_tok;
+        const bool valid_kv = kv_idx < split_end;
+        int64_t k_off = 0;
+        if (valid_kv) {
+          const int page = __ldg(&page_ids[kv_idx / page_size]);
+          k_off = page * kb + (kv_idx % page_size) * kt;
+        }
+        e4m3_2cta_load_kv_32B<PAIRED>(nk_lo0, nk_hi0, nk_lo1, nk_hi1,
+                                      k_cache + k_off, ld_sub, valid_kv);
+      }
+      __syncthreads();
+      e4m3_2cta_unpack_kv_32B(smem.kv, ld_tok, ld_sub, nk_lo0, nk_hi0, nk_lo1,
+                              nk_hi1);
+      __syncthreads();
+    }
+  }
+
+  const int d_col = warp * 32 + c0;
+#pragma unroll
+  for (int rt = 0; rt < ROW_TILES; ++rt) {
+    const int r0 = rt * 8 + ((lane & 16) ? 4 : 0) + (lane & 1);
+#pragma unroll
+    for (int sr = 0; sr < 2; ++sr) {
+      const int row = r0 + sr * 2;
+      const int tok_idx = row / 6;
+      const int h_idx = row % 6;
+      if (tok_idx < query_len) {
+        const float sum = smem.row_sum[row];
+        const float sc = sum > 0.0f ? v_scale : 0.0f;
+        float* dst =
+            partial_out +
+            (((static_cast<int64_t>(split_id) * query_len + tok_idx) * 6 +
+              h_idx) *
+                 256 +
+             d_col);
+        const int b = sr * 2;
+        *reinterpret_cast<float2*>(dst + 0) =
+            make_float2(out_acc[rt][b] * sc, out_acc[rt][b + 1] * sc);
+        *reinterpret_cast<float2*>(dst + 4) =
+            make_float2(out_acc[rt][b + 4] * sc, out_acc[rt][b + 5] * sc);
+      }
+    }
+  }
+  if (tid < ROW_TILES * 8) {
+    const int tok_idx = tid / 6;
+    const int h_idx = tid % 6;
+    if (tok_idx < query_len) {
+      const float sum = smem.row_sum[tid];
+      const int64_t lse_idx =
+          (static_cast<int64_t>(split_id) * query_len + tok_idx) * 6 + h_idx;
+      partial_lse[2 * lse_idx] = sum > 0.0f ? smem.row_max[tid] : kXQANegInf;
+      partial_lse[2 * lse_idx + 1] = sum;
+    }
+  }
+}
+
+template <int MAX_SPLITS = 160>
+__global__ __launch_bounds__(256, 4) void grouped_e4m3_parallel_combine_kernel(
+    const float* __restrict__ partial_out,
+    const float* __restrict__ partial_lse, const int* __restrict__ row_lengths,
+    __half* __restrict__ out, int query_len, int max_splits,
+    int min_tok_per_split, int kv_heads) {
+  const int token_idx = blockIdx.x >> 2;
+  const int d_base = (blockIdx.x & 3) << 6;
+  const int head_idx = blockIdx.y % 6;
+  const int kv_head = blockIdx.y / 6;
+  const int req_idx = blockIdx.z;
+  if (token_idx >= query_len || kv_head >= kv_heads) return;
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int64_t out_row_base =
+      ((static_cast<int64_t>(req_idx) * query_len + token_idx) * kv_heads +
+       kv_head) *
+          6 * 256 +
+      head_idx * 256 + d_base;
+
+  const int* req_lens = row_lengths + static_cast<int64_t>(req_idx) * query_len;
+  if (req_lens[token_idx] <= 0) {
+    if (tid < 64) {
+      out[out_row_base + tid] = __float2half_rn(0.0f);
+    }
+    return;
+  }
+
+  int total_kv = 0;
+  for (int i = 0; i < query_len; ++i) total_kv = max(total_kv, req_lens[i]);
+  const int active_splits = e4m3_2cta_active_splits(
+      total_kv, max_splits, min_tok_per_split, query_len);
+
+  const int64_t panel = static_cast<int64_t>(req_idx) * kv_heads + kv_head;
+  partial_out += panel * max_splits * query_len * 6 * 256;
+  partial_lse += panel * max_splits * query_len * 6 * 2;
+
+  if (active_splits == 1) {
+    if (tid < 64) {
+      const int64_t idx = (static_cast<int64_t>(token_idx) * 6 + head_idx) * 2;
+      const float sum = partial_lse[idx + 1];
+      const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+      const float val =
+          partial_out[(token_idx * 6 + head_idx) * 256 + d_base + tid] *
+          inv_sum;
+      out[out_row_base + tid] = __float2half_rn(val);
+    }
+    return;
+  }
+
+  __shared__ float s_lse[MAX_SPLITS];
+  __shared__ float s_sum[MAX_SPLITS];
+  __shared__ float s_weight[MAX_SPLITS];
+  __shared__ float s_warp[8];
+  __shared__ float4 s_acc[16][16];
+
+  float local_max = kXQANegInf;
+  for (int s = tid; s < active_splits; s += 256) {
+    const int64_t idx =
+        ((static_cast<int64_t>(s) * query_len + token_idx) * 6 + head_idx) * 2;
+    const float2 v = *reinterpret_cast<const float2*>(partial_lse + idx);
+    s_lse[s] = v.x;
+    s_sum[s] = v.y;
+    local_max = fmaxf(local_max, v.x);
+  }
+#pragma unroll
+  for (int m = 16; m > 0; m >>= 1) {
+    local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, m));
+  }
+  if (lane == 0) s_warp[warp] = local_max;
+  __syncthreads();
+  float max_lse = s_warp[0];
+#pragma unroll
+  for (int w = 1; w < 8; ++w) max_lse = fmaxf(max_lse, s_warp[w]);
+
+  float local_denom = 0.0f;
+  for (int s = tid; s < active_splits; s += 256) {
+    const float m = s_lse[s];
+    float w = 0.0f;
+    if (m > -1.0e20f) {
+      w = __expf(fmaxf(m - max_lse, -80.0f));
+      local_denom = fmaf(w, s_sum[s], local_denom);
+    }
+    s_weight[s] = w;
+  }
+#pragma unroll
+  for (int m = 16; m > 0; m >>= 1) {
+    local_denom += __shfl_xor_sync(0xffffffffu, local_denom, m);
+  }
+  if (lane == 0) s_warp[warp] = local_denom;
+  __syncthreads();
+  float total_denom = s_warp[0];
+#pragma unroll
+  for (int w = 1; w < 8; ++w) total_denom += s_warp[w];
+  const float inv_sum = total_denom > 0.0f ? 1.0f / total_denom : 0.0f;
+
+  const int d_vec = tid & 15;
+  const int s_grp = tid >> 4;
+  float4 acc4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  const float* p_base =
+      partial_out + (token_idx * 6 + head_idx) * 256 + d_base + (d_vec << 2);
+  const int64_t split_stride = static_cast<int64_t>(query_len) * 6 * 256;
+  for (int s = s_grp; s < active_splits; s += 16) {
+    const float w = s_weight[s] * inv_sum;
+    if (w > 0.0f) {
+      const float4 p4 =
+          *reinterpret_cast<const float4*>(p_base + s * split_stride);
+      acc4.x = fmaf(w, p4.x, acc4.x);
+      acc4.y = fmaf(w, p4.y, acc4.y);
+      acc4.z = fmaf(w, p4.z, acc4.z);
+      acc4.w = fmaf(w, p4.w, acc4.w);
+    }
+  }
+  s_acc[s_grp][d_vec] = acc4;
+  __syncthreads();
+
+  if (tid < 64) {
+    const int dv = tid >> 2;
+    const int comp = tid & 3;
+    float acc = 0.0f;
+#pragma unroll
+    for (int g = 0; g < 16; ++g) {
+      acc += reinterpret_cast<const float*>(&s_acc[g][dv])[comp];
+    }
+    out[out_row_base + tid] = __float2half_rn(acc);
+  }
+}
+
+struct E4M3Split160Workspace {
+  int device = -1;
+  cudaStream_t stream = nullptr;
+  const void* caller_ptr = nullptr;
+  int64_t panels = 0;
+  at::Tensor partial;
+  at::Tensor lse;
+};
+
+void resolve_e4m3_split160_workspace(at::Tensor& partial, at::Tensor& lse,
+                                     int64_t panels, int query_len,
+                                     cudaStream_t stream, float*& partial_ptr,
+                                     float*& lse_ptr, int& max_splits) {
+  constexpr int kTargetSplits = 160;
+  if (kTargetSplits * query_len <= 80 * 8) {
+    partial_ptr = partial.data_ptr<float>();
+    lse_ptr = lse.data_ptr<float>();
+    max_splits = kTargetSplits;
+    return;
+  }
+  const int device = partial.get_device();
+  const void* caller_ptr = partial.data_ptr();
+  static std::mutex mutex;
+  static std::vector<E4M3Split160Workspace> bank;
+  std::lock_guard<std::mutex> lock(mutex);
+  for (const auto& entry : bank) {
+    if (entry.device == device && entry.caller_ptr == caller_ptr &&
+        entry.panels >= panels) {
+      partial_ptr = entry.partial.data_ptr<float>();
+      lse_ptr = entry.lse.data_ptr<float>();
+      max_splits = kTargetSplits;
+      return;
+    }
+  }
+  for (const auto& entry : bank) {
+    if (entry.device == device && entry.stream == stream &&
+        entry.panels >= panels) {
+      partial_ptr = entry.partial.data_ptr<float>();
+      lse_ptr = entry.lse.data_ptr<float>();
+      max_splits = kTargetSplits;
+      return;
+    }
+  }
+  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+  const cudaError_t capture_err =
+      cudaStreamIsCapturing(stream, &capture_status);
+  if (capture_err == cudaSuccess &&
+      capture_status == cudaStreamCaptureStatusNone) {
+    try {
+      const int64_t alloc_panels = std::max<int64_t>(panels, 32);
+      auto ws_partial = at::empty({alloc_panels, kTargetSplits, 8, 6, 256},
+                                  partial.options());
+      auto ws_lse =
+          at::empty({alloc_panels, kTargetSplits, 8, 6, 2}, lse.options());
+      partial_ptr = ws_partial.data_ptr<float>();
+      lse_ptr = ws_lse.data_ptr<float>();
+      max_splits = kTargetSplits;
+      bank.push_back({device, stream, caller_ptr, alloc_panels,
+                      std::move(ws_partial), std::move(ws_lse)});
+      return;
+    } catch (...) {
+      (void)cudaGetLastError();
+    }
+  } else {
+    (void)cudaGetLastError();
+  }
+  for (const auto& entry : bank) {
+    if (entry.device == device && entry.panels >= panels) {
+      partial_ptr = entry.partial.data_ptr<float>();
+      lse_ptr = entry.lse.data_ptr<float>();
+      max_splits = kTargetSplits;
+      return;
+    }
+  }
+  partial_ptr = partial.data_ptr<float>();
+  lse_ptr = lse.data_ptr<float>();
+  max_splits = (80 * 8) / query_len;
+}
+
 }  // namespace
 
 at::Tensor private_grouped_e4m3_fp32_paged(
@@ -5080,39 +5649,39 @@ at::Tensor private_grouped_e4m3_fp32_paged(
     at::Tensor& out, const at::Tensor& block_table,
     const at::Tensor& row_lengths, at::Tensor& partial, at::Tensor& lse,
     float scale, float k_scale, float v_scale) {
-  TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf &&
-                  q.is_contiguous() && q.dim() == 3 && q.size(0) >= 2 &&
-                  q.size(1) == 6 && q.size(2) == 256,
-              "E4M3 grouped FP32 requires contiguous CUDA FP16 Q [rows,6,256]");
   TORCH_CHECK(
-      k.dim() == 4 && k.size(2) == 1 && k.size(3) == 256 &&
-          k.size(1) > 0 && k.size(1) % 16 == 0 &&
-          k.scalar_type() == at::kByte && v.scalar_type() == at::kByte &&
-          v.sizes() == k.sizes(),
-      "E4M3 grouped FP32 requires supported uint8 paged KV [pages,page,1,256]");
+      q.is_cuda() && q.scalar_type() == at::kHalf && q.is_contiguous() &&
+          q.dim() == 3 && q.size(0) >= 1 && q.size(1) > 0 &&
+          q.size(1) % 6 == 0 && q.size(2) == 256,
+      "E4M3 grouped FP32 requires contiguous CUDA FP16 Q [rows,6*Hkv,256]");
+  TORCH_CHECK(k.dim() == 4 && k.size(2) * 6 == q.size(1) && k.size(3) == 256 &&
+                  k.size(1) > 0 && k.size(1) % 16 == 0 &&
+                  k.scalar_type() == at::kByte &&
+                  v.scalar_type() == at::kByte && v.sizes() == k.sizes(),
+              "E4M3 grouped FP32 requires supported uint8 paged KV "
+              "[pages,page,Hkv,256]");
   const int64_t batch_size = block_table.dim() == 2 ? block_table.size(0) : 0;
   TORCH_CHECK(
-      block_table.dim() == 2 && batch_size >= 1 && batch_size <= 16 &&
+      block_table.dim() == 2 && batch_size >= 1 &&
           block_table.is_contiguous() &&
           block_table.scalar_type() == at::kInt && block_table.size(1) > 0 &&
-          block_table.size(1) * k.size(1) <= 266240 &&
-          q.size(0) % batch_size == 0 &&
-          (batch_size == 1
-               ? (q.size(0) >= 2 && q.size(0) <= 8)
-               : q.size(0) == batch_size * 8) &&
+          block_table.size(1) <= (INT_MAX - 4096) / k.size(1) &&
+          q.size(0) % batch_size == 0 && q.size(0) / batch_size >= 1 &&
+          q.size(0) / batch_size <= 8 &&
           row_lengths.sizes() == at::IntArrayRef({q.size(0)}) &&
           row_lengths.scalar_type() == at::kInt && row_lengths.is_contiguous(),
-      "E4M3 grouped FP32 requires q2..8/B1 or request-major q8/B2..16 "
+      "E4M3 grouped FP32 requires request-major q1..8 "
       "and per-query int32 lengths");
   TORCH_CHECK(out.sizes() == q.sizes() && out.is_contiguous() &&
                   out.scalar_type() == at::kHalf,
               "E4M3 grouped FP32 output must be contiguous FP16 and Q-shaped");
+  const int64_t panels = batch_size * k.size(2);
   const bool workspace_shapes =
-      batch_size == 1
+      panels == 1
           ? (partial.sizes() == at::IntArrayRef({80, 8, 6, 256}) &&
              lse.sizes() == at::IntArrayRef({80, 8, 6, 2}))
-          : (partial.sizes() == at::IntArrayRef({batch_size, 80, 8, 6, 256}) &&
-             lse.sizes() == at::IntArrayRef({batch_size, 80, 8, 6, 2}));
+          : (partial.sizes() == at::IntArrayRef({panels, 80, 8, 6, 256}) &&
+             lse.sizes() == at::IntArrayRef({panels, 80, 8, 6, 2}));
   TORCH_CHECK(workspace_shapes && partial.is_contiguous() &&
                   partial.scalar_type() == at::kFloat && lse.is_contiguous() &&
                   lse.scalar_type() == at::kFloat,
@@ -5144,6 +5713,11 @@ at::Tensor private_grouped_e4m3_fp32_paged(
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "E4M3 grouped FP32 supports SM70 only");
+  TORCH_CHECK(batch_size <= properties->maxGridSize[2],
+              "request count exceeds the device grid capacity");
+  TORCH_CHECK(k.size(2) <= properties->maxGridSize[0] &&
+                  q.size(1) <= properties->maxGridSize[1],
+              "head count exceeds the device grid capacity");
   // A contiguous FP16 view can start at a half-element storage offset.
   // The shared-Q feed uses uint4 loads; only those exceptional views need
   // an aligned, stream-local copy. Ordinary model Q keeps the original path.
@@ -5155,59 +5729,76 @@ at::Tensor private_grouped_e4m3_fp32_paged(
     for (int dim = 0; dim < 3; ++dim)
       paired = paired && tensor->stride(dim) % 16 == 0;
   }
-  auto kernel = paired
-      ? flash_attention_grouped_verify_e5m2_partial_kernel<
-          8, false, 0, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
-          false, float, true, true, true>
-      : flash_attention_grouped_verify_e5m2_partial_kernel<
-          8, false, 0, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
-          false, float, true, true, false>;
-  if (k.size(1) == 1648) kernel = paired ? flash_attention_grouped_verify_e5m2_partial_kernel<8, false, 1648, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float, true, true, true> : flash_attention_grouped_verify_e5m2_partial_kernel<8, false, 1648, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float, true, true, false>;
-  if (k.size(1) == 3296) kernel = paired ? flash_attention_grouped_verify_e5m2_partial_kernel<8, false, 3296, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float, true, true, true> : flash_attention_grouped_verify_e5m2_partial_kernel<8, false, 3296, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float, true, true, false>;
   const int query_len = static_cast<int>(q.size(0) / batch_size);
-  if (query_len == 8) {
-  kernel = paired
-      ? flash_attention_grouped_verify_e4m3_full_q8_kernel<
-          8, false, 0, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
-          false, float, true, true, true>
-      : flash_attention_grouped_verify_e4m3_full_q8_kernel<
-          8, false, 0, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
-          false, float, true, true, false>;
-  if (k.size(1) == 1648) kernel = paired ? flash_attention_grouped_verify_e4m3_full_q8_kernel<8, false, 1648, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float, true, true, true> : flash_attention_grouped_verify_e4m3_full_q8_kernel<8, false, 1648, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float, true, true, false>;
-  if (k.size(1) == 3296) kernel = paired ? flash_attention_grouped_verify_e4m3_full_q8_kernel<8, false, 3296, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float, true, true, true> : flash_attention_grouped_verify_e4m3_full_q8_kernel<8, false, 3296, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3, false, float, true, true, false>;
+  const int row_tiles = (query_len * kGroupedVerifyHeads + 7) / 8;
+  constexpr int kMinTokensPerSplit = 32;
+  float* partial_ptr = nullptr;
+  float* lse_ptr = nullptr;
+  int max_splits = 80;
+  resolve_e4m3_split160_workspace(partial, lse, panels, query_len, stream,
+                                  partial_ptr, lse_ptr, max_splits);
+  const int64_t max_possible_kv = block_table.size(1) * k.size(1);
+  const int panel_split_cap =
+      panels <= 2 ? max_splits : std::max(20, 320 / static_cast<int>(panels));
+  const int l2_split_cap = std::max(
+      10, static_cast<int>(800 / std::max<int64_t>(1, panels * query_len)));
+  const int split_cap =
+      panels <= 2
+          ? max_splits
+          : std::min(max_splits, std::min(panel_split_cap, l2_split_cap));
+  const int launch_splits = max_possible_kv <= 256
+                                ? 1
+                                : static_cast<int>(std::min<int64_t>(
+                                      split_cap, (max_possible_kv + 63) / 64));
+
+  auto launch = [&](auto rt_tag, auto paired_tag) {
+    constexpr int RT = decltype(rt_tag)::value;
+    constexpr bool P = decltype(paired_tag)::value;
+    constexpr int kSmemBytes = sizeof(E4M3Long2CtaSmem<RT, true>);
+    TORCH_CHECK(properties->sharedMemPerBlockOptin >= kSmemBytes,
+                "E4M3 attention exceeds device opt-in shared memory");
+    auto kernel = grouped_e4m3_2cta_partial_kernel<RT, P, true>;
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    kernel<<<dim3(k.size(2), launch_splits, static_cast<unsigned>(batch_size)),
+             256, kSmemBytes, stream>>>(
+        reinterpret_cast<const __half*>(aligned_q.data_ptr()),
+        k.data_ptr<uint8_t>(), v.data_ptr<uint8_t>(),
+        block_table.data_ptr<int>(), row_lengths.data_ptr<int>(), partial_ptr,
+        lse_ptr, query_len, launch_splits, kMinTokensPerSplit,
+        block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale,
+        static_cast<int>(batch_size), static_cast<int>(k.size(2)));
+  };
+  auto dispatch_rt = [&](auto paired_tag) {
+    if (row_tiles == 1) {
+      launch(std::integral_constant<int, 1>{}, paired_tag);
+    } else if (row_tiles == 2) {
+      launch(std::integral_constant<int, 2>{}, paired_tag);
+    } else if (row_tiles == 3) {
+      launch(std::integral_constant<int, 3>{}, paired_tag);
+    } else if (row_tiles == 4) {
+      launch(std::integral_constant<int, 4>{}, paired_tag);
+    } else {
+      launch(std::integral_constant<int, 6>{}, paired_tag);
+    }
+  };
+  if (paired) {
+    dispatch_rt(std::true_type{});
+  } else {
+    dispatch_rt(std::false_type{});
   }
-  constexpr int kCompensatedSmemBytes =
-      sizeof(GroupedVerifySmem) +
-      kGroupedVerifyRows * kGroupedVerifyProbStride * sizeof(__half) +
-      kGroupedVerifyBlockN * kGroupedVerifyKVStride * sizeof(__half);
-  static_assert(kCompensatedSmemBytes <= 96 * 1024,
-                "compensated P and prefetched V must fit the SM70 budget");
-  TORCH_CHECK(properties->sharedMemPerBlockOptin >= kCompensatedSmemBytes,
-              "V prefetch exceeds device opt-in shared memory");
-  C10_CUDA_CHECK(
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           kCompensatedSmemBytes));
-  C10_CUDA_CHECK(cudaFuncSetAttribute(
-      kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-  kernel<<<dim3(1, 80, static_cast<unsigned>(batch_size)),
-           kGroupedVerifyThreads, kCompensatedSmemBytes, stream>>>(
-      reinterpret_cast<const __half*>(aligned_q.data_ptr()), k.data_ptr(),
-      v.data_ptr(), block_table.data_ptr<int>(), row_lengths.data_ptr<int>(),
-      partial.data_ptr<float>(), lse.data_ptr<float>(), query_len,
-      block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
-      v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale, nullptr,
-      static_cast<int>(batch_size), row_lengths.data_ptr<int>());
-  flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
-      <<<dim3(query_len, 6, static_cast<unsigned>(batch_size)),
-         kGroupedVerifyHeadDim, 0, stream>>>(
-          partial.data_ptr<float>(), lse.data_ptr<float>(),
-          row_lengths.data_ptr<int>(),
-          reinterpret_cast<__half*>(out.data_ptr()), query_len,
-          row_lengths.data_ptr<int>());
+  grouped_e4m3_parallel_combine_kernel<160>
+      <<<dim3(query_len * 4, q.size(1), static_cast<unsigned>(batch_size)), 256,
+         0, stream>>>(partial_ptr, lse_ptr, row_lengths.data_ptr<int>(),
+                      reinterpret_cast<__half*>(out.data_ptr()), query_len,
+                      launch_splits, kMinTokensPerSplit,
+                      static_cast<int>(k.size(2)));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
-
 
 at::Tensor private_grouped_fp16_fp32_paged(const at::Tensor& q,
                                            const at::Tensor& k,
@@ -5230,7 +5821,7 @@ at::Tensor private_grouped_fp16_fp32_paged(const at::Tensor& q,
       block_table.dim() == 2 && batch_size >= 1 && batch_size <= 16 &&
           block_table.is_contiguous() &&
           block_table.scalar_type() == at::kInt && block_table.size(1) > 0 &&
-          block_table.size(1) * k.size(1) <= 266240 &&
+          block_table.size(1) <= (INT_MAX - 4096) / k.size(1) &&
           q.size(0) % batch_size == 0 &&
           (batch_size == 1 ? (q.size(0) >= 2 && q.size(0) <= 8)
                            : q.size(0) == batch_size * 8) &&
@@ -5279,23 +5870,24 @@ at::Tensor private_grouped_fp16_fp32_paged(const at::Tensor& q,
   TORCH_CHECK(properties->sharedMemPerBlockOptin >= sizeof(GroupedVerifySmem),
               "FP16 grouped workspace exceeds opt-in shared memory");
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
-  auto kernel = short_splits
-      ? flash_attention_grouped_verify_fp16_fp32_partial_kernel<true>
-      : flash_attention_grouped_verify_fp16_fp32_partial_kernel<false>;
-  C10_CUDA_CHECK(cudaFuncSetAttribute(
-      kernel,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(GroupedVerifySmem)));
+  auto kernel =
+      short_splits
+          ? flash_attention_grouped_verify_fp16_fp32_partial_kernel<true>
+          : flash_attention_grouped_verify_fp16_fp32_partial_kernel<false>;
+  C10_CUDA_CHECK(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           sizeof(GroupedVerifySmem)));
   const int query_len = static_cast<int>(q.size(0) / batch_size);
-  kernel<<<
-      dim3(80, static_cast<unsigned>(batch_size)), kGroupedVerifyThreads,
-      sizeof(GroupedVerifySmem), stream>>>(
+  kernel<<<dim3(80, static_cast<unsigned>(batch_size)), kGroupedVerifyThreads,
+           sizeof(GroupedVerifySmem), stream>>>(
       reinterpret_cast<const __half*>(q.data_ptr()), k.data_ptr(), v.data_ptr(),
       block_table.data_ptr<int>(), row_lengths.data_ptr<int>(),
       partial.data_ptr<float>(), lse.data_ptr<float>(), query_len,
       block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
       v.stride(0), v.stride(1), v.stride(2), scale);
   if (short_splits) {
-    flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true, true>
+    flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true,
+                                                       true>
         <<<dim3(query_len, 6, static_cast<unsigned>(batch_size)),
            kGroupedVerifyHeadDim, 0, stream>>>(
             partial.data_ptr<float>(), lse.data_ptr<float>(),
@@ -5321,11 +5913,13 @@ at::Tensor private_grouped_fp16_fp32_paged(const at::Tensor& q,
 // its validated float signature behind a thin adapter rather than having its
 // numeric body touched.
 namespace {
-at::Tensor sm70_grouped_long_entry(
-    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
-    at::Tensor& out, const at::Tensor& block_table,
-    const at::Tensor& row_lengths, at::Tensor& partial, at::Tensor& lse,
-    double scale, double k_scale, double v_scale) {
+at::Tensor sm70_grouped_long_entry(const at::Tensor& q, const at::Tensor& k,
+                                   const at::Tensor& v, at::Tensor& out,
+                                   const at::Tensor& block_table,
+                                   const at::Tensor& row_lengths,
+                                   at::Tensor& partial, at::Tensor& lse,
+                                   double scale, double k_scale,
+                                   double v_scale) {
   return private_grouped_e4m3_fp32_paged(
       q, k, v, out, block_table, row_lengths, partial, lse,
       static_cast<float>(scale), static_cast<float>(k_scale),
@@ -5337,13 +5931,17 @@ at::Tensor sm70_grouped_fp16_entry(const at::Tensor& q, const at::Tensor& k,
                                    const at::Tensor& row_lengths,
                                    at::Tensor& partial, at::Tensor& lse,
                                    double scale, bool short_splits) {
-  return private_grouped_fp16_fp32_paged(q, k, v, out, block_table, row_lengths,
-                                         partial, lse,
-                                         static_cast<float>(scale), short_splits);
+  return private_grouped_fp16_fp32_paged(
+      q, k, v, out, block_table, row_lengths, partial, lse,
+      static_cast<float>(scale), short_splits);
 }
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
+  ops.def("sm70_grouped_fp16_context_revision() -> int",
+          []() -> int64_t { return 1; });
+  ops.def("sm70_grouped_long_context_revision() -> int",
+          []() -> int64_t { return 1; });
   ops.def(
       "sm70_grouped_fp16_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, "
       "Tensor block_table, Tensor row_lengths, Tensor(b!) partial, "
@@ -5356,12 +5954,18 @@ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
           []() -> int64_t { return 1; });
   // Older builds only admit B1. Python must query the loaded binary before
   // capturing a request-major batch with its larger workspace.
-  ops.def("sm70_grouped_long_max_batch_size() -> int",
-          []() -> int64_t { return 16; });
+  ops.def("sm70_grouped_long_max_batch_size() -> int", []() -> int64_t {
+    return at::cuda::getCurrentDeviceProperties()->maxGridSize[2];
+  });
+  ops.def("sm70_grouped_long_query_rows_revision() -> int",
+          []() -> int64_t { return 2; });
+  ops.def("sm70_grouped_long_kv_heads_revision() -> int",
+          []() -> int64_t { return 1; });
   ops.def(
       "sm70_grouped_long_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, "
       "Tensor block_table, Tensor row_lengths, Tensor(a!) partial, "
-      "Tensor(a!) lse, float scale, float k_scale, float v_scale) -> Tensor(a!)");
+      "Tensor(a!) lse, float scale, float k_scale, float v_scale) -> "
+      "Tensor(a!)");
 }
 TORCH_LIBRARY_IMPL(_vllm_fa2_C, CUDA, ops) {
   ops.impl("sm70_grouped_fp16_fwd", &sm70_grouped_fp16_entry);

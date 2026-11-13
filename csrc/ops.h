@@ -204,6 +204,12 @@ void sm70_dflash2_fp16_m8_out(torch::Tensor output, torch::Tensor input,
 void sm70_dflash2_fp16_dispatch_out(torch::Tensor output, torch::Tensor input,
                                     torch::Tensor packed, torch::Tensor weight,
                                     int64_t tile, int64_t warps);
+void sm70_fp16_candidate_scores_out(torch::Tensor scores, torch::Tensor input,
+                                    torch::Tensor weight, torch::Tensor ids,
+                                    bool tiled_multirow = false);
+void sm70_fp16_masked_head_out(torch::Tensor scores, torch::Tensor input,
+                               torch::Tensor weight, torch::Tensor certified,
+                               bool tiled_multirow = false);
 
 std::vector<torch::Tensor> fp8_qpn8_prepare_sm70(torch::Tensor qweight,
                                                  torch::Tensor scales);
@@ -236,6 +242,12 @@ void fp8_qpn8_gemm_ba_split_sm70_out(torch::Tensor qkv_out, torch::Tensor z_out,
                                      torch::Tensor ba_weight);
 
 void fp8_qpn8_dispatch_ba_split_sm70_out(
+    torch::Tensor qkv_out, torch::Tensor z_out, torch::Tensor b_out,
+    torch::Tensor a_out, torch::Tensor qkvz_staging, torch::Tensor ba_staging,
+    int64_t dense_weight_ptr, torch::Tensor input, torch::Tensor codes,
+    torch::Tensor group_scales, torch::Tensor ba_weight);
+
+void fp8_qpn8_dispatch_ba_masked_sm70_out(
     torch::Tensor qkv_out, torch::Tensor z_out, torch::Tensor b_out,
     torch::Tensor a_out, torch::Tensor qkvz_staging, torch::Tensor ba_staging,
     int64_t dense_weight_ptr, torch::Tensor input, torch::Tensor codes,
@@ -287,6 +299,7 @@ void fp8_gemm_sm70_prescaled_m1_out(torch::Tensor out, torch::Tensor _in_feats,
                                     int64_t group_size, int64_t k_ld,
                                     int64_t q_ld);
 
+int64_t nvfp4_qpn2_max_rows_sm70();
 std::vector<torch::Tensor> nvfp4_qpn2_prepare_sm70(torch::Tensor weight_packed,
                                                    torch::Tensor weight_scale);
 
@@ -847,6 +860,12 @@ fptr_t init_custom_ar_configured(const std::vector<int64_t>& fake_ipc_ptrs,
                                  const std::vector<std::string>& policy);
 void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
                 fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
+void sm70_all_reduce_gemma_rms_norm(
+    fptr_t fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& weight, torch::Tensor& normalized_out,
+    torch::Tensor& residual_out, fptr_t reg_buffer, int64_t reg_buffer_sz_bytes,
+    double epsilon);
+
 void sm70_tp2_all_reduce_gemma_rms_norm(
     fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
     torch::Tensor& weight, torch::Tensor& normalized_out,

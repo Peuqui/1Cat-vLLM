@@ -100,6 +100,13 @@ def test_cpu_inputs_disabled_without_the_kernel_config_field():
     assert _model_state(None).ple_cpu_inputs(_batch()) is None  # type: ignore[arg-type]
 
 
+def test_zero_length_ngram_context_matches_the_absent_transport_buffer():
+    state = _model_state(TOKENS)
+    state.ngram_context_len = 0
+    inputs = state.ple_cpu_inputs(_batch())
+    assert inputs is not None and inputs.ngram_context is None
+
+
 def test_launch_queues_host_inputs_without_a_d2h_event():
     connector = PleOffloadConnector.__new__(PleOffloadConnector)
     connector.tp_rank = 0
@@ -127,6 +134,7 @@ def test_early_request_waits_for_the_previous_request(monkeypatch):
     connector = PleOffloadConnector.__new__(PleOffloadConnector)
     connector._uses_cuda_inputs = True
     connector._request_done = np.zeros(1, dtype=np.int64)
+    connector._request_shutdown = threading.Event()
     connector._input_ids_buf = torch.zeros(8, dtype=torch.int32)
     connector._query_start_loc_buf = torch.zeros(3, dtype=torch.int32)
     connector._ngram_context_buf = torch.zeros(2, 2, dtype=torch.int32)
@@ -179,7 +187,7 @@ def test_release_skips_results_the_forward_already_released(monkeypatch):
     monkeypatch.setattr(
         connector_module,
         "finish_early_result_release",
-        lambda: {released.data_ptr()},
+        lambda state: {released.data_ptr()},
     )
 
     connector.release_outputs()
@@ -240,11 +248,87 @@ def test_wait_op_releases_mapped_result_only_when_armed(armed):
     cpu_output = torch.arange(8, dtype=torch.float16).reshape(4, 2).pin_memory()
     hidden = torch.zeros(1, device="cuda")
 
-    ple_offload_layer.begin_early_result_release(armed)
-    torch.ops.vllm.ple_offload_wait(flag, gpu_output, hidden, cpu_output, 3)
-    torch.accelerator.synchronize()
-    released = ple_offload_layer.finish_early_result_release()
+    state = ple_offload_layer.begin_early_result_release(armed, [flag.data_ptr()])
+    try:
+        torch.ops.vllm.ple_offload_wait(flag, gpu_output, hidden, cpu_output, 3)
+        torch.accelerator.synchronize()
+    finally:
+        released = ple_offload_layer.finish_early_result_release(state)
 
     torch.testing.assert_close(gpu_output[:3].cpu(), cpu_output[:3])
     assert flag.item() == (0 if armed else 1)
     assert released == ({flag.data_ptr()} if armed else set())
+
+
+def test_early_release_is_owned_by_each_connectors_semaphores():
+    first = ple_offload_layer.begin_early_result_release(True, [123])
+    second = ple_offload_layer.begin_early_result_release(True, [456])
+    try:
+        assert ple_offload_layer._early_result_releases[123] is first
+        assert ple_offload_layer._early_result_releases[456] is second
+        ple_offload_layer.finish_early_result_release(second)
+        assert 456 not in ple_offload_layer._early_result_releases
+        assert ple_offload_layer._early_result_releases[123] is first
+        with pytest.raises(RuntimeError, match="already armed"):
+            ple_offload_layer.begin_early_result_release(True, [123])
+    finally:
+        ple_offload_layer.finish_early_result_release(first)
+        ple_offload_layer.finish_early_result_release(second)
+
+
+def test_finished_request_releases_prompt_tokens_and_slot_can_be_reused():
+    state = _model_state(dict(TOKENS))
+    state.remove_request(3)
+    assert 3 not in state._ple_early_tokens
+    assert 1 in state._ple_early_tokens
+    assert state.ple_cpu_inputs(_batch()) is None
+    state.remove_request(3)
+    state._ple_early_tokens[3] = TOKENS[3] + 1000
+    assert state.ple_cpu_inputs(_batch()).input_ids[0] == 1110
+
+
+def test_shutdown_cancels_wait_without_overwriting_or_publishing(monkeypatch):
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector._request_done = np.zeros(1, dtype=np.int64)
+    connector._request_shutdown = threading.Event()
+    connector._request_shutdown.set()
+    monkeypatch.setattr(
+        connector_module.torch.cuda.nvtx, "range", lambda *_: nullcontext()
+    )
+    request = PleOffloadRequest(0, 1, 1, seq=2)
+    inputs = PleCpuInputs(np.ones(1, dtype=np.int32), np.array([0, 1]), None)
+    sent: list[bytes] = []
+    connector._process_request(
+        connector_module._PendingPleOffloadRequest(request, None, inputs),
+        SimpleNamespace(send=sent.append),
+    )
+    assert sent == []
+
+
+def test_early_prefill_uses_one_sequenced_transport_instead_of_the_native_lane():
+    connector = SimpleNamespace(tp_rank=0, early_prefill=True)
+    assert (
+        PleOffloadConnector._create_fast_lane(
+            connector, SimpleNamespace(scheduler_config=None)
+        )
+        is None
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_graph_capture_and_replay_do_not_early_release():
+    flag = torch.ones(1, dtype=torch.int32, device="cuda")
+    gpu_output = torch.zeros(4, 2, dtype=torch.float16, device="cuda")
+    cpu_output = torch.arange(8, dtype=torch.float16).reshape(4, 2).pin_memory()
+    hidden = torch.zeros(1, device="cuda")
+    state = ple_offload_layer.begin_early_result_release(True, [flag.data_ptr()])
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            torch.ops.vllm.ple_offload_wait(flag, gpu_output, hidden, cpu_output, 3)
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert flag.item() == 1
+        torch.testing.assert_close(gpu_output[:3].cpu(), cpu_output[:3])
+    finally:
+        assert ple_offload_layer.finish_early_result_release(state) == set()

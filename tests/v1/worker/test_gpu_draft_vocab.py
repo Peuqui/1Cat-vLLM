@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -85,6 +87,47 @@ def test_load_draft_token_ids(tmp_path, fmt):
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("ids", [[1.5], [True], ["3"], [[1, 2]]])
+def test_token_map_rejects_noninteger_ids(tmp_path, ids):
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps(ids))
+    with pytest.raises(ValueError, match="integer ids"):
+        load_draft_token_ids(str(path), [])
+
+
+@pytest.mark.cpu_test
+def test_token_map_is_checked_against_initialization_snapshot(tmp_path):
+    path = tmp_path / "map.json"
+    path.write_text("[1, 3]")
+    identity = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert load_draft_token_ids(str(path), [], identity).tolist() == [1, 3]
+    path.write_text("[1, 4]")
+    with pytest.raises(ValueError, match="changed after configuration"):
+        load_draft_token_ids(str(path), [], identity)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("explicit", [None, False, True])
+def test_token_map_selects_v2_and_rejects_explicit_v1(monkeypatch, explicit):
+    from vllm import envs
+    from vllm.config import VllmConfig
+
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", explicit)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["Qwen3_5ForCausalLM"]),
+        speculative_config=SimpleNamespace(
+            draft_token_map="map.json",
+            use_dflash=lambda: False,
+        ),
+    )
+    if explicit is False:
+        with pytest.raises(ValueError, match="requires Model Runner V2"):
+            VllmConfig.use_v2_model_runner.fget(config)
+    else:
+        assert VllmConfig.use_v2_model_runner.fget(config)
+
+
+@pytest.mark.cpu_test
 @pytest.mark.parametrize("bad", [-1, VOCAB])
 def test_draft_vocab_rejects_out_of_range_ids(lm_head, bad):
     with pytest.raises(ValueError, match="outside"):
@@ -98,6 +141,26 @@ def test_draft_vocab_rejects_quantized_head(lm_head):
     lm_head.quant_method = object()
     with pytest.raises(ValueError, match="unquantized"):
         DraftVocab(torch.tensor(DRAFT_IDS), lm_head)
+
+
+@pytest.mark.cpu_test
+def test_draft_vocab_rejects_adapted_head(lm_head):
+    wrapper = nn.Module()
+    wrapper.base_layer = lm_head
+    with pytest.raises(ValueError, match="adapted lm_head"):
+        DraftVocab(torch.tensor(DRAFT_IDS), wrapper)
+
+
+@pytest.mark.cpu_test
+def test_draft_vocab_normalizes_ids_without_modifying_target(lm_head, logits_processor):
+    hidden = _hidden()
+    before = logits_processor(lm_head, hidden).clone()
+    dv = DraftVocab(torch.tensor([7, 0, 7, 3]), lm_head)
+    assert dv.target_ids.tolist() == [0, 3, 7]
+    dv.install(_Drafter(lm_head, nn.Identity()), lm_head)
+    torch.testing.assert_close(
+        logits_processor(lm_head, hidden), before, rtol=0, atol=0
+    )
 
 
 @pytest.mark.cpu_test
