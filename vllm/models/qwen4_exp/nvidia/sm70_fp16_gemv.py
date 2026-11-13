@@ -26,7 +26,6 @@ from vllm.config.speculative_sampling import mtp_batch_enabled
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.platforms import current_platform
-from vllm.platforms.compiled_capability import is_sm70_device
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -162,7 +161,7 @@ def _can_fuse_gdn_projection_split(qkvz: torch.Tensor, ba: torch.Tensor) -> bool
         and qkvz.is_cuda
         and ba.is_cuda
         and qkvz.device == ba.device
-        and is_sm70_device(qkvz.device.index)
+        and current_platform.is_device_capability(70, device_id=qkvz.device.index)
     )
 
 

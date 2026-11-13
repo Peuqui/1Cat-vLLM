@@ -8,7 +8,7 @@ from vllm import ir
 from vllm.config.execution_policy import graph_policy
 from vllm.config.sm70_dflash2 import sm70_dflash2_enabled
 from vllm.logger import init_logger
-from vllm.platforms.compiled_capability import is_sm70_device
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -137,7 +137,7 @@ def _use_sm70_dflash2_fixed_gemma_rms(
     return bool(
         sm70_dflash2_enabled("fixed_gemma_rms", policy)
         and (graph if graph is not None else graph_policy()).compile_graph
-        and is_sm70_device(None)
+        and current_platform.is_device_capability(70)
         and x.is_cuda
         and x.dtype == torch.float16
         and x.ndim == 2
@@ -254,9 +254,7 @@ def _use_sm70_dflash2_gemma_fused_add_rms(
     return bool(
         sm70_dflash2_enabled("fused_gemma_rms", policy)
         and (graph if graph is not None else graph_policy()).compile_graph
-        # Keep the cached platform query out of the AOT fullgraph:
-        # is_sm70_device is constant-foldable by Dynamo.
-        and is_sm70_device(None)
+        and current_platform.is_device_capability(70)
         and residual is not None
         and x.is_cuda
         and x.dtype == torch.float16
@@ -398,7 +396,7 @@ def use_long_prefill_fused(
         policy.gemma_long_prefill_fused
         and residual is not None
         and x.is_cuda
-        and is_sm70_device(None)
+        and current_platform.is_device_capability(70)
         and x.dtype == torch.float16
         and residual.dtype == torch.float32
         and weight.dtype in (torch.float16, torch.bfloat16, torch.float32)

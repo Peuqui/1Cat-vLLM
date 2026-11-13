@@ -11,7 +11,7 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     UnquantizedLinearMethod,
 )
-from vllm.platforms.compiled_capability import is_sm70_device
+from vllm.platforms import current_platform
 
 
 def _can_combine_fc(model, embedding, hidden):
@@ -26,7 +26,7 @@ def _can_combine_fc(model, embedding, hidden):
         or hidden.dtype != torch.float16
         or not embedding.is_cuda
         or not hidden.is_cuda
-        or not is_sm70_device(None)
+        or not current_platform.is_device_capability(70)
     ):
         return False
     return all(

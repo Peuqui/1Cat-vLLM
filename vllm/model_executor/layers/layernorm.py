@@ -26,7 +26,6 @@ from vllm.model_executor.kernels.norm.sm70 import (
 )
 from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
 from vllm.platforms import current_platform
-from vllm.platforms.compiled_capability import is_sm70_device
 
 logger = init_logger(__name__)
 
@@ -408,7 +407,7 @@ class RMSNormGated(CustomOp):
             self._sm70_rmsnorm_gated_exact
             and not envs.VLLM_BATCH_INVARIANT
             and x.is_cuda
-            and is_sm70_device(x.device.index)
+            and current_platform.is_device_capability(70, device_id=x.device.index)
             and self.group_size is None
             and self.norm_before_gate
             and self.activation in ("sigmoid", "silu", "swish")
