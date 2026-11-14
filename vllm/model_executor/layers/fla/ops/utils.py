@@ -196,8 +196,10 @@ def check_shared_mem(arch: str = "none", tensor_idx: int | None = None) -> bool:
     # Without an explicit index, ask the worker's own device. Index 0 is the
     # first visible card, which on a mixed rig (e.g. an Ampere card next to an
     # older one) would pick tile sizes the worker's own card cannot hold.
+    # FLA modules evaluate this at import, also in processes without a CUDA
+    # context; resolve_device_id answers without creating one.
     if tensor_idx is None:
-        tensor_idx = device_torch_lib.current_device()
+        tensor_idx = current_platform.resolve_device_id(None)
     try:
         device_shared_mem_list = get_all_max_shared_mem()
         max_shared_memory = device_shared_mem_list[tensor_idx]

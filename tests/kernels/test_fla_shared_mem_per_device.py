@@ -16,11 +16,19 @@ def mixed_rig(monkeypatch):
     utils.check_shared_mem.cache_clear()
 
 
+def _worker_on_device_1(device_id):
+    return 1 if device_id is None else device_id
+
+
 def test_uses_current_device(mixed_rig, monkeypatch):
-    monkeypatch.setattr(utils.device_torch_lib, "current_device", lambda: 1)
+    monkeypatch.setattr(
+        utils.current_platform, "resolve_device_id", _worker_on_device_1
+    )
     assert utils.check_shared_mem() is False
 
 
 def test_first_card_still_reachable_by_index(mixed_rig, monkeypatch):
-    monkeypatch.setattr(utils.device_torch_lib, "current_device", lambda: 1)
+    monkeypatch.setattr(
+        utils.current_platform, "resolve_device_id", _worker_on_device_1
+    )
     assert utils.check_shared_mem(tensor_idx=0) is True
