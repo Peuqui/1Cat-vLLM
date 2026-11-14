@@ -377,10 +377,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # through the gated RMSNorm.
         self._use_sm70_fp32_recurrent_output = (
             current_platform.is_cuda()
-            and current_platform.get_device_capability(
-                torch.accelerator.current_device_index()
-            )
-            in ((7, 0), (7, 5))
+            # Without an index: the worker's own device, no CUDA context.
+            and current_platform.get_device_capability() in ((7, 0), (7, 5))
             and self.head_dim == 128
         )
         self._use_sm70_glm53_tp8_cublaslt = (

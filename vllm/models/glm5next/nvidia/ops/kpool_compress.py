@@ -26,10 +26,9 @@ INDEX_HEAD_DIM = 128
 
 def _software_e4m3() -> bool:
     # Triton stores float8e4nv from SM89 on; earlier cards (Volta, Turing)
-    # write the E4M3 bytes the kernels encode in software.
-    return current_platform.is_cuda() and not current_platform.has_device_capability(
-        89, device_id=torch.accelerator.current_device_index()
-    )
+    # write the E4M3 bytes the kernels encode in software. Without an index the
+    # platform answers for the worker's own device without a CUDA context.
+    return current_platform.is_cuda() and not current_platform.has_device_capability(89)
 
 
 # Hadamard-128 rotation

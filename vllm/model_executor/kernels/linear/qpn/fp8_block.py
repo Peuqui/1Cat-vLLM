@@ -455,10 +455,10 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
             "fp8_qpn8_prefill_sm70_out",
         ]
         # The worker's own device: on a node that mixes card generations,
-        # device 0 answers for another card.
-        capability = current_platform.get_device_capability(
-            torch.accelerator.current_device_index()
-        )
+        # device 0 answers for another card. Without an index the platform
+        # resolves it without creating a CUDA context (selection also runs
+        # in processes that must not hold one).
+        capability = current_platform.get_device_capability()
         if capability is not None and capability.to_int() == 75:
             required.append("fp8_qpn8_mma_sm75_out")
         missing = [name for name in required if not hasattr(torch.ops._C, name)]
