@@ -117,7 +117,7 @@ def test_pure_nvfp4_glm53_moe_uses_turbomind_w4a16_on_sm70():
         patch.object(modelopt, "RoutedExperts", FakeRoutedExperts),
         patch.object(sm70_tm, "is_exact_sm70_cuda_platform", return_value=True),
         patch.object(sm70_tm, "should_use_nvfp4_moe_turbomind", return_value=True),
-        # The automatic backend keeps TurboMind when the skinny kernel declines.
+        # An admitted skinny MoE kernel would release the TurboMind gate.
         patch.object(skinny_sm70_moe, "skinny_backend_admitted", return_value=False),
     ):
         method = config.get_quant_method(
