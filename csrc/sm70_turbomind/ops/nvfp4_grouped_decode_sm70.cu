@@ -9,17 +9,18 @@
 #include <torch/types.h>
 
 namespace {
-constexpr int kMaxRoutes = 160;
+constexpr int kMaxTokens = 40;
+constexpr int kTopK = 10;
+constexpr int kMaxRoutes = kMaxTokens * kTopK;
 constexpr int kPack = 8;
 constexpr int kExperts = 512;
-constexpr int kChunks = kMaxRoutes / kPack;
 
 // Integer atomics only: route order within a pack is immaterial because both
 // projections scatter back to the original route before the unchanged W2.
 __global__ void plan_kernel(const int32_t* ids, int32_t* rows, int32_t* experts,
                             int32_t* sizes, int32_t* total, int routes) {
   __shared__ int counts[kExperts + 1];
-  __shared__ int groups[kExperts + 1][kChunks];
+  __shared__ int group_base[kExperts + 1];
   const int t = threadIdx.x;
   for (int e = t; e <= kExperts; e += blockDim.x) counts[e] = 0;
   if (t == 0) *total = 0;
@@ -31,16 +32,18 @@ __global__ void plan_kernel(const int32_t* ids, int32_t* rows, int32_t* experts,
     ordinal = atomicAdd(counts + expert, 1);
   }
   __syncthreads();
-  if (t < routes && ordinal % kPack == 0) {
-    const int group = atomicAdd(total, 1);
-    groups[expert][ordinal / kPack] = group;
-    experts[group] = expert;
-    sizes[group] = min(kPack, counts[expert] - ordinal);
+  for (int e = t; e <= kExperts; e += blockDim.x) {
+    const int n_groups = (counts[e] + kPack - 1) / kPack;
+    group_base[e] = n_groups > 0 ? atomicAdd(total, n_groups) : 0;
   }
   __syncthreads();
   if (t < routes) {
-    const int group = groups[expert][ordinal / kPack];
+    const int group = group_base[expert] + ordinal / kPack;
     rows[group * kPack + ordinal % kPack] = t;
+    if (ordinal % kPack == 0) {
+      experts[group] = expert;
+      sizes[group] = min(kPack, counts[expert] - ordinal);
+    }
   }
 }
 
@@ -65,79 +68,87 @@ __device__ __forceinline__ void decode(unsigned packed, half2 scale,
         "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                          \
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 
-template <int Split, bool Interleaved>
+template <int Inter, int Split, bool Interleaved>
 __global__ void w13_kernel(const half* x, const uint32_t* weights,
                            const half* scales, const int32_t* rows,
                            const int32_t* experts, const int32_t* sizes,
                            const int32_t* total, half* out) {
+  constexpr int kTiles = Inter / 32;
   // Split within the CTA: no floating-point atomics or global partial tensor.
   __shared__ float partial[2][Split][kPack][32];
   __shared__ half projected[2][kPack][32];
-  const int group_id = blockIdx.y;
-  if (group_id >= *total) return;
-  const int count = sizes[group_id], expert = experts[group_id];
+  const int total_groups = *total;
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int projection = warp / Split, split = warp % Split;
-  const int tile =
-      Interleaved ? blockIdx.x * 2 + projection : blockIdx.x + projection * 5;
+  const int tile = Interleaved ? blockIdx.x * 2 + projection
+                               : blockIdx.x + projection * kTiles;
   const int mma_row = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int quad = (lane >> 2) & 3;
   const int col = quad * 8 + mma_row;
-  const int route = mma_row < count ? rows[group_id * kPack + mma_row] : 0;
-  float accum[8] = {};
-  if (expert < kExperts) {
-    const uint32_t* w = weights + static_cast<size_t>(expert) * 2560 * 40;
-    const half* s = scales + static_cast<size_t>(expert) * 160 * 320;
-    const half* input = x + static_cast<size_t>(route / 10) * 2560;
+  for (int group_id = blockIdx.y; group_id < total_groups;
+       group_id += gridDim.y) {
+    const int count = sizes[group_id], expert = experts[group_id];
+    const int route = mma_row < count ? rows[group_id * kPack + mma_row] : 0;
+    float accum[8] = {};
+    if (expert < kExperts) {
+      const uint32_t* w =
+          weights + static_cast<size_t>(expert) * 2560 * (Inter / 4);
+      const half* s = scales + static_cast<size_t>(expert) * 160 * (2 * Inter);
+      const half* input = x + static_cast<size_t>(route / kTopK) * 2560;
 #pragma unroll 4
-    for (int g = split * (160 / Split); g < (split + 1) * (160 / Split); ++g) {
-      const size_t offset =
-          (static_cast<size_t>(tile) * 320 + g * 2) * 32 + col;
-      const half scalar = __hmul(__ldg(s + (g * 10 + tile) * 32 + col),
-                                 __float2half_rn(16384.0f));
-      const half2 scale = __halves2half2(scalar, scalar);
-      half2 decoded[8];
-      decode(__ldcs(w + offset), scale, decoded);
-      decode(__ldcs(w + offset + 32), scale, decoded + 4);
-      const unsigned* b = reinterpret_cast<const unsigned*>(decoded);
-      uint4 lo = make_uint4(0, 0, 0, 0), hi = make_uint4(0, 0, 0, 0);
-      if (mma_row < count) {
-        lo = *reinterpret_cast<const uint4*>(input + g * 16);
-        hi = *reinterpret_cast<const uint4*>(input + g * 16 + 8);
+      for (int g = split * (160 / Split); g < (split + 1) * (160 / Split);
+           ++g) {
+        const size_t offset =
+            (static_cast<size_t>(tile) * 320 + g * 2) * 32 + col;
+        const half scalar =
+            __hmul(__ldg(s + (g * (2 * kTiles) + tile) * 32 + col),
+                   __float2half_rn(16384.0f));
+        const half2 scale = __halves2half2(scalar, scalar);
+        half2 decoded[8];
+        decode(__ldcs(w + offset), scale, decoded);
+        decode(__ldcs(w + offset + 32), scale, decoded + 4);
+        const unsigned* b = reinterpret_cast<const unsigned*>(decoded);
+        uint4 lo = make_uint4(0, 0, 0, 0), hi = make_uint4(0, 0, 0, 0);
+        if (mma_row < count) {
+          lo = *reinterpret_cast<const uint4*>(input + g * 16);
+          hi = *reinterpret_cast<const uint4*>(input + g * 16 + 8);
+        }
+        PACKED_MMA(accum, lo.x, lo.y, b[0], b[1]);
+        PACKED_MMA(accum, lo.z, lo.w, b[2], b[3]);
+        PACKED_MMA(accum, hi.x, hi.y, b[4], b[5]);
+        PACKED_MMA(accum, hi.z, hi.w, b[6], b[7]);
       }
-      PACKED_MMA(accum, lo.x, lo.y, b[0], b[1]);
-      PACKED_MMA(accum, lo.z, lo.w, b[2], b[3]);
-      PACKED_MMA(accum, hi.x, hi.y, b[4], b[5]);
-      PACKED_MMA(accum, hi.z, hi.w, b[6], b[7]);
     }
-  }
 #pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    const int r = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
-    const int c = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
-    partial[projection][split][r][quad * 8 + c] = accum[i];
-  }
-  __syncthreads();
-  for (int idx = threadIdx.x; idx < 2 * kPack * 32; idx += blockDim.x) {
-    const int p = idx / (kPack * 32), r = idx / 32 % kPack, c = idx % 32;
-    // FP16 materialization is retained before SiLU, then again before the
-    // multiplication. Split>1 changes FP32 association, not quantization.
-    float value = 0;
+    for (int i = 0; i < 8; ++i) {
+      const int r = (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+      const int c = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      partial[projection][split][r][quad * 8 + c] = accum[i];
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < 2 * kPack * 32; idx += blockDim.x) {
+      const int p = idx / (kPack * 32), r = idx / 32 % kPack, c = idx % 32;
+      // FP16 materialization is retained before SiLU, then again before the
+      // multiplication. Split>1 changes FP32 association, not quantization.
+      float value = 0;
 #pragma unroll
-    for (int s = 0; s < Split; ++s) value += partial[p][s][r][c];
-    projected[p][r][c] = __float2half_rn(value);
-  }
-  __syncthreads();
-  for (int idx = threadIdx.x; idx < count * 32; idx += blockDim.x) {
-    const int r = idx / 32, c = idx % 32;
-    const int p = Interleaved ? c / 16 : 0;
-    const int pc = Interleaved ? c % 16 * 2 : c;
-    const half gate = projected[p][r][pc];
-    const half up = Interleaved ? projected[p][r][pc + 1] : projected[1][r][c];
-    const float gf = __half2float(gate);
-    const half activated = __float2half_rn(gf / (1.0f + expf(-gf)));
-    out[static_cast<size_t>(rows[group_id * kPack + r]) * 160 +
-        blockIdx.x * 32 + c] = __hmul(activated, up);
+      for (int s = 0; s < Split; ++s) value += partial[p][s][r][c];
+      projected[p][r][c] = __float2half_rn(value);
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < count * 32; idx += blockDim.x) {
+      const int r = idx / 32, c = idx % 32;
+      const int p = Interleaved ? c / 16 : 0;
+      const int pc = Interleaved ? c % 16 * 2 : c;
+      const half gate = projected[p][r][pc];
+      const half up =
+          Interleaved ? projected[p][r][pc + 1] : projected[1][r][c];
+      const float gf = __half2float(gate);
+      const half activated = __float2half_rn(gf / (1.0f + expf(-gf)));
+      out[static_cast<size_t>(rows[group_id * kPack + r]) * Inter +
+          blockIdx.x * 32 + c] = __hmul(activated, up);
+    }
+    if (group_id + gridDim.y < total_groups) __syncthreads();
   }
 }
 
@@ -146,8 +157,12 @@ void run(torch::Tensor out, torch::Tensor x, torch::Tensor w, torch::Tensor s,
          torch::Tensor sizes, torch::Tensor total, int64_t split,
          bool interleaved) {
   const c10::cuda::CUDAGuard guard(x.device());
-  const int routes = x.size(0) * 10;
-  TORCH_CHECK(x.dim() == 2 && x.size(1) == 2560 && routes > 0 && routes <= 160);
+  const int routes = x.size(0) * kTopK;
+  TORCH_CHECK(x.dim() == 2 && x.size(1) == 2560 && routes > 0 &&
+              routes <= kMaxRoutes);
+  TORCH_CHECK(out.dim() == 2 && out.size(0) == routes);
+  const int inter = out.size(1);
+  TORCH_CHECK(inter == 160 || inter == 320 || inter == 640);
   for (const auto& t : {out, x, w, s, ids, rows, experts, sizes, total}) {
     TORCH_CHECK(t.is_cuda() && t.device() == x.device() && t.is_contiguous());
   }
@@ -157,27 +172,38 @@ void run(torch::Tensor out, torch::Tensor x, torch::Tensor w, torch::Tensor s,
     TORCH_CHECK(t.scalar_type() == at::kInt);
   TORCH_CHECK(ids.numel() == routes && rows.numel() >= routes * kPack &&
               experts.numel() >= routes && sizes.numel() >= routes &&
-              total.numel() == 1 && out.numel() == routes * 160 &&
-              w.numel() == 512 * 2560 * 40 && s.numel() == 512 * 160 * 320);
+              total.numel() == 1 && out.numel() == routes * inter &&
+              w.numel() ==
+                  static_cast<int64_t>(kExperts) * 2560 * (inter / 4) &&
+              s.numel() == static_cast<int64_t>(kExperts) * 160 * (2 * inter));
   const auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
-  plan_kernel<<<1, 256, 0, stream>>>(
+  plan_kernel<<<1, 512, 0, stream>>>(
       ids.data_ptr<int32_t>(), rows.data_ptr<int32_t>(),
       experts.data_ptr<int32_t>(), sizes.data_ptr<int32_t>(),
       total.data_ptr<int32_t>(), routes);
-#define LAUNCH(S, I)                                                         \
-  w13_kernel<S, I><<<dim3(5, routes), 64 * S, 0, stream>>>(                  \
-      reinterpret_cast<const half*>(x.data_ptr()),                           \
-      reinterpret_cast<const uint32_t*>(w.data_ptr()),                       \
-      reinterpret_cast<const half*>(s.data_ptr()), rows.data_ptr<int32_t>(), \
-      experts.data_ptr<int32_t>(), sizes.data_ptr<int32_t>(),                \
+  const int grid_y = std::min(routes, 128);
+#define LAUNCH(INTER, S, I)                                                   \
+  w13_kernel<INTER, S, I><<<dim3((INTER) / 32, grid_y), 64 * S, 0, stream>>>( \
+      reinterpret_cast<const half*>(x.data_ptr()),                            \
+      reinterpret_cast<const uint32_t*>(w.data_ptr()),                        \
+      reinterpret_cast<const half*>(s.data_ptr()), rows.data_ptr<int32_t>(),  \
+      experts.data_ptr<int32_t>(), sizes.data_ptr<int32_t>(),                 \
       total.data_ptr<int32_t>(), reinterpret_cast<half*>(out.data_ptr()))
-#define CASE(S)         \
-  case S:               \
-    if (interleaved) {  \
-      LAUNCH(S, true);  \
-    } else {            \
-      LAUNCH(S, false); \
-    }                   \
+#define LAUNCH_INTER(S, I)   \
+  if (inter == 160) {        \
+    LAUNCH(160, S, I);       \
+  } else if (inter == 320) { \
+    LAUNCH(320, S, I);       \
+  } else {                   \
+    LAUNCH(640, S, I);       \
+  }
+#define CASE(S)               \
+  case S:                     \
+    if (interleaved) {        \
+      LAUNCH_INTER(S, true);  \
+    } else {                  \
+      LAUNCH_INTER(S, false); \
+    }                         \
     break
   switch (split) {
     CASE(1);
@@ -190,15 +216,18 @@ void run(torch::Tensor out, torch::Tensor x, torch::Tensor w, torch::Tensor s,
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 #undef CASE
+#undef LAUNCH_INTER
 #undef LAUNCH
 }
 
 // All groups, including singletons, use one kernel. The earlier prototype
 // launched separate repeated/singleton kernels; their overhead erased reuse.
+template <int Inter>
 __global__ void w2_kernel(const half* x, const uint32_t* weights,
                           const half* scales, const int32_t* rows,
                           const int32_t* experts, const int32_t* sizes,
                           const int32_t* total, half* out) {
+  constexpr int kW2Groups = Inter / 16;
   const int group = blockIdx.y * 4 + threadIdx.x / 32;
   if (group >= *total) return;
   const int count = sizes[group], expert = experts[group];
@@ -207,12 +236,12 @@ __global__ void w2_kernel(const half* x, const uint32_t* weights,
   const int route = r < count ? rows[group * kPack + r] : 0;
   float accum[8] = {};
   if (expert < kExperts) {
-    const uint32_t* w = weights + static_cast<size_t>(expert) * 160 * 320;
-    const half* s = scales + static_cast<size_t>(expert) * 10 * 2560;
-    const half* input = x + static_cast<size_t>(route) * 160;
+    const uint32_t* w = weights + static_cast<size_t>(expert) * Inter * 320;
+    const half* s = scales + static_cast<size_t>(expert) * kW2Groups * 2560;
+    const half* input = x + static_cast<size_t>(route) * Inter;
 #pragma unroll
-    for (int g = 0; g < 10; ++g) {
-      const int offset = (blockIdx.x * 20 + g * 2) * 32 + col;
+    for (int g = 0; g < kW2Groups; ++g) {
+      const int offset = (blockIdx.x * (2 * kW2Groups) + g * 2) * 32 + col;
       const half scalar = __hmul(__ldg(s + (g * 80 + blockIdx.x) * 32 + col),
                                  __float2half_rn(16384.0f));
       const half2 scale = __halves2half2(scalar, scalar);
@@ -248,9 +277,9 @@ __global__ void reduce_kernel(const half* routed, const float* weights,
   const int token = blockIdx.y, col = blockIdx.x * 256 + threadIdx.x;
   float result = 0;
 #pragma unroll
-  for (int slot = 0; slot < 10; ++slot)
-    result = fmaf(__half2float(routed[(token * 10 + slot) * 2560 + col]),
-                  weights[token * 10 + slot], result);
+  for (int slot = 0; slot < kTopK; ++slot)
+    result = fmaf(__half2float(routed[(token * kTopK + slot) * 2560 + col]),
+                  weights[token * kTopK + slot], result);
   out[token * 2560 + col] = __float2half_rn(result);
 }
 
@@ -259,11 +288,13 @@ __global__ void reduce_kernel(const half* routed, const float* weights,
 // groups rather than token slots. Keep the FP16 W2 boundary in CTA memory;
 // after one barrier, reduce each token in the original top-k order. No global
 // scatter tensor, floating-point atomics, or inter-CTA synchronization.
+template <int Inter, int MaxRoutes>
 __global__ __launch_bounds__(1024) void w2_batch_reduce_kernel(
     const half* x, const uint32_t* weights, const half* scales,
     const float* topk, const int32_t* rows, const int32_t* experts,
     const int32_t* sizes, const int32_t* total, half* out, int tokens) {
-  __shared__ half values[kMaxRoutes][32];
+  constexpr int kW2Groups = Inter / 16;
+  __shared__ half values[MaxRoutes][32];
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int quad = (lane >> 2) & 3;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
@@ -274,12 +305,12 @@ __global__ __launch_bounds__(1024) void w2_batch_reduce_kernel(
     const int route = r < count ? rows[group * kPack + r] : 0;
     float accum[8] = {};
     if (expert < kExperts) {
-      const uint32_t* w = weights + static_cast<size_t>(expert) * 160 * 320;
-      const half* s = scales + static_cast<size_t>(expert) * 10 * 2560;
-      const half* input = x + static_cast<size_t>(route) * 160;
+      const uint32_t* w = weights + static_cast<size_t>(expert) * Inter * 320;
+      const half* s = scales + static_cast<size_t>(expert) * kW2Groups * 2560;
+      const half* input = x + static_cast<size_t>(route) * Inter;
 #pragma unroll
-      for (int g = 0; g < 10; ++g) {
-        const int offset = (tile * 20 + g * 2) * 32 + col;
+      for (int g = 0; g < kW2Groups; ++g) {
+        const int offset = (tile * (2 * kW2Groups) + g * 2) * 32 + col;
         const half scalar = __hmul(__ldg(s + (g * 80 + tile) * 32 + col),
                                    __float2half_rn(16384.0f));
         const half2 scale = __halves2half2(scalar, scalar);
@@ -313,9 +344,9 @@ __global__ __launch_bounds__(1024) void w2_batch_reduce_kernel(
     const int token = idx / 32, c = idx % 32;
     float weighted = 0.0f;
 #pragma unroll
-    for (int slot = 0; slot < 10; ++slot) {
-      weighted = fmaf(__half2float(values[token * 10 + slot][c]),
-                      __ldg(topk + token * 10 + slot), weighted);
+    for (int slot = 0; slot < kTopK; ++slot) {
+      weighted = fmaf(__half2float(values[token * kTopK + slot][c]),
+                      __ldg(topk + token * kTopK + slot), weighted);
     }
     out[token * 2560 + tile * 32 + c] = __float2half_rn(weighted);
   }
@@ -326,9 +357,11 @@ void w2_dispatch(torch::Tensor out, torch::Tensor routed, torch::Tensor x,
                  torch::Tensor rows, torch::Tensor experts, torch::Tensor sizes,
                  torch::Tensor total, bool batch_reduce) {
   const c10::cuda::CUDAGuard guard(x.device());
-  TORCH_CHECK(x.dim() == 2 && x.size(1) == 160 && x.size(0) % 10 == 0);
-  const int routes = x.size(0), tokens = routes / 10;
-  TORCH_CHECK(tokens >= 1 && tokens <= 16);
+  const int inter = x.dim() == 2 ? x.size(1) : 0;
+  TORCH_CHECK(x.dim() == 2 && (inter == 160 || inter == 320 || inter == 640) &&
+              x.size(0) % kTopK == 0);
+  const int routes = x.size(0), tokens = routes / kTopK;
+  TORCH_CHECK(tokens >= 1 && tokens <= kMaxTokens);
   for (const auto& t :
        {out, routed, x, w, s, topk, rows, experts, sizes, total})
     TORCH_CHECK(t.is_cuda() && t.device() == x.device() && t.is_contiguous());
@@ -337,25 +370,51 @@ void w2_dispatch(torch::Tensor out, torch::Tensor routed, torch::Tensor x,
   for (const auto& t : {w, rows, experts, sizes, total})
     TORCH_CHECK(t.scalar_type() == at::kInt);
   TORCH_CHECK(topk.scalar_type() == at::kFloat && topk.numel() == routes &&
-              out.numel() == tokens * 2560 && routed.numel() == routes * 2560 &&
-              rows.numel() >= routes * 8 && experts.numel() >= routes &&
+              out.numel() == tokens * 2560 &&
+              (batch_reduce || routed.numel() == routes * 2560) &&
+              rows.numel() >= routes * kPack && experts.numel() >= routes &&
               sizes.numel() >= routes && total.numel() == 1 &&
-              w.numel() == 512 * 160 * 320 && s.numel() == 512 * 10 * 2560);
+              w.numel() == static_cast<int64_t>(kExperts) * inter * 320 &&
+              s.numel() ==
+                  static_cast<int64_t>(kExperts) * (inter / 16) * 2560);
   const auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
   if (batch_reduce) {
-    TORCH_CHECK(tokens == 5 || tokens == 8 || tokens == 16,
-                "Grouped batch reduction is screened for M5/M8/M16 only");
-    w2_batch_reduce_kernel<<<80, 1024, 0, stream>>>(
-        reinterpret_cast<const half*>(x.data_ptr()),
-        reinterpret_cast<const uint32_t*>(w.data_ptr()),
-        reinterpret_cast<const half*>(s.data_ptr()), topk.data_ptr<float>(),
-        rows.data_ptr<int32_t>(), experts.data_ptr<int32_t>(),
-        sizes.data_ptr<int32_t>(), total.data_ptr<int32_t>(),
-        reinterpret_cast<half*>(out.data_ptr()), tokens);
+    auto launch_br = [&](auto inter_tag, auto max_routes_tag) {
+      constexpr int Inter = decltype(inter_tag)::value;
+      constexpr int MaxR = decltype(max_routes_tag)::value;
+      w2_batch_reduce_kernel<Inter, MaxR><<<80, 1024, 0, stream>>>(
+          reinterpret_cast<const half*>(x.data_ptr()),
+          reinterpret_cast<const uint32_t*>(w.data_ptr()),
+          reinterpret_cast<const half*>(s.data_ptr()), topk.data_ptr<float>(),
+          rows.data_ptr<int32_t>(), experts.data_ptr<int32_t>(),
+          sizes.data_ptr<int32_t>(), total.data_ptr<int32_t>(),
+          reinterpret_cast<half*>(out.data_ptr()), tokens);
+    };
+    auto dispatch_inter = [&](auto max_routes_tag) {
+      if (inter == 160) {
+        launch_br(std::integral_constant<int, 160>{}, max_routes_tag);
+      } else if (inter == 320) {
+        launch_br(std::integral_constant<int, 320>{}, max_routes_tag);
+      } else {
+        launch_br(std::integral_constant<int, 640>{}, max_routes_tag);
+      }
+    };
+    if (tokens <= 10) {
+      dispatch_inter(std::integral_constant<int, 100>{});
+    } else if (tokens <= 16) {
+      dispatch_inter(std::integral_constant<int, 160>{});
+    } else if (tokens <= 20) {
+      dispatch_inter(std::integral_constant<int, 200>{});
+    } else {
+      dispatch_inter(std::integral_constant<int, kMaxRoutes>{});
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
-  w2_kernel<<<dim3(80, (routes + 3) / 4), 128, 0, stream>>>(
+  auto w2_fn = inter == 160   ? w2_kernel<160>
+               : inter == 320 ? w2_kernel<320>
+                              : w2_kernel<640>;
+  w2_fn<<<dim3(80, (routes + 3) / 4), 128, 0, stream>>>(
       reinterpret_cast<const half*>(x.data_ptr()),
       reinterpret_cast<const uint32_t*>(w.data_ptr()),
       reinterpret_cast<const half*>(s.data_ptr()), rows.data_ptr<int32_t>(),
