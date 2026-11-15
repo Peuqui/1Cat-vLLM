@@ -252,6 +252,9 @@ def test_qsa_circular_group_uses_one_block_and_custom_slot_mapping(
     runner.max_num_reqs = 1
     runner.max_num_tokens = 2
     runner.device = torch.device("cpu")
+    # __init__ leaves the TP prefill overlap off unless
+    # kernel_config.tp_prefill_overlap_min_tokens > 0.
+    runner.prefill_overlap = None
 
     circular_spec = CircularBufferSpec(
         block_size=8,
@@ -297,7 +300,10 @@ def test_qsa_circular_group_uses_one_block_and_custom_slot_mapping(
     monkeypatch.setattr(
         mrv2,
         "init_attn_backend",
-        lambda *args: ([], SimpleNamespace(), [8, 16]),
+        # Without the TP prefill overlap one metadata builder per group.
+        lambda *args, num_metadata_builders: (
+            ([], SimpleNamespace(), [8, 16]) if num_metadata_builders == 1 else None
+        ),
     )
     captured: dict[str, object] = {}
 
