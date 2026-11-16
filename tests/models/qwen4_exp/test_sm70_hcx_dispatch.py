@@ -156,7 +156,7 @@ def test_small_m_hc_consumes_unrounded_moe_pair():
 
     module = SimpleNamespace(
         _hcx=SimpleNamespace(run=run),
-        _partial_pair=lambda x: (x[:5], x[5:]),
+        _partial_pair=lambda x, expected_rows=None: (x[:5], x[5:]),
         hc_norm=SimpleNamespace(weight=torch.ones(4)),
         config=SimpleNamespace(rms_norm_eps=1e-6),
         _hcx_down=None,
@@ -224,11 +224,14 @@ def test_materialization_reduces_small_payloads_at_runtime(rows, monkeypatch):
         _partial_inputs=True,
         _hcx_moe_payload=True,
         hc_count=4,
-        _partial_pair=lambda payload: (payload[:rows], payload[rows:]),
+        _partial_pair=lambda payload, expected_rows=None: (
+            payload[:rows],
+            payload[rows:],
+        ),
         _combine_and_mix_reduced=lambda h, b, i: (b.clone(), b.clone(), None),
     )
-    module._reduce_partial = lambda payload: hc.GatedResidual._reduce_partial(
-        module, payload
+    module._reduce_partial = lambda payload, expected_rows=None: (
+        hc.GatedResidual._reduce_partial(module, payload, expected_rows)
     )
     hc._PARTIAL_MODULES["materialize"] = module
     first = torch.ones(rows, 4, dtype=torch.float16)
@@ -254,7 +257,7 @@ def test_large_m_hc_does_not_reduce_or_recompute_projection():
 
     hc._PARTIAL_MODULES["consumer"] = SimpleNamespace(
         _hcx=SimpleNamespace(run=lambda *a, **k: pytest.fail("small-M HCX")),
-        _partial_pair=lambda x: (x, None),
+        _partial_pair=lambda x, expected_rows=None: (x, None),
         _hcx_oproj=(lambda x: pytest.fail("duplicate projection"), 2),
         _combine_and_mix_reduced=original,
     )
@@ -370,7 +373,10 @@ def test_compiled_moe_payload_keeps_both_dependencies_live():
 
     hc._PARTIAL_MODULES["consumer"] = SimpleNamespace(
         _hcx=SimpleNamespace(run=native),
-        _partial_pair=lambda x: (x[: x.shape[0] // 2], x[x.shape[0] // 2 :]),
+        _partial_pair=lambda x, expected_rows=None: (
+            x[: x.shape[0] // 2],
+            x[x.shape[0] // 2 :],
+        ),
         hc_norm=SimpleNamespace(weight=torch.ones(4)),
         config=SimpleNamespace(rms_norm_eps=1e-6),
         _hcx_down=None,
@@ -412,7 +418,7 @@ def test_large_m_injection_matches_contiguous_fake_contract():
     injection = padded_injection[:, :4]
     assert injection.stride(0) == 336
     hc._PARTIAL_MODULES["consumer"] = SimpleNamespace(
-        _partial_pair=lambda x: (x, None),
+        _partial_pair=lambda x, expected_rows=None: (x, None),
         _combine_and_mix_reduced=lambda h, b, i: (h, b, i),
     )
     outputs = hc._hcx_combine_and_mix(hidden, block, injection, "consumer")

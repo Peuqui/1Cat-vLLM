@@ -319,12 +319,14 @@ def test_peer_native_allocation_follows_loading_cache_release(monkeypatch):
     from torch import nn
 
     from vllm.model_executor.layers.quantization import sm70_dmv13_projection as dense
-    from vllm.models.qwen4_exp.nvidia import model, sm70_fp16_hc
+    from vllm.models.qwen4_exp.nvidia import model, ple_layer, sm70_fp16_hc
 
     owner = model.Qwen4ExpForCausalLM.__new__(model.Qwen4ExpForCausalLM)
     nn.Module.__init__(owner)
     owner.model_config = NS(dtype=torch.half)
-    owner.vllm_config = NS(kernel_config=NS(hc_weight_storage="sharded"))
+    owner.vllm_config = NS(
+        kernel_config=NS(hc_weight_storage="sharded", sm70_mtp_bounded_target_head=None)
+    )
     owner._hc_prefill_sequence_qualified = True
     owner.model = nn.Module()
     owner.model.start_layer = 0
@@ -337,6 +339,7 @@ def test_peer_native_allocation_follows_loading_cache_release(monkeypatch):
     monkeypatch.setattr(model, "enable_qwen38_sm70_fp16_fused_hc", lambda *args: None)
     monkeypatch.setattr(dense, "share_prepared_banks", lambda module: 0)
     monkeypatch.setattr(sm70_fp16_hc, "prepare_sharded_hc_storage", lambda *args: None)
+    monkeypatch.setattr(ple_layer, "prepare_sm70_ple_storage", lambda *args: None)
     monkeypatch.setattr(
         torch.accelerator, "empty_cache", lambda: live_loading_pages.clear()
     )
