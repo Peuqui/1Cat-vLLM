@@ -101,8 +101,9 @@ def _ensure_block_qpn8_prefill_workspace(
 
 
 def _graphs_capture_dense_prefill(dense_above: int) -> bool:
-    """Whether CUDA graphs capture batches of more than ``dense_above`` rows,
-    the first size at which this layer takes the FP16 prefill.
+    """Whether the FP16 prefill needs the workspace held for the engine's life:
+    CUDA graphs capture batches of more than ``dense_above`` rows, the first
+    size at which this layer takes the FP16 prefill, or the KV budget is fixed.
 
     Only such graphs need the shared workspace: it keeps every captured layer
     from holding its own K*N buffer in the graph pool. An eager prefill takes
@@ -112,6 +113,10 @@ def _graphs_capture_dense_prefill(dense_above: int) -> bool:
     """
     engine = get_current_vllm_config_or_none()
     if engine is None:
+        return True
+    # A fixed KV byte budget skips the peak-memory deduction, so a buffer
+    # taken per call would not be planned for: keep the workspace resident.
+    if engine.cache_config.kv_cache_memory_bytes is not None:
         return True
     compilation = engine.compilation_config
     if compilation.cudagraph_mode == CUDAGraphMode.NONE:
