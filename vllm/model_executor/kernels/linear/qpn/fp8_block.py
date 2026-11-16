@@ -24,7 +24,7 @@ from torch.library import custom_op
 
 from vllm import _sm70_ops as sm70_ops
 from vllm._sm70.policy import NativeBindings, call_native
-from vllm.config import get_current_vllm_config_or_none
+from vllm.config import CUDAGraphMode, get_current_vllm_config_or_none
 from vllm.config.kernel import Sm70Fp8Config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.qpn.fp8 import (
@@ -98,6 +98,44 @@ def _ensure_block_qpn8_prefill_workspace(
     buf = torch.empty((needed_elements,), dtype=torch.float16, device=device)
     pool[key] = buf
     return buf
+
+
+def _graphs_capture_dense_prefill(dense_above: int) -> bool:
+    """Whether CUDA graphs capture batches of more than ``dense_above`` rows,
+    the first size at which this layer takes the FP16 prefill.
+
+    Only such graphs need the shared workspace: it keeps every captured layer
+    from holding its own K*N buffer in the graph pool. An eager prefill takes
+    the buffer from the caching allocator for the call, inside the activation
+    memory the startup profile reserves, so a workspace held for the life of
+    the engine would only take that memory from the KV cache.
+    """
+    engine = get_current_vllm_config_or_none()
+    if engine is None:
+        return True
+    compilation = engine.compilation_config
+    if compilation.cudagraph_mode == CUDAGraphMode.NONE:
+        return False
+    return any(size > dense_above for size in compilation.cudagraph_capture_sizes)
+
+
+def _block_qpn8_prefill_dense(
+    device: torch.device, needed_elements: int
+) -> torch.Tensor:
+    """The FP16 weight buffer of the dense prefill: the shared workspace while
+    a graph is captured or once one was set up for captured prefill, else a
+    buffer that lives for this call only."""
+    pool = sm70_layer_workspaces.workspace_pool(
+        "_block_qpn8_prefill_workspaces", _block_qpn8_prefill_workspaces
+    )
+    dev_idx = (
+        device.index
+        if device.index is not None
+        else torch.accelerator.current_device_index()
+    )
+    if torch.cuda.is_current_stream_capturing() or (dev_idx, -1) in pool:
+        return _ensure_block_qpn8_prefill_workspace(device, needed_elements)
+    return torch.empty((needed_elements,), dtype=torch.float16, device=device)
 
 
 def _qpn8_native_linear_write(
@@ -230,7 +268,7 @@ def _qpn8_native_linear_write(
                     prefetch_codes,
                 )
             return
-    dense = _ensure_block_qpn8_prefill_workspace(x.device, k_dim * n_dim)
+    dense = _block_qpn8_prefill_dense(x.device, k_dim * n_dim)
     call_native(
         sm70_ops.fp8_qpn8_prefill_sm70_out,
         native_policy,
@@ -447,7 +485,7 @@ def _qpn8_native_gated_silu(
         )
         torch.ops._C.silu_and_mul(out, gate_up)
         return out
-    dense = _ensure_block_qpn8_prefill_workspace(x.device, k_dim * n_dim)
+    dense = _block_qpn8_prefill_dense(x.device, k_dim * n_dim)
     call_native(
         sm70_ops.fp8_qpn8_prefill_sm70_out,
         native_policy,
@@ -668,6 +706,12 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
             layer._qpn8_fallback_k_ld = int(metadata[0].item())
             layer._qpn8_fallback_q_ld = int(metadata[1].item())
         if layer._qpn8_sm75_mma:
+            if (
+                codes.is_cuda
+                and not torch.cuda.is_current_stream_capturing()
+                and _graphs_capture_dense_prefill(_SM75_MMA_MAX_M)
+            ):
+                _ensure_block_qpn8_prefill_workspace(codes.device, k_dim * n_dim)
             logger.info_once(
                 "Block FP8 QPN8 on SM75: M=1..8 uses the packed decode GEMM, "
                 "M=9..512 the tensor-core GEMM on the packed codes, larger M "
@@ -681,12 +725,16 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
                 "to hold one layout and use the FP16 prefill instead."
             )
         else:
-            if codes.is_cuda and not torch.cuda.is_current_stream_capturing():
+            if (
+                codes.is_cuda
+                and not torch.cuda.is_current_stream_capturing()
+                and _graphs_capture_dense_prefill(_QPN8_MAX_M)
+            ):
                 _ensure_block_qpn8_prefill_workspace(codes.device, k_dim * n_dim)
             logger.info_once(
-                "Block FP8 QPN8 native GEMM supports M=1..128; larger M uses a "
-                "reusable FP16 prefill workspace, which needs no second copy of "
-                "the weights."
+                "Block FP8 QPN8 native GEMM supports M=1..128; larger M uses the "
+                "FP16 prefill, which needs no second copy of the weights (a "
+                "shared workspace when CUDA graphs capture such batches)."
             )
         layer._qpn8_out_features = n
         split_k, accumulator_chains, prefetch_codes = _sm70_fp8_qpn8_config(
