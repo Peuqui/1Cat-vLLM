@@ -1200,6 +1200,49 @@ if hasattr(torch.ops._C, "fp8_qpn8_gated_pair_sm70_out"):
         return None
 
 
+def fp8_qpn8_block_native_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    k_unroll: int,
+    packed_input: bool,
+    gated: bool,
+    native_policy: tuple[str, ...] = (),
+) -> None:
+    """Run two-phase native block-FP8 QPN8 GEMM (or fused gated-SiLU) for M=9..40."""
+    call_native(
+        _qwen38_qpn8_op("fp8_qpn8_block_native_sm70_out"),
+        native_policy,
+        out,
+        input,
+        codes,
+        group_scales,
+        split_k,
+        k_unroll,
+        packed_input,
+        gated,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_block_native_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_block_native_sm70_out")
+    def _fp8_qpn8_block_native_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        split_k: int,
+        k_unroll: int,
+        packed_input: bool,
+        gated: bool,
+        native_policy: tuple[str, ...] = (),
+    ) -> None:
+        return None
+
+
 def _register_qwen38_qpn8_out_fakes() -> None:
     """Teach Dynamo about out-variant operators from the task sidecar."""
 

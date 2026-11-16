@@ -707,6 +707,21 @@ class Sm70RingConfig:
 
 
 @config
+class TopologyAllReduceConfig:
+    """Experimental measured single-node CUDA IPC all-reduce selection."""
+
+    enabled: bool = False
+    """Qualify and select routes before first model compilation and capture."""
+
+    precision: Literal["fp16", "fp32"] = "fp16"
+    """Use FP16 sums/transfers by default; opt into FP32 sums and partial
+    transfers for accuracy at higher latency. Input and output stay FP16."""
+
+    cache_dir: str | None = None
+    """Selection cache directory; None uses PyTorch's default extension root."""
+
+
+@config
 class HostReduceConfig:
     """Two-rank FP16 all-reduce through pinned host memory for GPU pairs without
     peer access; exact, the same bits as NCCL's two-rank sum."""
@@ -739,6 +754,11 @@ class HostReduceConfig:
 @config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
+
+    topology_all_reduce: TopologyAllReduceConfig = Field(
+        default_factory=TopologyAllReduceConfig
+    )
+    """Opt-in topology-aware peer reduction with startup measured selection."""
 
     layer_execution: LayerExecutionPolicy = Field(default_factory=LayerExecutionPolicy)
     """Per-engine execution decisions and initialization provenance."""
@@ -1422,6 +1442,7 @@ class KernelConfig:
         Any future fields that don't affect compilation should be excluded.
         """
         ignored_factors = {
+            "topology_all_reduce",  # Include enabled math policy below, not cache path.
             "enable_flashinfer_autotune",
             "gdn",  # Hash only initialized computation policy below.
             "sm70_marlin",  # Hash only when the provider is prepared.
@@ -1494,6 +1515,10 @@ class KernelConfig:
         if not self.sm70_mxfp4.values:
             ignored_factors.add("sm70_mxfp4")
         factors = get_hash_factors(self, ignored_factors)
+        if self.topology_all_reduce.enabled:
+            factors["topology_all_reduce"] = dict(
+                enabled=True, precision=self.topology_all_reduce.precision
+            )
         factors["layer_execution"] = self.layer_execution.compute_hash()
         if self.sm70_sparse.active:
             factors["sm70_sparse"] = self.sm70_sparse.compute_hash()
@@ -1611,6 +1636,39 @@ class KernelConfig:
             "Final IR op priority after setting platform defaults: %s",
             self.ir_op_priority,
         )
+
+    def resolve_fp8_verifier_defaults(
+        self,
+        *,
+        model_quantization: str | None,
+        speculative_config: Any,
+        qualification: dict[str, Any],
+        use_native_block_prefill: bool,
+    ) -> None:
+        if speculative_config is not None:
+            policy = speculative_config.sm70_dflash2
+            policy.resolve(**qualification)
+            if (
+                model_quantization in ("fp8", "compressed-tensors")
+                and self.sm70_fp8.qpn8 is None
+                and (
+                    policy.qualified
+                    or qualification.get("mtp_qualified", False)
+                    or "target_fp8_qpn8" in policy.explicit_fields
+                )
+            ):
+                self.sm70_fp8.qpn8 = policy.target_fp8_qpn8
+        if model_quantization in ("fp8", "compressed-tensors"):
+            import torch
+
+            if (
+                use_native_block_prefill
+                and self.sm70_fp8.block_qpn8_volta_turbomind_prefill is None
+                and hasattr(torch.ops._C, "fp8_qpn8_block_native_sm70_out")
+            ):
+                self.sm70_fp8.block_qpn8_volta_turbomind_prefill = False
+            # Resolve after the per-engine verifier defaults.
+            self.sm70_fp8.resolve()
 
 
 def capture_sm70_fp8_linear_config() -> Sm70Fp8Config:

@@ -174,6 +174,38 @@ class _PrefixCacheBoundaries:
             self._generation[key] = suffix
         return self._generation[key]
 
+    def _last_user_turn_suffix(self, tokenizer, last_content, chat_template, kwargs):
+        base_key = json.dumps(
+            ["__turn_base__", chat_template, kwargs], sort_keys=True, default=str
+        )
+        base_msgs = [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+        ]
+        if base_key not in self._generation:
+            base_tokens = self._render(
+                tokenizer, base_msgs, chat_template, kwargs, None, False
+            )
+            self._generation[base_key] = tuple(base_tokens) if base_tokens else None
+        base = self._generation[base_key]
+        if not base:
+            return None
+        probed = self._render(
+            tokenizer,
+            base_msgs + [{"role": "user", "content": last_content}],
+            chat_template,
+            kwargs,
+            None,
+            True,
+        )
+        if (
+            probed is not None
+            and len(probed) > len(base)
+            and tuple(probed[: len(base)]) == base
+        ):
+            return tuple(probed[len(base) :])
+        return None
+
     def _system_prompt(self, tokenizer, message, chat_template, kwargs, tools):
         key = json.dumps(
             [message, tools, chat_template, kwargs], sort_keys=True, default=str
@@ -181,7 +213,36 @@ class _PrefixCacheBoundaries:
         if key in self._system:
             self._system.move_to_end(key)
             return self._system[key]
-        tokens = self._render(tokenizer, [message], chat_template, kwargs, tools, False)
+        prefix_msgs = [message] if message is not None else []
+        tokens = (
+            self._render(tokenizer, prefix_msgs, chat_template, kwargs, tools, False)
+            if prefix_msgs
+            else None
+        )
+        if not tokens and (prefix_msgs or tools):
+            probe_a = self._render(
+                tokenizer,
+                prefix_msgs + [{"role": "user", "content": "A"}],
+                chat_template,
+                kwargs,
+                tools,
+                False,
+            )
+            probe_b = self._render(
+                tokenizer,
+                prefix_msgs + [{"role": "user", "content": "xyz"}],
+                chat_template,
+                kwargs,
+                tools,
+                False,
+            )
+            if probe_a and probe_b:
+                common = 0
+                limit = min(len(probe_a), len(probe_b))
+                while common < limit and probe_a[common] == probe_b[common]:
+                    common += 1
+                if common > 0:
+                    tokens = probe_a[:common]
         value = tuple(tokens) if tokens else None
         self._system[key] = value
         if len(self._system) > self._max_entries:
@@ -209,20 +270,26 @@ class _PrefixCacheBoundaries:
             boundaries.append(n - len(suffix))
         messages = request.messages
         first = messages[0] if messages else None
-        if (
+        has_sys = (
             len(messages) > 1
             and isinstance(first, dict)
             and first.get("role") in ("system", "developer")
             and isinstance(first.get("content"), str)
-        ):
+        )
+        if has_sys or (messages and request.tools):
             tools = (
                 [tool.model_dump(exclude_none=True) for tool in request.tools]
                 if request.tools
                 else None
             )
+            sys_msg = (
+                {"role": first["role"], "content": first["content"]}
+                if has_sys and isinstance(first, dict)
+                else None
+            )
             system = self._system_prompt(
                 tokenizer,
-                {"role": first["role"], "content": first["content"]},
+                sys_msg,
                 chat_template,
                 kwargs,
                 tools,
@@ -233,6 +300,21 @@ class _PrefixCacheBoundaries:
                 and tuple(prompt_token_ids[: len(system)]) == system
             ):
                 boundaries.append(len(system))
+        last = messages[-1] if messages and len(messages) >= 3 else None
+        if (
+            isinstance(last, dict)
+            and last.get("role") == "user"
+            and isinstance(last.get("content"), str)
+        ):
+            turn_suffix = self._last_user_turn_suffix(
+                tokenizer, last["content"], chat_template, kwargs
+            )
+            if (
+                turn_suffix
+                and len(turn_suffix) < n
+                and tuple(prompt_token_ids[-len(turn_suffix) :]) == turn_suffix
+            ):
+                boundaries.append(n - len(turn_suffix))
         return sorted(set(boundaries))
 
 
@@ -1040,6 +1122,44 @@ class OpenAIServingChat(OpenAIServing):
                         )
                         # only check if there are any tool calls
                         # detected by partial parsing
+                        # Hold-back parsers that release ALL tool calls in one
+                        # final delta with full args (e.g. the DeepSeek-V4.1 DSML
+                        # engine parser) have already streamed every call in full.
+                        # The compensation below assumes the vanilla invariant that
+                        # the final delta carries only the LAST call's incremental
+                        # args tail and that it is safe to REPLACE the whole delta
+                        # with a single remaining-args call; given a multi-call
+                        # release delta it reads tool_calls[0] (the FIRST call),
+                        # trims the last call's streamed args by the wrong length,
+                        # and DROPS every other call. If the parser's own
+                        # bookkeeping says the last call's args were already
+                        # streamed in full, there is nothing to compensate: skip.
+                        if (
+                            should_check
+                            and tool_parser
+                            and auto_tools_called
+                            and 0 <= index < len(tool_parser.prev_tool_call_arr)
+                            and index < len(tool_parser.streamed_args_for_tool)
+                            and tool_parser.streamed_args_for_tool[index]
+                            == (
+                                tool_parser.prev_tool_call_arr[index].get(
+                                    "arguments", {}
+                                )
+                                if isinstance(
+                                    tool_parser.prev_tool_call_arr[index].get(
+                                        "arguments", {}
+                                    ),
+                                    str,
+                                )
+                                else json.dumps(
+                                    tool_parser.prev_tool_call_arr[index].get(
+                                        "arguments", {}
+                                    ),
+                                    ensure_ascii=False,
+                                )
+                            )
+                        ):
+                            should_check = False
                         if (
                             should_check
                             and tool_parser
