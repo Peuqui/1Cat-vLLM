@@ -11,8 +11,8 @@ for op, so the results are bit-identical:
 * the packing is a pure copy;
 * the norm reproduces torch's fp32 operation order and rounding: ``x * x``
   stored before summing (no FMA contraction), PyTorch's CUDA reduction order
-  for a 128-wide row (four sequential values per lane, then an adjacent
-  pairwise tree over the 32 lanes), the exact ``mean`` scale 1/128, IEEE
+  for a 128-wide row (four sequential values per lane, then a
+  halving tree over the 32 lanes), the exact ``mean`` scale 1/128, IEEE
   ``expf`` and division for the sigmoid, and one round-to-nearest cast.
 """
 
@@ -27,15 +27,11 @@ _PACK_BLOCK = 1024
 
 
 @triton.jit
-def _pair_sum_tree(partial, LANES: tl.constexpr):
-    # Adjacent pairwise reduction, as torch's shuffle-down tree combines lanes.
-    # Every step adds exactly two values, so its result does not depend on
-    # the order the compiler chooses inside the add.
-    if LANES == 1:
-        return tl.sum(partial, axis=0)
-    return _pair_sum_tree(
-        tl.sum(tl.reshape(partial, [LANES // 2, 2]), axis=1), LANES // 2
-    )
+def _pair_sum(partial, GROUPS: tl.constexpr):
+    # Adds the upper half to the lower half: [2 * GROUPS] -> [GROUPS]. Every
+    # output adds exactly two values, so it does not depend on the order the
+    # compiler chooses.
+    return tl.sum(tl.reshape(partial, [2, GROUPS]), axis=0)
 
 
 @triton.jit
@@ -53,13 +49,20 @@ def _kda_gated_rmsnorm_kernel(
     lane_base = tl.arange(0, LANES) * (DIM // LANES)
 
     # x.float().pow(2).mean(-1): per lane ((v0 + v1) + v2) + v3 over its four
-    # consecutive values, then the pairwise tree over the lanes.
+    # consecutive values, then the halving tree over the lanes.
     lane_sum = tl.load(x_ptr + base + lane_base).to(tl.float32)
     lane_sum = lane_sum * lane_sum
     for step in tl.static_range(1, DIM // LANES):
         value = tl.load(x_ptr + base + lane_base + step).to(tl.float32)
         lane_sum = lane_sum + value * value
-    total = _pair_sum_tree(lane_sum, LANES)
+    # Halving tree over the lanes (lane i + lane i + 16, then 8, 4, 2, 1), the
+    # order torch's CUDA reduction produces (verified against torch.mean on
+    # V100). LANES is 32, so five levels.
+    tree = _pair_sum(lane_sum, 16)
+    tree = _pair_sum(tree, 8)
+    tree = _pair_sum(tree, 4)
+    tree = _pair_sum(tree, 2)
+    total = tl.sum(_pair_sum(tree, 1), axis=0)
     rstd = tl.rsqrt(total * (1.0 / DIM) + EPS)
 
     offsets = tl.arange(0, DIM)
