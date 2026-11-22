@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from vllm.config import CUDAGraphMode
 from vllm.v1.worker.gpu import model_runner as mrv2
@@ -74,6 +75,8 @@ def test_draft_phase_aware_predicate(has_prefill):
 
 def test_execute_rejects_prefill_before_dp_graph_dispatch(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.model_state = SimpleNamespace(flush_decode_ckpt_blocks=lambda: None)
     runner.req_states = SimpleNamespace(
         req_id_to_index={"tail": 0},
         num_computed_prefill_tokens=np.array([800]),
@@ -83,6 +86,7 @@ def test_execute_rejects_prefill_before_dp_graph_dispatch(monkeypatch):
     for name in ("finish_requests", "free_states", "add_requests", "update_requests"):
         setattr(runner, name, lambda _: None)
     runner.block_tables = SimpleNamespace(apply_staged_writes=lambda: None)
+    runner.kv_connector = SimpleNamespace(handle_preemptions=lambda _: None)
     runner.is_encoder_decoder = False
     runner.cudagraph_manager = object()
     runner.dp_size, runner.dp_rank = 1, 0
@@ -90,6 +94,8 @@ def test_execute_rejects_prefill_before_dp_graph_dispatch(monkeypatch):
         num_scheduled_tokens={"tail": 4},
         total_num_scheduled_tokens=4,
         new_block_ids_to_zero=[],
+        kv_block_copies=None,
+        decode_ckpt_mounts=None,
     )
 
     class DispatchReached(Exception):

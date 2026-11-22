@@ -76,6 +76,7 @@ def test_v2_clears_new_cache_blocks_before_zero_token_return() -> None:
     runner.free_states = lambda _: events.append("free")
     runner.add_requests = lambda _: events.append("add")
     runner.update_requests = lambda _: events.append("update")
+    runner.model_state = SimpleNamespace(flush_decode_ckpt_blocks=lambda: None)
     runner.block_tables = SimpleNamespace(
         apply_staged_writes=lambda: events.append("apply")
     )
@@ -88,6 +89,7 @@ def test_v2_clears_new_cache_blocks_before_zero_token_return() -> None:
         total_num_scheduled_tokens=0,
         new_block_ids_to_zero=[3, 7],
         kv_block_copies=None,
+        decode_ckpt_mounts=None,
     )
 
     output = runner.execute_model(scheduler_output)
