@@ -21,6 +21,10 @@ from vllm.model_executor.layers.fla.ops.kda import (
     chunk_kda_with_fused_gate,
     fused_recurrent_kda,
 )
+from vllm.model_executor.layers.fla.ops.sm70.kda_glue import (
+    kda_gated_rmsnorm,
+    kda_pack_recurrent_inputs,
+)
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -683,12 +687,15 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
         if core_output_dtype != hidden_states.dtype:
-            # Keep the recurrent output in FP32 until normalization. The
-            # CustomOp owner selects Triton when enabled and preserves an
-            # explicit disable instead of bypassing its captured dispatch.
-            core_attn_out = self.o_norm(
+            # Keep the recurrent output in FP32 until normalization. One
+            # kernel replaces the eager forward_native chain (11 launches)
+            # with the same fp32 operation order; it does not go through the
+            # CustomOp dispatch, which stays for the other (non-fp32) branch.
+            core_attn_out = kda_gated_rmsnorm(
                 core_attn_out,
                 g2,
+                self.o_norm.weight,
+                self.o_norm.eps,
                 out_dtype=hidden_states.dtype,
             )
             logger.info_once(
@@ -704,6 +711,26 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             self.prefix, "output_projection", projected_output, 0, None, None
         )
         return projected_output
+
+    def _recurrent_inputs(
+        self, qkv: torch.Tensor, beta: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """q, k, v (1, T, H, D) and beta (1, T, H) as the recurrent kernel reads them.
+
+        The kernel needs them contiguous. For T > 1 the q|k|v split of the conv
+        output and the beta split are strided, so one packing kernel replaces
+        the four copies ``fused_recurrent_kda`` would make; for T == 1 the
+        views are already contiguous.
+        """
+        if qkv.size(0) > 1:
+            return kda_pack_recurrent_inputs(
+                qkv, beta.squeeze(0), self.local_num_heads, self.head_dim
+            )
+        q, k, v = (
+            part.reshape(1, -1, self.local_num_heads, self.head_dim)
+            for part in qkv.split(self.local_projection_size, dim=-1)
+        )
+        return q, k, v, beta
 
     def _warmup_prefill_kernels(self, qkv_proj_states: torch.Tensor) -> None:
         """Tune the chunked prefill kernels at the profile run's token count.
@@ -968,7 +995,6 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 decode_conv_indices,
                 None,
             )
-            q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
 
         def _rearr(x):
             return x.reshape(1, -1, self.local_num_heads, self.head_dim)
@@ -1081,12 +1107,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # Gate computed inside the recurrent kernel (COMPUTE_GATE) from
             # raw g1 — replicates fused_kda_gate's arithmetic bit-for-bit and
             # skips its launch + fp32 [n, H, D] intermediate per layer.
+            assert beta_spec is not None
+            q_rec, k_rec, v_rec, beta_rec = self._recurrent_inputs(qkv_spec, beta_spec)
             core_attn_out_spec, _ = fused_recurrent_kda(
-                q=_rearr(q_spec),
-                k=_rearr(k_spec),
-                v=_rearr(v_spec),
+                q=q_rec,
+                k=k_rec,
+                v=v_rec,
                 g=g1_spec,
-                beta=beta_spec,
+                beta=beta_rec,
                 initial_state=recurrent_state,
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=spec_query_start_loc[: num_spec_decodes + 1],
@@ -1214,12 +1242,13 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             # Gate computed in-kernel (COMPUTE_GATE), beta sigmoided in-kernel.
             if not use_spec:
                 ns_out = spec_out
+            q_rec, k_rec, v_rec, beta_rec = self._recurrent_inputs(qkv_ns, beta_ns)
             core_attn_out_non_spec, _ = fused_recurrent_kda(
-                q=_rearr(q_ns),
-                k=_rearr(k_ns),
-                v=_rearr(v_ns),
+                q=q_rec,
+                k=k_rec,
+                v=v_rec,
                 g=g1_ns,
-                beta=beta_ns,
+                beta=beta_rec,
                 initial_state=recurrent_state,
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=non_spec_query_start_loc[
