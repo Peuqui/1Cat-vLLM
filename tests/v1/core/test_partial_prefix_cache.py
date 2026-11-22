@@ -4,7 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm.entrypoints.openai.chat_completion.serving import _PrefixCacheBoundaries
+from vllm.entrypoints.openai.chat_completion.serving import (
+    _AssistantReasoningCache,
+    _PrefixCacheBoundaries,
+)
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash
@@ -474,3 +477,1022 @@ def test_partial_prefix_hit_reclaims_older_lru_entry_under_tight_pool():
     assert hit_tokens == 64
     assert len(cm.partial_cache.entries) == 1
     cm.block_pool.free_blocks(held)
+
+
+def test_assistant_reasoning_cache_restores_omitted_reasoning_across_turns():
+    cache = _AssistantReasoningCache(max_entries=16)
+    prior_msgs = [
+        {"role": "system", "content": "you are an agent"},
+        {"role": "user", "content": "inspect src/wal.py"},
+    ]
+    # 1. Tool-calling turn recorded with compact JSON arguments, queried with
+    # re-formatted JSON arguments and omitted reasoning_content.
+    cache.record(
+        prior_msgs,
+        "",
+        [("read_file", '{"path":"src/wal.py","start":1}')],
+        "Need to inspect WAL header invariants first.",
+        cache_salt="session-a",
+        reasoning_ended=True,
+    )
+    restored = cache.lookup(
+        prior_msgs,
+        "",
+        [
+            {
+                "id": "call_new_id",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{ "start": 1, "path": "src/wal.py" }',
+                },
+            }
+        ],
+        cache_salt="session-a",
+    )
+    assert restored == "Need to inspect WAL header invariants first."
+
+    # 2. Identical tool call in a different conversation prefix or different
+    # cache_salt MUST NOT leak reasoning across turns or sessions (no any_key).
+    other_prior_same_tail = [
+        {"role": "system", "content": "different repo"},
+        {"role": "user", "content": "fix auth bug"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "ls", "arguments": "{}"}}],
+        },
+        {"role": "system", "content": "you are an agent"},
+        {"role": "user", "content": "inspect src/wal.py"},
+    ]
+    same_tc = [
+        {
+            "id": "call_other",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": '{"path":"src/wal.py","start":1}',
+            },
+        }
+    ]
+    assert (
+        cache.lookup(other_prior_same_tail, "", same_tc, cache_salt="session-a") is None
+    )
+    assert cache.lookup(prior_msgs, "", same_tc, cache_salt="session-b") is None
+
+    # 3. Prior assistant tool_calls participate in context digest so distinct
+    # tool trajectories with identical tool outputs do not collide.
+    traj_a = prior_msgs + [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "read_file", "arguments": '{"path":"a.py"}'}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "not found"},
+    ]
+    traj_b = prior_msgs + [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "read_file", "arguments": '{"path":"b.py"}'}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "not found"},
+    ]
+    cache.record(
+        traj_a, "File a.py is missing.", [], "Checked a.py.", cache_salt="session-a"
+    )
+    assert (
+        cache.lookup(traj_a, "File a.py is missing.", [], cache_salt="session-a")
+        == "Checked a.py."
+    )
+    assert (
+        cache.lookup(traj_b, "File a.py is missing.", [], cache_salt="session-a")
+        is None
+    )
+
+    # 4. Length-truncated unfinished thinking turns (reasoning_ended=False or
+    # empty content + empty tool_calls) are never cached or fabricated as closed
+    # </think> blocks on subsequent turns.
+    cache.record(
+        prior_msgs,
+        "",
+        [],
+        "Partial truncated reasoning cut off mid-",
+        cache_salt="session-a",
+        reasoning_ended=False,
+    )
+    assert cache.lookup(prior_msgs, "", [], cache_salt="session-a") is None
+    cache.record(
+        prior_msgs,
+        "",
+        [],
+        "Empty output turn",
+        cache_salt="session-a",
+        reasoning_ended=True,
+    )
+    assert cache.lookup(prior_msgs, "", [], cache_salt="session-a") is None
+
+
+def test_decode_ckpt_promotes_64_aligned_output_and_coalesces_warm_tail():
+    import torch
+
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        CircularBufferSpec,
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+    from vllm.v1.request import RequestStatus
+
+    full = FullAttentionSpec(
+        block_size=256, num_kv_heads=1, head_size=4, dtype=torch.float16
+    )
+    ring = CircularBufferSpec(
+        block_size=8, num_kv_heads=1, head_size=4, head_size_v=0, dtype=torch.float16
+    )
+    mamba = MambaSpec(
+        block_size=256,
+        shapes=((4,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+    )
+    config = KVCacheConfig(
+        64,
+        [],
+        [
+            KVCacheGroupSpec(["qsa"], full),
+            KVCacheGroupSpec(["ring"], ring),
+            KVCacheGroupSpec(["gdn"], mamba),
+        ],
+    )
+    cm = KVCacheManager(
+        config,
+        2048,
+        256,
+        partial_prefix_cache=True,
+        enable_decode_ckpt=True,
+    )
+    assert cm.partial_cache is not None
+    assert cm._enable_decode_ckpt is True
+    free_initial = cm.block_pool.get_num_free_blocks()
+
+    def _hasher(req):
+        return [
+            BlockHash(bytes(x % 256 for x in req.all_token_ids[i : i + 256]))
+            for i in range(0, len(req.all_token_ids) // 256 * 256, 256)
+        ]
+
+    # Turn 1: prompt=90 tokens, generates 60 decode tokens -> total=150 -> B64=128.
+    t1 = Request(
+        request_id="t1",
+        prompt_token_ids=list(range(10, 100)),
+        sampling_params=SamplingParams(max_tokens=128),
+        pooling_params=None,
+        block_hasher=_hasher,
+    )
+    cm.new_step_starts()
+    assert cm.allocate_slots(t1, 90) is not None
+    assert cm.take_decode_ckpt_mounts() == []
+    t1.num_computed_tokens = 90
+    t1.append_output_token_ids([500])
+
+    # First decode step mounts ping-pong Mamba checkpoint blocks.
+    cm.new_step_starts()
+    assert cm.allocate_slots(t1, 1) is not None
+    mounts = cm.take_decode_ckpt_mounts()
+    assert len(mounts) == 1
+    req_id, even_ids, odd_ids = mounts[0]
+    assert req_id == "t1" and len(even_ids) == 1 and len(odd_ids) == 1
+    even_mamba_id = even_ids[0]  # 128 // 64 == 2 -> parity 0 (even)
+
+    # Simulate decoding past 128 up to 150 tokens and finishing cleanly.
+    t1.append_output_token_ids(list(range(501, 560)))
+    t1.num_computed_tokens = 149
+    t1.status = RequestStatus.FINISHED_STOPPED
+    cm.free(t1)
+
+    # Immediate next step (c=1 sequential multi-turn agent): Turn 2 arrives and
+    # MUST hit 128 (including 38 decode-generated tokens!) in the SAME step with
+    # zero (A->B, B->C) copy chains, and coalesce its near-end gen-prompt tail!
+    cm.new_step_starts()
+    t2_tokens = list(t1.all_token_ids[:149]) + list(range(700, 740))
+    t2 = Request(
+        request_id="t2",
+        prompt_token_ids=t2_tokens,
+        sampling_params=SamplingParams(
+            max_tokens=128,
+            extra_args={"prefix_cache_boundaries": [len(t2_tokens) - 10]},
+        ),
+        pooling_params=None,
+        block_hasher=_hasher,
+    )
+    comp_blocks, hit = cm.get_computed_blocks(t2)
+    assert hit == 128
+    # Warm continuation skips the 10-token generation-prompt split -> 1 prefill step!
+    assert cm.partial_prefix_stops(t2, hit, len(t2_tokens)) == ()
+    assert cm.allocate_slots(t2, len(t2_tokens) - hit, hit, comp_blocks) is not None
+    copies, _ = cm.take_block_copies_with_groups()
+    dsts = {dst for _, dst in copies}
+    srcs = {src for src, _ in copies}
+    assert srcs.isdisjoint(dsts), (
+        f"Unexpected chained block copy in same step: {copies}"
+    )
+    entry = next(iter(cm.partial_cache.entries.values()))
+    assert entry.length == 128
+    assert entry.blocks[2][0].block_id == even_mamba_id
+
+    # Also verify client abort (FINISHED_ABORTED) promotes odd parity B64=192,
+    # while preemption (RUNNING) does NOT promote and leaks zero blocks.
+    t2.num_computed_tokens = len(t2_tokens)
+    t2.append_output_token_ids([800])
+    cm.new_step_starts()
+    assert cm.allocate_slots(t2, 1) is not None
+    _, _, odd_ids_2 = cm.take_decode_ckpt_mounts()[0]
+    t2.append_output_token_ids(list(range(801, 830)))
+    t2.num_computed_tokens = 205
+    t2.status = RequestStatus.FINISHED_ABORTED
+    cm.free(t2)
+    cm.new_step_starts()
+    cm.take_block_copies_with_groups()
+    lengths = sorted(e.length for e in cm.partial_cache.entries.values())
+    assert lengths == [128, 192]
+    entry_192 = [e for e in cm.partial_cache.entries.values() if e.length == 192][0]
+    assert entry_192.blocks[2][0].block_id == odd_ids_2[0]
+
+    for _ in range(4):
+        cm.new_step_starts()
+    cm.reset_prefix_cache()
+    assert cm.block_pool.get_num_free_blocks() == free_initial
+
+
+def test_partial_prefix_pins_full_parent_blocks_and_deduplicates_swarm_leaders():
+    import torch
+
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+    from vllm.v1.request import RequestStatus
+
+    full = FullAttentionSpec(
+        block_size=256, num_kv_heads=1, head_size=4, dtype=torch.float16
+    )
+    mamba = MambaSpec(
+        block_size=256,
+        shapes=((4,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+    )
+    config = KVCacheConfig(
+        32,
+        [],
+        [
+            KVCacheGroupSpec(["qsa"], full),
+            KVCacheGroupSpec(["gdn"], mamba),
+        ],
+    )
+    cm = KVCacheManager(
+        config,
+        2048,
+        256,
+        partial_prefix_cache=True,
+        enable_decode_ckpt=True,
+    )
+    free_initial = cm.block_pool.get_num_free_blocks()
+
+    def _hasher(req):
+        return [
+            BlockHash(
+                bytes(((x * 31 + i) % 256) for x in req.all_token_ids[i : i + 256])
+            )
+            for i in range(0, len(req.all_token_ids) // 256 * 256, 256)
+        ]
+
+    # Swarm burst: leader is prefilling [0..600) with shared system boundary at 384.
+    leader_tokens = list(range(100, 700))
+    follower_tokens = list(range(100, 484)) + list(range(900, 1020))
+    leader = Request(
+        request_id="leader",
+        prompt_token_ids=leader_tokens,
+        sampling_params=SamplingParams(
+            max_tokens=32,
+            extra_args={"prefix_cache_boundaries": [384]},
+        ),
+        pooling_params=None,
+        block_hasher=_hasher,
+    )
+    follower = Request(
+        request_id="follower",
+        prompt_token_ids=follower_tokens,
+        sampling_params=SamplingParams(
+            max_tokens=32,
+            extra_args={"prefix_cache_boundaries": [384]},
+        ),
+        pooling_params=None,
+        block_hasher=_hasher,
+    )
+
+    cm.new_step_starts()
+    comp_l, hit_l = cm.get_computed_blocks(leader)
+    assert hit_l == 0
+    stops = cm.partial_prefix_stops(leader, 0, len(leader_tokens))
+    assert stops == (384,)
+    assert cm.allocate_slots(leader, 384, 0, comp_l) is not None
+    # Follower shares both full block [0..256) and partial boundary 384 -> waits!
+    assert cm.should_wait_for_inflight_snapshot(follower, [(leader, 0, 384)]) is True
+
+    # Finish leader's 384-token boundary step -> snapshot is usable immediately
+    # in the next step AND pins its FullAttention parent block [0..256)!
+    leader.num_computed_tokens = 384
+    cm.new_step_starts()
+    assert cm.allocate_slots(leader, len(leader_tokens) - 384) is not None
+    cm.take_block_copies_with_groups()
+    leader.num_computed_tokens = len(leader_tokens)
+    leader.status = RequestStatus.FINISHED_STOPPED
+    cm.free(leader)
+
+    entry_384 = next(iter(cm.partial_cache.entries.values()))
+    assert entry_384.length == 384
+    assert len(entry_384.pinned_blocks) == 1
+    assert entry_384.pinned_blocks[0].ref_cnt >= 1
+
+    # Allocate and free unrelated traffic to churn free_block_queue, then verify
+    # follower STILL hits 384 (not degraded or invalidated due to parent eviction)!
+    for k in range(6):
+        noise = Request(
+            request_id=f"noise-{k}",
+            prompt_token_ids=[5000 + k * 500 + j for j in range(300)],
+            sampling_params=SamplingParams(max_tokens=8),
+            pooling_params=None,
+            block_hasher=_hasher,
+        )
+        cm.new_step_starts()
+        assert cm.allocate_slots(noise, 300) is not None
+        noise.num_computed_tokens = 300
+        noise.status = RequestStatus.FINISHED_STOPPED
+        cm.free(noise)
+
+    cm.new_step_starts()
+    _, hit_f = cm.get_computed_blocks(follower)
+    assert hit_f == 384
+
+    cm.reset_prefix_cache()
+    assert cm.block_pool.get_num_free_blocks() == free_initial
+
+
+def test_short_conv_blocks_zeroed_on_alloc_and_decode_ckpt_mount():
+    import torch
+
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+    from vllm.v1.request import RequestStatus
+
+    for short_conv_type in (MambaAttentionBackendEnum.SHORT_CONV, "short_conv"):
+        full = FullAttentionSpec(
+            block_size=256, num_kv_heads=1, head_size=4, dtype=torch.float16
+        )
+        gdn = MambaSpec(
+            block_size=256,
+            shapes=((4,), (4, 4)),
+            dtypes=(torch.float16, torch.float32),
+            mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+            mamba_cache_mode="align",
+        )
+        ple = MambaSpec(
+            block_size=256,
+            shapes=((13, 16),),
+            dtypes=(torch.float16,),
+            mamba_type=short_conv_type,
+            mamba_cache_mode="align",
+        )
+        config = KVCacheConfig(
+            32,
+            [],
+            [
+                KVCacheGroupSpec(["qsa"], full),
+                KVCacheGroupSpec(["gdn"], gdn),
+                KVCacheGroupSpec(["ple"], ple),
+            ],
+        )
+        cm = KVCacheManager(
+            config,
+            2048,
+            256,
+            partial_prefix_cache=True,
+            enable_decode_ckpt=True,
+        )
+        free_initial = cm.block_pool.get_num_free_blocks()
+
+        req = Request(
+            request_id="sc-zero-1",
+            prompt_token_ids=list(range(80)),
+            sampling_params=SamplingParams(max_tokens=32),
+            pooling_params=None,
+            block_hasher=lambda _r: [],
+        )
+        cm.new_step_starts()
+        allocated = cm.allocate_slots(req, 80)
+        assert allocated is not None
+        zero_ids_prefill = set(cm.take_new_block_ids())
+        assert allocated.blocks[0][0].block_id in zero_ids_prefill
+        assert allocated.blocks[2][0].block_id in zero_ids_prefill
+        assert allocated.blocks[1][0].block_id not in zero_ids_prefill
+
+        req.num_computed_tokens = 80
+        req.append_output_token_ids([501])
+        cm.new_step_starts()
+        assert cm.allocate_slots(req, 1) is not None
+        mounts = cm.take_decode_ckpt_mounts()
+        assert len(mounts) == 1
+        _, even_ids, odd_ids = mounts[0]
+        zero_ids_decode = set(cm.take_new_block_ids())
+        # Group 2 (ple short_conv) is index 1 in _mamba_group_ids=(1, 2).
+        assert even_ids[1] in zero_ids_decode
+        assert odd_ids[1] in zero_ids_decode
+        assert even_ids[0] not in zero_ids_decode
+
+        req.status = RequestStatus.FINISHED_STOPPED
+        cm.free(req)
+        cm.reset_prefix_cache()
+        assert cm.block_pool.get_num_free_blocks() == free_initial
+
+
+def test_decode_ckpt_duplicate_snapshot_defers_chosen_release():
+    import torch
+
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+    from vllm.v1.request import RequestStatus
+
+    full = FullAttentionSpec(
+        block_size=256, num_kv_heads=1, head_size=4, dtype=torch.float16
+    )
+    gdn = MambaSpec(
+        block_size=256,
+        shapes=((4,),),
+        dtypes=(torch.float16,),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        mamba_cache_mode="align",
+    )
+    config = KVCacheConfig(
+        32,
+        [],
+        [
+            KVCacheGroupSpec(["qsa"], full),
+            KVCacheGroupSpec(["gdn"], gdn),
+        ],
+    )
+    cm = KVCacheManager(
+        config,
+        2048,
+        256,
+        partial_prefix_cache=True,
+        enable_decode_ckpt=True,
+    )
+    free_initial = cm.block_pool.get_num_free_blocks()
+
+    prompt = list(range(90))
+    out_tail = list(range(900, 950))
+    r1 = Request(
+        request_id="dup-1",
+        prompt_token_ids=list(prompt),
+        sampling_params=SamplingParams(max_tokens=64),
+        pooling_params=None,
+        block_hasher=lambda _r: [],
+    )
+    r2 = Request(
+        request_id="dup-2",
+        prompt_token_ids=list(prompt),
+        sampling_params=SamplingParams(max_tokens=64),
+        pooling_params=None,
+        block_hasher=lambda _r: [],
+    )
+    cm.new_step_starts()
+    assert cm.allocate_slots(r1, 90) is not None
+    assert cm.allocate_slots(r2, 90) is not None
+    r1.num_computed_tokens = 90
+    r2.num_computed_tokens = 90
+    r1.append_output_token_ids([899])
+    r2.append_output_token_ids([899])
+
+    cm.new_step_starts()
+    assert cm.allocate_slots(r1, 1) is not None
+    assert cm.allocate_slots(r2, 1) is not None
+    mounts = dict((rid, (ev, od)) for rid, ev, od in cm.take_decode_ckpt_mounts())
+    r2_even_blk_id = mounts["dup-2"][0][0]
+
+    r1.append_output_token_ids(out_tail)
+    r2.append_output_token_ids(out_tail)
+    r1.num_computed_tokens = 140
+    r2.num_computed_tokens = 140
+    r1.status = RequestStatus.FINISHED_STOPPED
+    r2.status = RequestStatus.FINISHED_STOPPED
+    cm.free(r1)
+    cm.free(r2)
+
+    # Next step materializes dup-1 at boundary=128 and skips dup-2 via cache.contains;
+    # dup-2's chosen_mamba block must stay held in _deferred_release for 3 steps.
+    cm.new_step_starts()
+    r2_even_blk = cm.block_pool.blocks[r2_even_blk_id]
+    assert r2_even_blk.ref_cnt >= 1
+    cm.new_step_starts()
+    assert r2_even_blk.ref_cnt >= 1
+    cm.new_step_starts()
+    assert r2_even_blk.ref_cnt >= 1
+    cm.new_step_starts()
+    assert r2_even_blk.ref_cnt == 0
+
+    cm.reset_prefix_cache()
+    assert cm.block_pool.get_num_free_blocks() == free_initial
+
+
+def test_spec_decode_crosses_2048_mamba_block_and_hits_full_and_partial_on_turn2():
+    import torch
+
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+    from vllm.v1.request import RequestStatus
+
+    full = FullAttentionSpec(
+        block_size=256, num_kv_heads=1, head_size=4, dtype=torch.float16
+    )
+    mamba = MambaSpec(
+        block_size=2048,
+        shapes=((4,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+    )
+    config = KVCacheConfig(
+        64,
+        [],
+        [
+            KVCacheGroupSpec(["qsa"], full),
+            KVCacheGroupSpec(["gdn"], mamba),
+        ],
+    )
+    cm = KVCacheManager(
+        config,
+        8192,
+        256,
+        prefix_cache_retention_interval=8192,
+        partial_prefix_cache=True,
+        enable_decode_ckpt=True,
+    )
+    free_initial = cm.block_pool.get_num_free_blocks()
+
+    def _hasher(req):
+        start = len(req.block_hashes) * 256
+        return [
+            BlockHash(
+                bytes(((x * 131 + i) % 256) for x in req.all_token_ids[i : i + 256])
+            )
+            for i in range(start, len(req.all_token_ids) // 256 * 256, 256)
+        ]
+
+    # Turn 1: prompt=1980 (< 2048), speculative decode steps cross 2048 up to 2120.
+    prompt_ids = list(range(1000, 2980))
+    t1 = Request(
+        request_id="spec-t1",
+        prompt_token_ids=prompt_ids,
+        sampling_params=SamplingParams(
+            max_tokens=256,
+            extra_args={"prefix_cache_boundaries": [1975]},
+        ),
+        pooling_params=None,
+        block_hasher=_hasher,
+    )
+    cm.new_step_starts()
+    assert cm.allocate_slots(t1, 1980) is not None
+    t1.num_computed_tokens = 1980
+    t1.append_output_token_ids([5000])
+
+    cur = 1980
+    next_tok = 5001
+    while cur < 2120:
+        cm.new_step_starts()
+        draft = list(range(next_tok, next_tok + 7))
+        assert cm.allocate_slots(t1, 1 + len(draft), num_lookahead_tokens=len(draft))
+        cm.take_decode_ckpt_mounts()
+        t1.num_computed_tokens = cur + 8
+        t1.append_output_token_ids(list(range(next_tok, next_tok + 8)))
+        cur += 8
+        next_tok += 8
+
+    t1.status = RequestStatus.FINISHED_STOPPED
+    cm.free(t1)
+
+    cm.new_step_starts()
+    t2_tokens = list(t1.all_token_ids[:2120]) + list(range(9000, 9160))
+    t2 = Request(
+        request_id="spec-t2",
+        prompt_token_ids=t2_tokens,
+        sampling_params=SamplingParams(
+            max_tokens=64,
+            extra_args={"prefix_cache_boundaries": [len(t2_tokens) - 5]},
+        ),
+        pooling_params=None,
+        block_hasher=_hasher,
+    )
+    comp_blocks, hit = cm.get_computed_blocks(t2)
+    assert hit == 2112
+    assert cm.partial_prefix_stops(t2, hit, len(t2_tokens)) == ()
+    assert cm.allocate_slots(t2, len(t2_tokens) - hit, hit, comp_blocks) is not None
+    t2.status = RequestStatus.FINISHED_ABORTED
+    cm.free(t2)
+
+    for _ in range(4):
+        cm.new_step_starts()
+    cm.reset_prefix_cache()
+    assert cm.block_pool.get_num_free_blocks() == free_initial
+
+
+def test_partial_cache_dedups_pinned_blocks_and_protects_active_hit_on_eviction():
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.partial_prefix_cache import PartialEntry, PartialPrefixCache
+
+    pool = BlockPool(num_gpu_blocks=32, enable_caching=True, hash_block_size=256)
+    cache = PartialPrefixCache(block_pool=pool, max_blocks=20)
+    parent_a, parent_b, sys_blk, t0, t1_blk, t2_blk = pool.get_new_blocks(6)
+
+    sys_entry = PartialEntry(
+        key=(None, (1, 2, 3), None, 0, ()),
+        length=3,
+        blocks=((sys_blk,),),
+        copy_last=(True,),
+        ready_step=0,
+        pinned_blocks=(),
+    )
+    cache.insert(sys_entry)
+    sys_entry.hit_count = 1
+
+    turn_entries = []
+    for i, tail in enumerate((t0, t1_blk, t2_blk)):
+        for p in (parent_a, parent_b):
+            p.ref_cnt += 1
+        ent = PartialEntry(
+            key=(None, tuple(range(100 + i)), None, 0, ()),
+            length=100 + i,
+            blocks=((tail,),),
+            copy_last=(True,),
+            ready_step=0,
+            pinned_blocks=(parent_a, parent_b),
+        )
+        cache.insert(ent)
+        turn_entries.append(ent)
+    # 1 (sys_blk) + 3 (tails) + 2 (deduped parent_a, parent_b) == 6 blocks!
+    assert cache.num_blocks == 6
+
+    assert cache.evict_one(protected=turn_entries[0]) is True
+    assert sys_entry.key in cache.entries
+    assert turn_entries[0].key in cache.entries
+    assert turn_entries[1].key not in cache.entries
+    assert parent_a.ref_cnt == 3 and parent_b.ref_cnt == 3
+
+
+def test_agent_prefix_boundaries_and_decoded_span_splicing():
+    from vllm.entrypoints.openai.chat_completion.serving import (
+        _AssistantReasoningCache,
+        _PrefixCacheBoundaries,
+    )
+
+    class _MockChatTokenizer:
+        chat_template = "Supported types are xhigh, high, medium, low"
+
+        def get_vocab(self):
+            return {
+                "<|im_start|>": 1,
+                "<|im_end|>": 2,
+                "<think>": 3,
+                "</think>": 4,
+            }
+
+        def encode(self, text: str, add_special_tokens: bool = False):
+            if text == "\n":
+                return [10]
+            return [100 + (ord(ch) % 90) for ch in text]
+
+        def apply_chat_template(
+            self,
+            messages,
+            tools=None,
+            chat_template=None,
+            add_generation_prompt=False,
+            tokenize=True,
+            **kwargs,
+        ):
+            if kwargs.get("reasoning_effort") in ("max", "minimal", "none"):
+                raise ValueError(f"Unsupported effort: {kwargs['reasoning_effort']}")
+            ids: list[int] = []
+            if tools:
+                ids.extend([50] * 140)
+            for msg in messages:
+                ids.append(1)
+                role = msg.get("role", "")
+                ids.extend(self.encode(role))
+                ids.append(10)
+                if role == "assistant":
+                    ids.append(3)
+                    ids.append(10)
+                    rc = (
+                        msg.get("reasoning_content") or msg.get("reasoning") or ""
+                    ).strip()
+                    if rc:
+                        ids.extend(self.encode(rc))
+                    ids.append(10)
+                    ids.append(4)
+                    ids.append(10)
+                    ids.append(10)
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict):
+                            ids.extend(self.encode(part.get("text", "")))
+                elif isinstance(content, str):
+                    ids.extend(
+                        self.encode(content.strip() if role == "assistant" else content)
+                    )
+                if role == "tool":
+                    ids.extend(self.encode(msg.get("tool_call_id", "")))
+                ids.append(2)
+                ids.append(10)
+            if add_generation_prompt:
+                ids.extend([1, 101, 10, 3, 10])
+            return ids
+
+    tok = _MockChatTokenizer()
+    bounds = _PrefixCacheBoundaries()
+    rcache = _AssistantReasoningCache()
+
+    sys_msg = {
+        "role": "system",
+        "content": [
+            {"type": "text", "text": "S" * 80, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "D" * 40},
+        ],
+    }
+    user_1 = {"role": "user", "content": [{"type": "text", "text": "Inspect repo"}]}
+    tools = [{"type": "function", "function": {"name": "read_file"}}]
+    kwargs = {"reasoning_effort": "max"}
+    t1_msgs = [sys_msg, user_1]
+    t1_prompt = tok.apply_chat_template(
+        t1_msgs, tools=tools, add_generation_prompt=True, reasoning_effort="xhigh"
+    )
+    gen_suffix = bounds._generation_prompt(tok, tok.chat_template, kwargs)
+    assert gen_suffix == (1, 101, 10, 3, 10)
+    b1 = bounds(
+        tok,
+        None,
+        t1_prompt,
+        tok.chat_template,
+        kwargs,
+        messages=t1_msgs,
+        tools=tools,
+    )
+    assert 141 in b1
+    assert 228 in b1
+    assert len(t1_prompt) - len(gen_suffix) in b1
+
+    decoded_out = [10] + tok.encode("plan") + [10, 4, 10, 10] + tok.encode("OK") + [2]
+    rcache.record(
+        t1_msgs,
+        "OK",
+        [],
+        "\nplan",
+        prompt_token_ids=t1_prompt,
+        output_token_ids=decoded_out,
+        gen_suffix=gen_suffix,
+        im_end_id=2,
+        nl_ids=(10,),
+    )
+
+    t2_msgs = [
+        sys_msg,
+        user_1,
+        {"role": "assistant", "content": "OK"},
+        {"role": "tool", "tool_call_id": "call_1", "content": "file contents"},
+    ]
+    rerendered_t2 = tok.apply_chat_template(
+        [
+            sys_msg,
+            user_1,
+            {"role": "assistant", "content": "OK", "reasoning_content": "\nplan"},
+            t2_msgs[3],
+        ],
+        tools=tools,
+        add_generation_prompt=True,
+        reasoning_effort="xhigh",
+    )
+    expected_decode_prefix = list(t1_prompt) + decoded_out + [10]
+    assert rerendered_t2[: len(expected_decode_prefix)] != expected_decode_prefix
+
+    spliced_t2 = rcache.splice_prompt_tokens(t2_msgs, rerendered_t2, tok)
+    assert spliced_t2[: len(expected_decode_prefix)] == expected_decode_prefix
+    b2 = bounds(
+        tok,
+        None,
+        spliced_t2,
+        tok.chat_template,
+        kwargs,
+        messages=t2_msgs,
+        tools=tools,
+    )
+    assert len(expected_decode_prefix) in b2
+
+
+def test_reasoning_cache_rolling_digests_multimodal_isolation_and_placeholder_shift():
+    from dataclasses import dataclass
+
+    from vllm.entrypoints.openai.chat_completion.serving import _AssistantReasoningCache
+
+    @dataclass
+    class _FakePlaceholder:
+        offset: int
+        length: int
+        is_embed: object = None
+
+    class _MockTok:
+        def get_vocab(self):
+            return {"<|im_start|>": 1, "<|im_end|>": 2, "<think>": 3}
+
+        def encode(self, text: str, add_special_tokens: bool = False):
+            return [10] if text == "\n" else [ord(c) for c in text]
+
+    tok = _MockTok()
+    rcache = _AssistantReasoningCache()
+
+    img_a_user = {
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+            {"type": "text", "text": "What is in this image?"},
+        ],
+    }
+    img_b_user = {
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBB"}},
+            {"type": "text", "text": "What is in this image?"},
+        ],
+    }
+    assert rcache._context_digest([img_a_user]) != rcache._context_digest([img_b_user])
+
+    prompt_a = [1, 50, 99, 99, 99, 2, 10, 1, 60, 10, 3, 10]
+    gen_sfx = (1, 60, 10, 3, 10)
+    out_a = [10, 77, 78, 2]  # 4 tokens (1 extra leading newline token)
+    rcache.record(
+        [img_a_user],
+        "A cat",
+        [],
+        "saw ears",
+        prompt_token_ids=prompt_a,
+        output_token_ids=out_a,
+        gen_suffix=gen_sfx,
+        im_end_id=2,
+        nl_ids=(10,),
+    )
+    assert rcache.lookup([img_a_user], "A cat", []) == "saw ears"
+    # Distinct image with identical text must NOT collide!
+    assert rcache.lookup([img_b_user], "A cat", []) is None
+
+    # Verify O(L) prefix_digests matches _context_digest(messages[:i]) for every i.
+    conv = [
+        img_a_user,
+        {"role": "assistant", "content": "A cat"},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,CCC"},
+                },
+                {"type": "text", "text": "Compare with this second image"},
+            ],
+        },
+    ]
+    rolling = rcache.prefix_digests(conv)
+    assert rolling == [rcache._context_digest(conv[:i]) for i in range(len(conv))]
+
+    # Turn 2 has a historical image at offset 2 AND a new image after assistant_1.
+    # Re-rendered assistant_1 dropped token 10 (length 8 instead of 9 -> delta = +1).
+    rerendered_t2 = (
+        [1, 50, 99, 99, 99, 2, 10]  # prefix_len = 7
+        + [1, 60, 10, 3, 10, 77, 78, 2, 10]  # 9 tokens -> wait: cached span is 5+4+1=10
+        + [1, 50, 88, 88, 88, 88, 2, 10]  # Turn 2 user with 4-token image at 7+9+2=18
+        + [1, 60, 10, 3, 10]
+    )
+    mm_placeholders = {
+        "image": [
+            _FakePlaceholder(offset=2, length=3),
+            _FakePlaceholder(offset=18, length=4),
+        ]
+    }
+    spliced = rcache.splice_prompt_tokens(
+        conv, rerendered_t2, tok, mm_placeholders=mm_placeholders
+    )
+    assert len(spliced) == len(rerendered_t2) + 1
+    # Earlier placeholder unchanged; trailing placeholder shifted by +1!
+    assert mm_placeholders["image"][0].offset == 2
+    assert mm_placeholders["image"][1].offset == 19
+    assert spliced[19 : 19 + 4] == [88, 88, 88, 88]
+
+
+def test_prefix_tokenize_cache_exact_parity_and_incremental_encode():
+    from vllm.renderers.base import _PrefixTokenizeCache
+
+    class _CountingChatTokenizer:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get_vocab(self):
+            return {"<|im_start|>": 1000, "<|im_end|>": 1001}
+
+        def encode(self, text: str, **kwargs) -> list[int]:
+            self.calls.append(text)
+            out: list[int] = []
+            idx = 0
+            while idx < len(text):
+                if text.startswith("<|im_start|>", idx):
+                    out.append(1000)
+                    idx += len("<|im_start|>")
+                elif text.startswith("<|im_end|>", idx):
+                    out.append(1001)
+                    idx += len("<|im_end|>")
+                else:
+                    out.append(ord(text[idx]))
+                    idx += 1
+            return out
+
+    tok = _CountingChatTokenizer()
+    cache = _PrefixTokenizeCache(tok)
+    assert cache.enabled
+    tok.calls.clear()
+
+    sys_part = "<|im_start|>system\n" + ("S" * 1800) + "<|im_end|>\n"
+    u1_part = "<|im_start|>user\n" + ("U" * 600) + "<|im_end|>\n"
+    gen_part = "<|im_start|>assistant\n<think>\n"
+    t1_text = sys_part + u1_part + gen_part
+
+    plan1 = cache.plan(t1_text, {"add_special_tokens": False})
+    assert plan1 is not None
+    starts1, ckpts1, hit1 = plan1
+    assert hit1 == -1
+    ids1 = tok.encode(t1_text, add_special_tokens=False)
+    cache.record_full(starts1, ckpts1, ids1)
+    assert len(tok.calls) == 1
+
+    # Turn 2 appends assistant_1 + tool_1 + gen_part; prefix cache must hit sys+u1!
+    a1_part = "<|im_start|>assistant\n<think>\nok\n</think>\nhi<|im_end|>\n"
+    u2_part = "<|im_start|>user\nfollow up<|im_end|>\n"
+    t2_text = sys_part + u1_part + a1_part + u2_part + gen_part
+
+    tok.calls.clear()
+    plan2 = cache.plan(t2_text, {"add_special_tokens": False})
+    assert plan2 is not None
+    starts2, ckpts2, hit2 = plan2
+    assert hit2 >= 0
+    _, hit_pos, hit_digest = ckpts2[hit2]
+    assert hit_pos == len(sys_part + u1_part)
+    tail_ids = tok.encode(t2_text[hit_pos:], add_special_tokens=False)
+    assert tok.calls == [a1_part + u2_part + gen_part]
+    ids2 = cache.lookup(hit_digest) + tail_ids
+    cache.record_full(starts2, ckpts2, ids2, hit2)
+
+    ref_tok = _CountingChatTokenizer()
+    assert ids2 == ref_tok.encode(t2_text, add_special_tokens=False)
+
+
+def test_sm70_vision_default_unlimited_images_and_vit_sdpa_order():
+    from vllm.config.multimodal import UNLIMITED_MM_ITEMS_PER_PROMPT, MultiModalConfig
+    from vllm.platforms.cuda import CudaPlatform
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    mm = MultiModalConfig()
+    assert mm.get_limit_per_prompt("image") == UNLIMITED_MM_ITEMS_PER_PROMPT
+    backends = CudaPlatform.get_supported_vit_attn_backends()
+    assert AttentionBackendEnum.TORCH_SDPA in backends

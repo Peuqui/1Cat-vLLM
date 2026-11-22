@@ -52,12 +52,12 @@ class CompletionRequest(OpenAIBaseModel):
         | None
     ) = None
     echo: bool | None = False
-    frequency_penalty: float | None = 0.0
+    frequency_penalty: float | None = None
     logit_bias: dict[str, float] | None = None
     logprobs: int | None = None
     max_tokens: int | None = 16
     n: int = 1
-    presence_penalty: float | None = 0.0
+    presence_penalty: float | None = None
     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)
     stop: str | list[str] | None = []
     stream: bool | None = False
@@ -212,6 +212,8 @@ class CompletionRequest(OpenAIBaseModel):
     # Default sampling parameters for completion requests
     _DEFAULT_SAMPLING_PARAMS: dict = {
         "repetition_penalty": 1.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
         "temperature": 1.0,
         "top_p": 1.0,
         "top_k": 0,
@@ -248,14 +250,37 @@ class CompletionRequest(OpenAIBaseModel):
             default_sampling_params = {}
 
         # Default parameters
-        if (repetition_penalty := self.repetition_penalty) is None:
-            repetition_penalty = default_sampling_params.get(
-                "repetition_penalty",
-                self._DEFAULT_SAMPLING_PARAMS["repetition_penalty"],
-            )
         if (temperature := self.temperature) is None:
             temperature = default_sampling_params.get(
                 "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"]
+            )
+        greedy = temperature < 1e-5
+        if (presence_penalty := self.presence_penalty) is None:
+            presence_penalty = (
+                self._DEFAULT_SAMPLING_PARAMS["presence_penalty"]
+                if greedy
+                else default_sampling_params.get(
+                    "presence_penalty",
+                    self._DEFAULT_SAMPLING_PARAMS["presence_penalty"],
+                )
+            )
+        if (frequency_penalty := self.frequency_penalty) is None:
+            frequency_penalty = (
+                self._DEFAULT_SAMPLING_PARAMS["frequency_penalty"]
+                if greedy
+                else default_sampling_params.get(
+                    "frequency_penalty",
+                    self._DEFAULT_SAMPLING_PARAMS["frequency_penalty"],
+                )
+            )
+        if (repetition_penalty := self.repetition_penalty) is None:
+            repetition_penalty = (
+                self._DEFAULT_SAMPLING_PARAMS["repetition_penalty"]
+                if greedy
+                else default_sampling_params.get(
+                    "repetition_penalty",
+                    self._DEFAULT_SAMPLING_PARAMS["repetition_penalty"],
+                )
             )
         if (top_p := self.top_p) is None:
             top_p = default_sampling_params.get(
@@ -314,8 +339,8 @@ class CompletionRequest(OpenAIBaseModel):
             extra_args["kv_transfer_params"] = self.kv_transfer_params
         return SamplingParams.from_optional(
             n=self.n,
-            presence_penalty=self.presence_penalty,
-            frequency_penalty=self.frequency_penalty,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
             temperature=temperature,
             top_p=top_p,

@@ -137,6 +137,12 @@ class V41DraftAttention(V41Attention):
 
 
 class V41DraftMoE(V41MoE):
+    def __init__(self, vllm_config, prefix):
+        super().__init__(vllm_config, prefix)
+        # The drafter never routes image rows (the reference MTP takes no
+        # image mask): its checkpoint VL bias is not loaded.
+        self.gate.bias_vl = None
+
     def forward(self, x):
         routed, shared = self.experts.forward_partials(
             hidden_states=x, router_logits=self._draft_gate(x)
@@ -505,13 +511,29 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
                 return q8_channel_linear(x, head, self.lm_head.weight.shape[0])
         return self.lm_head.quant_method.apply(self.lm_head, x, bias=None)
 
-    def _greedy_draft(self, hidden_states, anchor):
+    def _greedy_draft(
+        self, hidden_states, anchor, c_keys=None, c_pos=None, c_temps=None
+    ):
         if self._markov_shard is not None:
+            from vllm.v1.spec_decode.coupled_draw import DRAFT_TEMP_SCALE
+
             if anchor.numel() > 1:  # VLLM_V41_BATCH: one anchor per request
                 return self._markov_shard.call_batch(
-                    self.local_logits(hidden_states), anchor
+                    self.local_logits(hidden_states),
+                    anchor,
+                    c_keys,
+                    c_pos,
+                    c_temps,
+                    DRAFT_TEMP_SCALE,
                 )
-            return self._markov_shard(self.local_logits(hidden_states), anchor)
+            return self._markov_shard(
+                self.local_logits(hidden_states),
+                anchor,
+                c_keys,
+                c_pos,
+                c_temps,
+                DRAFT_TEMP_SCALE,
+            )
         logits = self.compute_logits(hidden_states)
         if self._markov is not None:
             return self._markov(logits, anchor)
@@ -525,12 +547,28 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             tokens.append(previous)
         return torch.stack(tokens, dim=1).reshape(-1)
 
-    def greedy_draft_tokens(self, hidden_states, anchor):
+    def greedy_draft_tokens(
+        self, hidden_states, anchor, c_keys=None, c_pos=None, c_temps=None
+    ):
         if self.greedy_graph is None:
             return None
         if anchor.numel() > 1 and self._markov_shard is None:
             return None  # batched drafts need the sharded Markov head
-        return self.greedy_graph(hidden_states, anchor)
+        if c_keys is not None and (
+            self._markov_shard is None or not self._markov_shard._cuda_ready
+        ):
+            return None
+        return self._valid_drafts(
+            self.greedy_graph(hidden_states, anchor, c_keys, c_pos, c_temps)
+        )
+
+    def _valid_drafts(self, ids):
+        """An all-NaN draft step yields 2**31 - 1 (as upstream); the target
+        must never read it (embedding, Engram hash). Out-of-vocabulary drafts
+        become token 0: verification rejects them unless the target itself
+        picks 0, so the output is the target's either way."""
+        vocab = self.model.markov_embed.num_embeddings
+        return torch.where((ids >= 0) & (ids < vocab), ids, torch.zeros_like(ids))
 
     def coupled_draft_tokens(
         self, base_logits, prev, temperature, keys, positions, scale
@@ -564,7 +602,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         ).squeeze(-1)
 
     def map_draft_to_target(self, ids):
-        return ids
+        return self._valid_drafts(ids)
 
     def skip_checkpoint_weight(self, name):
         return draft_weight_name(name) is None
@@ -660,6 +698,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         assert shard is not None
         failures, cases = self._markov_shard_check(shard)
         self._markov_shard_agree(failures, "self-check failed")
+        shard.enable_cuda()
         self._markov_shard = shard
         # Only after the bitwise self-check: the FP8 draft head is lossy.
         self._fp8_ready = _DRAFT_HEAD_FP8

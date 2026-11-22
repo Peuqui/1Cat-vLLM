@@ -43,7 +43,10 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         chat_kwargs = kwargs.get("chat_template_kwargs", {}) or {}
         # Qwen3 defaults to thinking enabled; only treat output as
         # pure content when the user explicitly disables it.
-        self.thinking_enabled = chat_kwargs.get("enable_thinking", True)
+        effort = chat_kwargs.get("reasoning_effort")
+        self.thinking_enabled = (
+            chat_kwargs.get("enable_thinking", True) is not False and effort != "none"
+        )
 
         self._tool_call_tag = "<tool_call>"
         self._tool_call_token_id = self.vocab.get(self._tool_call_tag)
@@ -112,6 +115,16 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             return input_ids[tool_call_index:]
         return []
 
+    strip_post_reasoning_newlines: int = 2
+
+    @staticmethod
+    def _strip_post_end_newlines(text: str, limit: int = 2) -> tuple[str, int]:
+        removed = 0
+        while removed < limit and text.startswith("\n"):
+            text = text[1:]
+            removed += 1
+        return text, removed
+
     def extract_reasoning(
         self, model_output: str, request: "ChatCompletionRequest | ResponsesRequest"
     ) -> tuple[str | None, str | None]:
@@ -141,6 +154,9 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
 
         if self.end_token in model_output:
             reasoning, _, content = model_output.partition(self.end_token)
+            content, _ = self._strip_post_end_newlines(
+                content, self.strip_post_reasoning_newlines
+            )
             return reasoning, content or None
 
         if not self.thinking_enabled:
@@ -151,7 +167,20 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         tool_call_index = model_output.find(self._tool_call_tag)
         if tool_call_index != -1:
             reasoning = model_output[:tool_call_index]
-            content = model_output[tool_call_index:]
+            tool_choice = getattr(request, "tool_choice", None)
+            has_tools = bool(getattr(request, "tools", None))
+            has_structured_json = (
+                getattr(request, "response_format", None) is not None
+                and (not has_tools or tool_choice == "none")
+            ) or tool_choice not in (None, "auto", "none")
+            if has_structured_json:
+                content = model_output[
+                    tool_call_index + len(self._tool_call_tag) :
+                ].lstrip()
+                if content.endswith(self._tool_call_end_tag):
+                    content = content[: -len(self._tool_call_end_tag)].rstrip()
+            else:
+                content = model_output[tool_call_index:]
             return reasoning or None, content or None
         # Thinking enabled but no </think>: output was truncated.
         # Everything generated so far is reasoning.
@@ -191,6 +220,12 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             if end_index >= 0:
                 reasoning = delta_text[:end_index]
                 content = delta_text[end_index + len(self.end_token) :]
+                content, removed = self._strip_post_end_newlines(
+                    content, self.strip_post_reasoning_newlines
+                )
+                self._remaining_post_end_newlines = (
+                    0 if content else self.strip_post_reasoning_newlines - removed
+                )
                 if not reasoning and not content:
                     return None
                 return DeltaMessage(

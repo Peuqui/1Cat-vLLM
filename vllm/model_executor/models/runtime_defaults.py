@@ -92,7 +92,7 @@ def _configure_sm70_dflash2_graph_cache(
         or model_config.quantization != "compressed-tensors"
         or not model_config.is_nvfp4_quantized()
         or parallel_config.tensor_parallel_size != 4
-        or cache_config.cache_dtype != "fp8_e4m3"
+        or cache_config.cache_dtype not in ("fp8_e4m3", "int8", "int8_per_token_head")
     ):
         return False
     # The E4M3 release contract passes cold/warm quality with this cache path.
@@ -375,6 +375,32 @@ def apply_runtime_defaults(cfg, defaults, phase: str, *, is_sm70: bool):
         return qualified
     if phase == "prefill":
         if (
+            is_sm70
+            and _is_sm70_qwen38_decode_compile_contract(
+                cfg.model_config, cfg.speculative_config, cfg.parallel_config
+            )
+            and cfg.parallel_config.tensor_parallel_size == 4
+            and cfg.parallel_config.pipeline_parallel_size == 1
+            and cfg.parallel_config.decode_context_parallel_size in (1, 2)
+            and cfg.parallel_config.prefill_context_parallel_size == 1
+            and getattr(cfg.model_config, "quantization", None)
+            in ("gguf", "modelopt", "modelopt_fp4")
+        ):
+            layers = cfg.kernel_config.layer_execution
+            if layers.sources.get("hc_prefill_sequence_parallel") != "typed":
+                layers.hc_prefill_sequence_parallel = True
+                layers.sources["hc_prefill_sequence_parallel"] = "default:model.prefill"
+            if layers.sources.get("hc_prefill_peer_norm") != "typed":
+                layers.hc_prefill_peer_norm = True
+                layers.sources["hc_prefill_peer_norm"] = "default:model.prefill"
+            if layers.sources.get("ple_prefill_conv") != "typed":
+                layers.ple_prefill_conv = True
+                layers.sources["ple_prefill_conv"] = "default:model.prefill"
+            sparse = cfg.kernel_config.sm70_sparse
+            if sparse.sources.get("qsa_prefill_tp_rows") != "typed":
+                sparse.qsa_prefill_tp_rows = True
+                sparse.sources["qsa_prefill_tp_rows"] = "default:model.prefill"
+        if (
             defaults.value("VLLM_FLASH_V100_BFLA_PREFILL")
             and cfg.model_config is not None
             and "VLLM_FLASH_V100_BFLA_KEEP_RATIO" not in defaults
@@ -513,3 +539,16 @@ def prefer_native_mtp_runner(cfg) -> bool:
     except Exception:
         return False
     return capability is not None and (capability.major, capability.minor) == (7, 0)
+
+
+def default_hybrid_server_max_num_seqs(
+    text_config: Any,
+    dev_bytes: int,
+) -> int | None:
+    """Bound default max_num_seqs for 32 GiB Qwen4Exp hybrid serving."""
+    if getattr(text_config, "model_type", None) in (
+        "qwen4_exp",
+        "qwen4_exp_text",
+    ) and 0 < dev_bytes <= 34 * (1 << 30):
+        return 8
+    return None

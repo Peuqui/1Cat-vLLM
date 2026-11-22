@@ -6,6 +6,14 @@ from collections.abc import Sequence
 from typing import Any
 
 import regex as re
+from xgrammar import Grammar, StructuralTag
+from xgrammar.structural_tag import (
+    OptionalFormat,
+    RegexFormat,
+    SequenceFormat,
+    TagFormat,
+    TagsWithSeparatorFormat,
+)
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
@@ -370,9 +378,10 @@ class Qwen3CoderToolParser(ToolParser):
             if param_value.endswith("\n"):
                 param_value = param_value[:-1]
 
-            param_dict[param_name] = self._convert_param_value(
-                param_value, param_name, param_config, function_name
-            )
+            if param_name not in param_dict:
+                param_dict[param_name] = self._convert_param_value(
+                    param_value, param_name, param_config, function_name
+                )
         return ToolCall(
             type="function",
             function=FunctionCall(
@@ -730,28 +739,18 @@ class Qwen3CoderToolParser(ToolParser):
         if json_delta is not None:
             return json_delta
 
-        # Check if we need to advance to next tool
-        if self.json_closed and not self.in_function:
-            # Check if this tool call has ended
-            tool_ends = current_text.count(self.tool_call_end_token)
-            if tool_ends > self._current_tool_block():
-                # This tool has ended, advance to next
-                self.current_tool_index += 1
-                self.header_sent = False
-                self.param_count = 0
-                self.in_param = False
-                self.param_raw_streamed = 0
-                self.json_started = False
-                self.json_closed = False
-                self.accumulated_params = {}
-
-                # Check if there are more tool calls
-                tool_starts = current_text.count(self.tool_call_start_token)
-                if self._current_tool_block() >= tool_starts:
-                    # No more tool calls
-                    self.is_tool_call_started = False
-                # Continue processing next tool
+        # Check if we need to advance past a completed tool block.
+        if (
+            self._advance_closed_tool_block(current_text)
+            and not self.is_tool_call_started
+        ):
+            if delta_text.strip() == "":
                 return None
+            tail = current_text[self.content_search_start :]
+            held_prefix = self._trailing_tool_marker_prefix(current_text)
+            if held_prefix:
+                tail = tail[: -len(held_prefix)]
+            return DeltaMessage(content=tail) if tail else None
 
         # Handle normal content before tool calls
         if not self.is_tool_call_started:
@@ -769,15 +768,22 @@ class Qwen3CoderToolParser(ToolParser):
             tool_start = min(tool_start_candidates) if tool_start_candidates else -1
             if self.tool_call_start_token_id in delta_token_ids or tool_start != -1:
                 self.is_tool_call_started = True
-                # Return any content before the tool call
+                content_before = ""
                 if tool_start > len(previous_text):
                     content_before = (
                         self._trailing_tool_marker_prefix(previous_text)
                         + delta_text[: tool_start - len(previous_text)]
                     )
-                    if content_before:
-                        return DeltaMessage(content=content_before)
-                return None
+                drained = self._drain_tool_blocks(current_text)
+                if content_before:
+                    merged_content = content_before + (
+                        drained.content if drained and drained.content else ""
+                    )
+                    return DeltaMessage(
+                        content=merged_content,
+                        tool_calls=drained.tool_calls if drained else [],
+                    )
+                return drained
             else:
                 pending_prefix = self._pending_tool_marker_delta_prefix(
                     previous_text, current_text, delta_text
@@ -796,7 +802,86 @@ class Qwen3CoderToolParser(ToolParser):
                 # Normal content, no tool call
                 return DeltaMessage(content=delta_text)
 
-        return self._stream_current_tool_block(current_text)
+        return self._drain_tool_blocks(current_text)
+
+    def _advance_closed_tool_block(self, current_text: str) -> bool:
+        """Advance state when the current tool block's closing tag has arrived."""
+        if not (self.json_closed and not self.in_function):
+            return False
+        starts = self._tool_start_positions(current_text)
+        block_idx = self._current_tool_block()
+        if block_idx >= len(starts):
+            return False
+        end_idx = current_text.find(self.tool_call_end_token, starts[block_idx])
+        if end_idx == -1:
+            return False
+        self.content_search_start = end_idx + len(self.tool_call_end_token)
+        self.current_tool_index += 1
+        self.header_sent = False
+        self.param_count = 0
+        self.in_param = False
+        self.param_raw_streamed = 0
+        self.json_started = False
+        self.json_closed = False
+        self.accumulated_params = {}
+        self.is_tool_call_started = self._current_tool_block() < len(starts)
+        return True
+
+    @staticmethod
+    def _append_delta_tool_call(
+        acc: list[DeltaToolCall], incoming: DeltaToolCall
+    ) -> None:
+        for idx, prev in enumerate(acc):
+            if prev.index == incoming.index:
+                prev_fn = prev.function
+                inc_fn = incoming.function
+                merged_name = (prev_fn.name if prev_fn and prev_fn.name else None) or (
+                    inc_fn.name if inc_fn and inc_fn.name else None
+                )
+                merged_args = ((prev_fn.arguments or "") if prev_fn else "") + (
+                    (inc_fn.arguments or "") if inc_fn else ""
+                )
+                acc[idx] = DeltaToolCall(
+                    index=prev.index,
+                    id=prev.id or incoming.id,
+                    type=prev.type or incoming.type,
+                    function=DeltaFunctionCall(
+                        name=merged_name,
+                        arguments=merged_args,
+                    ),
+                )
+                return
+        acc.append(incoming)
+
+    def _drain_tool_blocks(self, current_text: str) -> DeltaMessage | None:
+        """Drain all tool progress available in ``current_text`` across bursts."""
+        tool_calls: list[DeltaToolCall] = []
+        content_parts: list[str] = []
+        while self.is_tool_call_started:
+            msg = self._stream_current_tool_block(current_text)
+            if msg is not None:
+                if msg.content:
+                    content_parts.append(msg.content)
+                for tc in msg.tool_calls or []:
+                    self._append_delta_tool_call(tool_calls, tc)
+            starts = self._tool_start_positions(current_text)
+            block_idx = self._current_tool_block()
+            if (
+                msg is not None
+                and self.in_function
+                and not self.json_closed
+                and block_idx < len(starts)
+                and self.function_end_token in current_text[starts[block_idx] :]
+            ):
+                continue
+            if not self._advance_closed_tool_block(current_text):
+                break
+        if not tool_calls and not content_parts:
+            return None
+        return DeltaMessage(
+            content="".join(content_parts) if content_parts else None,
+            tool_calls=tool_calls,
+        )
 
     def _stream_current_tool_block(self, current_text: str) -> DeltaMessage | None:
         """Stream the progress of the <tool_call> block the parser is in."""
@@ -989,6 +1074,11 @@ class Qwen3CoderToolParser(ToolParser):
                         # Recover a missing final close before function/tool end.
                         value_end = container_end
                     else:
+                        if (
+                            not self.in_param
+                            and current_param_name in self.accumulated_params
+                        ):
+                            break
                         if self._is_streamable_string_param(
                             current_param_name, param_config
                         ):
@@ -1005,7 +1095,7 @@ class Qwen3CoderToolParser(ToolParser):
                             if not self.in_param:
                                 key_prefix = (
                                     f'"{current_param_name}": "'
-                                    if self.param_count == 0
+                                    if not self.accumulated_params
                                     else f', "{current_param_name}": "'
                                 )
                                 escaped = json.dumps(
@@ -1032,6 +1122,11 @@ class Qwen3CoderToolParser(ToolParser):
                 if param_value.endswith("\n"):
                     param_value = param_value[:-1]
 
+                if not self.in_param and current_param_name in self.accumulated_params:
+                    self.param_count += 1
+                    continue
+
+                is_first_emitted = len(self.accumulated_params) == 0
                 self.current_param_name = current_param_name
                 self.accumulated_params[current_param_name] = param_value
 
@@ -1054,7 +1149,7 @@ class Qwen3CoderToolParser(ToolParser):
 
                 serialized_value = json.dumps(converted_value, ensure_ascii=False)
 
-                if self.param_count == 0:
+                if is_first_emitted:
                     json_fragment = f'"{current_param_name}": {serialized_value}'
                 else:
                     json_fragment = f', "{current_param_name}": {serialized_value}'
@@ -1117,6 +1212,8 @@ class Qwen3CoderToolParser(ToolParser):
 
         return None
 
+    _uses_qwen_xml_tool_grammar = True
+
     def adjust_request(
         self,
         request: ChatCompletionRequest | ResponsesRequest,
@@ -1126,9 +1223,59 @@ class Qwen3CoderToolParser(ToolParser):
         return super().adjust_request(request)
 
     def get_structural_tag(self, request: ChatCompletionRequest):
-        return get_model_structural_tag(
-            model="qwen_3_5",
-            tools=request.tools,
-            tool_choice=request.tool_choice,
-            reasoning=get_enable_structured_outputs_in_reasoning(),
-        )
+        if not request.tools:
+            return None
+        reasoning = get_enable_structured_outputs_in_reasoning()
+
+        def _build(tools):
+            tag = get_model_structural_tag(
+                model="qwen_3_5",
+                tools=tools,
+                tool_choice=request.tool_choice,
+                reasoning=reasoning,
+            )
+            if tag is None:
+                return None
+            fmt = tag.format
+            if reasoning and isinstance(fmt, SequenceFormat) and len(fmt.elements) == 2:
+                prefix_fmt, suffix_fmt = fmt.elements
+                if isinstance(suffix_fmt, TagsWithSeparatorFormat):
+                    suffix_fmt = suffix_fmt.model_copy(update={"separator": "\n"})
+                    fmt = SequenceFormat(elements=[prefix_fmt, suffix_fmt])
+            else:
+                if isinstance(fmt, TagsWithSeparatorFormat):
+                    fmt = fmt.model_copy(update={"separator": "\n"})
+                if isinstance(fmt, TagsWithSeparatorFormat | TagFormat):
+                    fmt = SequenceFormat(
+                        elements=[
+                            OptionalFormat(
+                                content=RegexFormat(pattern="[ \\n\\t]{1,8}")
+                            ),
+                            fmt,
+                        ]
+                    )
+            return StructuralTag(format=fmt)
+
+        tag = _build(request.tools)
+        if tag is None:
+            return None
+        try:
+            Grammar.from_structural_tag(json.dumps(tag.model_dump()))
+            return tag
+        except Exception as exc:
+            logger.warning(
+                "Qwen3CoderToolParser: tool schemas are not xgrammar-compatible "
+                "(%s); retrying with unconstrained tool arguments.",
+                exc,
+            )
+            relaxed_tools = [tool.model_copy(deep=True) for tool in request.tools]
+            for tool in relaxed_tools:
+                tool.function.parameters = None
+            relaxed_tag = _build(relaxed_tools)
+            if relaxed_tag is None:
+                return None
+            try:
+                Grammar.from_structural_tag(json.dumps(relaxed_tag.model_dump()))
+                return relaxed_tag
+            except Exception:
+                return tag

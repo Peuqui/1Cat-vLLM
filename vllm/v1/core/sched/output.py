@@ -285,6 +285,9 @@ class SchedulerOutput:
     # Optional KV cache group ID aligned 1:1 with ``kv_block_copies`` so the
     # worker copies only the owning group's segments and host/hot caches.
     kv_block_copy_groups: list[int] | None = None
+    # (req_id, even_block_ids, odd_block_ids) per Mamba KV group for 64-token
+    # decode-output checkpointing on Model Runner V2.
+    decode_ckpt_mounts: list[tuple[str, list[int], list[int]]] | None = None
 
     # Exact Mamba ``align`` boundary-state sources offered to a KV connector:
     # {request_id: [(group_id, block_id, boundary_tokens), ...]}.
@@ -294,6 +297,10 @@ class SchedulerOutput:
     # VLLM_V41_PP_AHEAD: requests scheduled while a step of theirs is still in
     # flight (the worker reads their previous round from per-request tables).
     v41_ahead_req_ids: set[str] | None = None
+
+    # Adaptive MTP (EntMTP): number of speculative draft steps to generate for
+    # the next decode step (None uses the configured num_speculative_tokens).
+    next_spec_steps: int | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

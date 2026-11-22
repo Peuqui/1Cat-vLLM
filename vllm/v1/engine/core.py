@@ -668,7 +668,11 @@ class EngineCore:
         # are kept in flight; more queued decode steps only wait for rounds
         # not back yet (8 x 8K: 38 vs 80 ms/round). VLLM_V41_LIVE_FILE
         # "qdepth N" overrides it (diagnostic).
-        depth = v41_live.get("qdepth", self._v41_depth)
+        live_qdepth = v41_live.get("qdepth", 0)
+        if live_qdepth > 0:
+            depth = min(self.batch_queue_size, live_qdepth)
+        else:
+            depth = self._v41_depth
 
         model_executed = False
         deferred_scheduler_output = None
@@ -682,6 +686,8 @@ class EngineCore:
                 and scheduler_output.total_num_scheduled_tokens == 0
                 and not scheduler_output.finished_req_ids
                 and not scheduler_output.scheduled_new_reqs
+                and not scheduler_output.kv_block_copies
+                and not scheduler_output.decode_ckpt_mounts
             ):
                 # VLLM_V41_PP_MICRO: every schedulable request is in flight.
                 # An empty step would still run on every stage (and drop the

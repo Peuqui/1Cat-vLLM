@@ -148,27 +148,63 @@ _UNSET_RETENTION_INTERVAL = -1
 def _resolve_sm70_flash_v100_kv_cache_dtype_alias(
     requested_dtype: str,
     resolved_dtype: str,
-) -> str:
+    *,
+    model_config: Any = None,
+    kernel_config: Any = None,
+    attention_backend: Any = None,
+) -> tuple[str, bool]:
     """Use E4M3 storage for the SM70 Flash-V100 ``fp8`` alias."""
-    if (
-        requested_dtype != "fp8"
-        or resolved_dtype != "fp8"
-        or not flash_v100_policy().enabled
-        or not current_platform.is_cuda()
-    ):
-        return resolved_dtype
+    from_checkpoint = requested_dtype == "auto" and resolved_dtype != "auto"
+    if requested_dtype == "int8":
+        return "int8_per_token_head", False
+    if not flash_v100_policy().enabled or not current_platform.is_cuda():
+        return resolved_dtype, from_checkpoint
     try:
         capability = current_platform.get_device_capability()
     except Exception:
-        return resolved_dtype
+        return resolved_dtype, from_checkpoint
     if capability is None or (capability.major, capability.minor) != (7, 0):
-        return resolved_dtype
-    logger.warning_once(
-        "On SM70 Flash-V100, --kv-cache-dtype fp8 resolves to fp8_e4m3. "
-        "Use explicit fp8_e5m2 to request legacy E5M2 KV storage. Model weight "
-        "quantization is configured independently."
-    )
-    return "fp8_e4m3"
+        return resolved_dtype, from_checkpoint
+    if requested_dtype == "fp8" and resolved_dtype == "fp8":
+        logger.warning_once(
+            "On SM70 Flash-V100, --kv-cache-dtype fp8 resolves to fp8_e4m3. "
+            "Use explicit fp8_e5m2 to request legacy E5M2 KV storage. Model weight "
+            "quantization is configured independently."
+        )
+        return "fp8_e4m3", False
+    if (
+        requested_dtype == "auto"
+        and resolved_dtype == "auto"
+        and model_config is not None
+        and not model_config.is_attention_free
+        and not getattr(model_config, "use_mla", False)
+        and getattr(model_config.hf_text_config, "indexer_n_heads", None) is None
+        and getattr(model_config, "runner_type", "generate") == "generate"
+        and not getattr(kernel_config, "qsa_host_kv", False)
+    ):
+        backend_supports_int8 = True
+        if attention_backend is not None:
+            try:
+                from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+                backend_enum = (
+                    attention_backend
+                    if isinstance(attention_backend, AttentionBackendEnum)
+                    else AttentionBackendEnum[str(attention_backend)]
+                )
+                backend_cls = backend_enum.get_class()
+                backend_supports_int8 = (
+                    "int8_per_token_head" in backend_cls.supported_kv_cache_dtypes
+                )
+            except Exception:
+                backend_supports_int8 = False
+        if backend_supports_int8:
+            logger.info_once(
+                "Defaulting KV cache storage to int8_per_token_head. "
+                "Pass --kv-cache-dtype float16 or fp8_e4m3 explicitly to override."
+            )
+            return "int8_per_token_head", False
+    return resolved_dtype, from_checkpoint
 
 
 # object is used to allow for special typing forms
@@ -691,6 +727,7 @@ class EngineArgs:
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
+    encoder_cache_size: int | None = SchedulerConfig.encoder_cache_size
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
@@ -1503,6 +1540,9 @@ class EngineArgs:
             "--disable-chunked-mm-input", **scheduler_kwargs["disable_chunked_mm_input"]
         )
         scheduler_group.add_argument(
+            "--encoder-cache-size", **scheduler_kwargs["encoder_cache_size"]
+        )
+        scheduler_group.add_argument(
             "--scheduler-cls", **scheduler_kwargs["scheduler_cls"]
         )
         scheduler_group.add_argument(
@@ -1820,6 +1860,7 @@ class EngineArgs:
         if self.block_size is None and self.mamba_block_size is None:
             self.block_size = _HYBRID_PREFIX_BLOCK_SIZE
             self.mamba_block_size = _HYBRID_PREFIX_BLOCK_SIZE
+            self._auto_hybrid_mamba_block_size = True
             updates.append(f"block_size={self.block_size}")
             updates.append(f"mamba_block_size={self.mamba_block_size}")
         if self.partial_prefix_cache is None:
@@ -1865,6 +1906,19 @@ class EngineArgs:
         has_linear_attention = any(
             layer_type == "linear_attention" for layer_type in layer_types
         )
+        if is_server and self.max_num_seqs is None:
+            from vllm.model_executor.models.runtime_defaults import (
+                default_hybrid_server_max_num_seqs,
+            )
+
+            try:
+                dev_bytes = current_platform.get_device_total_memory()
+            except Exception:
+                dev_bytes = 0
+            bounded_seqs = default_hybrid_server_max_num_seqs(text_config, dev_bytes)
+            if bounded_seqs is not None:
+                self.max_num_seqs = bounded_seqs
+                profile_updates.append(f"max_num_seqs={self.max_num_seqs}")
         if is_server and self.enable_prefix_caching is None and has_linear_attention:
             self.enable_prefix_caching = True
             profile_updates.append(
@@ -2099,9 +2153,14 @@ class EngineArgs:
         resolved_cache_dtype = resolve_kv_cache_dtype_string(
             self.kv_cache_dtype, model_config
         )
-        resolved_cache_dtype = _resolve_sm70_flash_v100_kv_cache_dtype_alias(
-            self.kv_cache_dtype,
-            resolved_cache_dtype,
+        resolved_cache_dtype, cache_dtype_from_checkpoint = (
+            _resolve_sm70_flash_v100_kv_cache_dtype_alias(
+                self.kv_cache_dtype,
+                resolved_cache_dtype,
+                model_config=model_config,
+                kernel_config=self.kernel_config,
+                attention_backend=self.attention_backend,
+            )
         )
 
         assert self.enable_prefix_caching is not None, (
@@ -2136,9 +2195,9 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
-        cache_config.cache_dtype_from_checkpoint = (
-            self.kv_cache_dtype == "auto" and resolved_cache_dtype != "auto"
-        )
+        cache_config.cache_dtype_from_checkpoint = cache_dtype_from_checkpoint
+        if getattr(self, "_auto_hybrid_mamba_block_size", False):
+            cache_config.user_specified_mamba_block_size = False
 
         if resolved_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
@@ -2411,6 +2470,7 @@ class EngineArgs:
             max_model_len=model_config.max_model_len,
             enable_chunked_prefill=self.enable_chunked_prefill,
             disable_chunked_mm_input=self.disable_chunked_mm_input,
+            encoder_cache_size=self.encoder_cache_size,
             is_multimodal_model=model_config.is_multimodal_model,
             is_encoder_decoder=model_config.is_encoder_decoder,
             policy=self.scheduling_policy,

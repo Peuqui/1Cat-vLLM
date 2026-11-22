@@ -39,7 +39,6 @@ from vllm.models.deepseek_v4.common.ops.fp8_software import (
 from vllm.triton_utils import tl, tldevice, triton
 
 from .attention_ops import WINDOW_RING
-from .norm import short_rows
 from .quant_rope import _ceil_power_two, _reciprocal_power_two
 
 logger = init_logger(__name__)
@@ -253,6 +252,63 @@ def _attn_post(
         tl.store(ring + (position % RING) * 512 + col, data, valid)
 
 
+@triton.jit
+def _attn_post_regs(
+    x,
+    positions,
+    table,
+    out,
+    values,
+    valid_tokens,
+    ring,
+    LENGTH,
+    HEADS: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK: tl.constexpr,
+    GROUP: tl.constexpr,
+    RING: tl.constexpr,
+    DO_RING: tl.constexpr,
+):
+    token, head = tl.program_id(0), tl.program_id(1)
+    if head < HEADS:
+        col = tl.arange(0, BLOCK)
+        rotary = col >= H - 64
+        paired_col = col ^ 1
+        offset = (token * HEADS + head) * H
+        value = tl.load(x + offset + col).to(tl.float32)
+        neighbor = tl.load(x + offset + paired_col, rotary, 0).to(tl.float32)
+        position = tl.load(positions + token).to(tl.int64)
+        index = (col - (H - 64)) // 2
+        if position < LENGTH:
+            cosine = tl.load(table + position * 64 + index, rotary, 0)
+            sine = -tl.load(table + position * 64 + 32 + index, rotary, 0)
+        else:
+            angle = position.to(tl.float32) * tl.load(
+                table + LENGTH * 64 + index, rotary, 0
+            )
+            cosine, sine = tldevice.cos(angle), -tldevice.sin(angle)
+        even = (col & 1) == 0
+        a, b = tl.where(even, value, neighbor), tl.where(even, neighbor, value)
+        rotated = tl.where(even, a * cosine - b * sine, a * sine + b * cosine)
+        value16 = tl.where(rotary, rotated, value).to(tl.float16)
+        groups = tl.reshape(value16.to(tl.float32), (H // GROUP, GROUP))
+        maximum = tl.maximum(tl.max(tl.abs(groups), 1), 1e-4)
+        scale = _ceil_power_two(maximum * (1.0 / 448.0))[:, None]
+        quantized = (
+            fp8_e4m3fn_bits_to_fp32_bitcast(
+                fp32_to_fp8_e4m3fn_bits(groups * _reciprocal_power_two(scale))
+            )
+            * scale
+        )
+        tl.store(out + offset + col, tl.reshape(quantized, (BLOCK,)))
+    elif DO_RING:
+        position = tl.load(positions + token).to(tl.int64)
+        valid = tl.load(valid_tokens + token) & (position >= 0)
+        col = tl.arange(0, 512)
+        data = tl.load(values + token * 512 + col, valid, 0)
+        tl.store(ring + (position % RING) * 512 + col, data, valid)
+
+
 def _rope_ok(x, positions, table):
     # apply_rope's accepted inputs (3-D form, width 512).
     return (
@@ -271,12 +327,12 @@ def _rope_ok(x, positions, table):
     )
 
 
-def attn_prep(q, kv, kv_weight, eps, positions, table):
+def attn_prep(q, kv, kv_weight, eps, positions, table, dcp_p2p=False):
     """(query, window) as apply_rope(q) and attention_qdq(apply_rope(kv_norm(kv)))
     compute them, in one launch; None if this call is not decode-shaped."""
     tokens = q.shape[0]
     if not (
-        short_rows(tokens)  # V41Norm's short_rms_norm route (per request)
+        tokens > 0
         and _rope_ok(q, positions, table)
         and kv.is_cuda
         and kv.dtype == torch.float16
@@ -294,6 +350,50 @@ def attn_prep(q, kv, kv_weight, eps, positions, table):
         "VLLM_V41_FUSE_ATTN_PREP=1: query RoPE + kv_norm/RoPE/FP8 QDQ in one "
         "launch per layer.",
     )
+    if _PREP_REGS and q.shape[1] == 16 and positions.dtype == torch.int64:
+        from .native import _LL_AR, _ll_dcp_state, load_v41sk
+
+        load_v41sk()
+        if hasattr(torch.ops.v41sk, "attn_prep_dcp"):
+            q_out = torch.empty_like(q)
+            window = torch.empty_like(kv)
+            if dcp_p2p and _LL_AR and tokens <= 384:
+                st = _ll_dcp_state()
+                if st is not None:
+                    ptrs, rank, slot_cap, dcp_cnt = st
+                    torch.ops.v41sk.attn_prep_dcp(
+                        q_out,
+                        window,
+                        q,
+                        kv,
+                        kv_weight,
+                        positions,
+                        table,
+                        eps,
+                        *ptrs,
+                        rank,
+                        slot_cap,
+                        dcp_cnt,
+                    )
+                    return q_out, window
+            torch.ops.v41sk.attn_prep_dcp(
+                q_out,
+                window,
+                q,
+                kv,
+                kv_weight,
+                positions,
+                table,
+                eps,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+            )
+            return q_out, window
     return _prep_launch(q, kv, kv_weight, eps, positions, table)
 
 
@@ -352,7 +452,7 @@ def attn_post(output, positions, table, groups, ring=None, values=None, valid=No
     tokens = output.shape[0]
     do_ring = ring is not None
     if not (
-        short_rows(tokens, 8)
+        tokens > 0
         and _rope_ok(output, positions, table)
         and output.shape[1] * D == groups * 4096  # project_output's reshape
     ):
@@ -384,8 +484,28 @@ def attn_post(output, positions, table, groups, ring=None, values=None, valid=No
 def _post_launch(output, positions, table, groups, ring, values, valid):
     tokens, heads = output.shape[0], output.shape[1]
     do_ring = ring is not None
-    roped = torch.empty_like(output)
     out = torch.empty(tokens, groups, 4096, dtype=torch.float16, device=output.device)
+    if _PREP_REGS:
+        _attn_post_regs[(tokens, heads + int(do_ring))](
+            output,
+            positions,
+            table,
+            out,
+            values if do_ring else output,
+            valid if do_ring else positions,
+            ring if do_ring else output,
+            table.shape[0] - 1,
+            HEADS=heads,
+            H=D,
+            BLOCK=D,
+            GROUP=GROUP,
+            RING=WINDOW_RING,
+            DO_RING=do_ring,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+        return out
+    roped = torch.empty_like(output)
     _attn_post[(tokens, heads + int(do_ring))](
         output,
         positions,

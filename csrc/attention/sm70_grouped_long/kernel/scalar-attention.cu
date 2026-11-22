@@ -1266,6 +1266,145 @@ __global__ void flash_attention_decode_reduce_kernel(
   out[out_base + threadIdx.x] = __float2half(acc * inv_global_sum);
 }
 
+template <int D, int PARTITION_SIZE>
+__global__ void flash_attention_decode_partition_int8_pth_kernel(
+    const __half* __restrict__ q, const int8_t* __restrict__ k_cache,
+    const int8_t* __restrict__ v_cache, const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales, float* __restrict__ tmp_out,
+    float* __restrict__ max_logits, float* __restrict__ exp_sums,
+    const int* __restrict__ block_table, const int* __restrict__ seq_lens,
+    const int* __restrict__ active_num_partitions, const int max_num_partitions,
+    const int max_num_blocks_per_seq, const int block_size,
+    const int64_t q_stride1,
+    const int64_t tmp_out_stride1, const int64_t tmp_out_stride2,
+    const int64_t stats_stride1, const int64_t k_block_stride,
+    const int64_t k_token_stride, const int64_t v_block_stride,
+    const int64_t v_token_stride, const int64_t ks_block_stride,
+    const int64_t ks_token_stride, const int64_t vs_block_stride,
+    const int64_t vs_token_stride, const float softmax_scale) {
+  static_assert(D == 256 && PARTITION_SIZE == 1024);
+  const int partition_idx = blockIdx.x;
+  const int seq_len = min(seq_lens[0], max_num_blocks_per_seq * block_size);
+  const int start_token_idx = partition_idx * PARTITION_SIZE;
+  if (seq_len <= 0 || start_token_idx >= seq_len ||
+      partition_idx >= max_num_partitions)
+    return;
+  const int effective_num_partitions =
+      min(max_num_partitions,
+          max(active_num_partitions[0],
+              (seq_len + PARTITION_SIZE - 1) / PARTITION_SIZE));
+  if (partition_idx >= effective_num_partitions) return;
+  const int part_tokens = min(PARTITION_SIZE, seq_len - start_token_idx);
+  const int lane = threadIdx.x % kWarpSize;
+  const int warp_idx = threadIdx.x / kWarpSize;
+  __shared__ __half q_shared[6][D];
+  __shared__ float scores_shared[6][PARTITION_SIZE];
+  __shared__ float v_scale_shared[PARTITION_SIZE];
+  constexpr int kMaxPagesInPart = (PARTITION_SIZE / 16) + 2;
+  __shared__ int pblk_shared[kMaxPagesInPart];
+  const int first_page = start_token_idx / block_size;
+  const int num_pages_in_part =
+      (start_token_idx + part_tokens - 1) / block_size - first_page + 1;
+  for (int i = threadIdx.x; i < 6 * D; i += blockDim.x)
+    q_shared[i / D][i % D] = q[(i / D) * q_stride1 + i % D];
+  for (int p = threadIdx.x; p < num_pages_in_part; p += blockDim.x)
+    pblk_shared[p] = block_table[first_page + p];
+  __syncthreads();
+  for (int i = threadIdx.x; i < part_tokens; i += blockDim.x) {
+    const int abs_tok = start_token_idx + i;
+    const int pblk = pblk_shared[abs_tok / block_size - first_page];
+    const int tok_off = abs_tok % block_size;
+    v_scale_shared[i] =
+        __ldg(&v_scales[static_cast<int64_t>(pblk) * vs_block_stride +
+                        static_cast<int64_t>(tok_off) * vs_token_stride]);
+  }
+  __syncthreads();
+  float local_max[6];
+#pragma unroll
+  for (int head = 0; head < 6; ++head) local_max[head] = -1.0e20f;
+  for (int token_local = warp_idx; token_local < part_tokens;
+       token_local += kWarpsPerBlock) {
+    const int abs_tok = start_token_idx + token_local;
+    const int pblk = pblk_shared[abs_tok / block_size - first_page];
+    const int token_offset = abs_tok % block_size;
+    const int64_t k_index = static_cast<int64_t>(pblk) * k_block_stride +
+                            static_cast<int64_t>(token_offset) * k_token_stride;
+    float score[6] = {};
+#pragma unroll
+    for (int d = lane; d < D; d += kWarpSize) {
+      const float kv = static_cast<float>(__ldg(&k_cache[k_index + d]));
+#pragma unroll
+      for (int head = 0; head < 6; ++head)
+        score[head] = fmaf(__half2float(q_shared[head][d]), kv, score[head]);
+    }
+    float tok_k_scale = 0.0f;
+    if (lane == 0) {
+      tok_k_scale =
+          __ldg(&k_scales[static_cast<int64_t>(pblk) * ks_block_stride +
+                          static_cast<int64_t>(token_offset) * ks_token_stride]) *
+          softmax_scale;
+    }
+#pragma unroll
+    for (int head = 0; head < 6; ++head) {
+      const float reduced = warp_reduce_sum(score[head]);
+      if (lane == 0) {
+        const float value = reduced * tok_k_scale;
+        scores_shared[head][token_local] = value;
+        local_max[head] = fmaxf(local_max[head], value);
+      }
+    }
+  }
+  __syncthreads();
+  float inv_sum[6];
+#pragma unroll
+  for (int head = 0; head < 6; ++head) {
+    const float part_max = block_reduce_max<kWarpsPerBlock>(local_max[head]);
+    __syncthreads();
+    float local_sum = 0.f;
+    for (int i = threadIdx.x; i < part_tokens; i += blockDim.x) {
+      const float p = __expf(scores_shared[head][i] - part_max);
+      scores_shared[head][i] = p;
+      local_sum += p;
+    }
+    const float part_sum = block_reduce_sum<kWarpsPerBlock>(local_sum);
+    inv_sum[head] = part_sum > 0.f ? 1.f / part_sum : 0.f;
+    if (threadIdx.x == 0) {
+      const int64_t stats_index = head * stats_stride1 + partition_idx;
+      max_logits[stats_index] = part_max;
+      exp_sums[stats_index] = part_sum;
+    }
+    __syncthreads();
+  }
+  for (int d = threadIdx.x; d < D; d += blockDim.x) {
+    float acc[6] = {};
+    int cur_local = 0;
+    for (int p = 0; p < num_pages_in_part; ++p) {
+      const int page_off_start =
+          p == 0 ? (start_token_idx - first_page * block_size) : 0;
+      const int page_tokens =
+          min(part_tokens - cur_local, block_size - page_off_start);
+      int64_t v_index =
+          static_cast<int64_t>(pblk_shared[p]) * v_block_stride +
+          static_cast<int64_t>(page_off_start) * v_token_stride + d;
+      for (int t = 0; t < page_tokens; ++t, ++cur_local, v_index += v_token_stride) {
+        const float vv =
+            static_cast<float>(__ldg(&v_cache[v_index])) *
+            v_scale_shared[cur_local];
+#pragma unroll
+        for (int head = 0; head < 6; ++head)
+          acc[head] = fmaf(scores_shared[head][cur_local], vv, acc[head]);
+      }
+    }
+#pragma unroll
+    for (int head = 0; head < 6; ++head) {
+      const int64_t tmp_out_base =
+          head * tmp_out_stride1 +
+          static_cast<int64_t>(partition_idx) * tmp_out_stride2;
+      tmp_out[tmp_out_base + d] = acc[head] * inv_sum[head];
+    }
+  }
+}
+
 }  // namespace
 at::Tensor scalar_attention_candidate(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
@@ -1340,6 +1479,91 @@ at::Tensor scalar_attention_candidate(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
+at::Tensor scalar_attention_int8_pth_candidate(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    const at::Tensor& k_scales, const at::Tensor& v_scales, at::Tensor& out,
+    const at::Tensor& table, const at::Tensor& lengths, at::Tensor& partial,
+    at::Tensor& maximum, at::Tensor& sums, const at::Tensor& active,
+    float scale) {
+  TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf &&
+                  q.sizes() == at::IntArrayRef({1, 6, 256}) && q.is_contiguous(),
+              "Scalar INT8 PTH q1 requires contiguous FP16 [1,6,256]");
+  TORCH_CHECK(k.dim() == 4 && k.size(2) == 1 && k.size(3) == 256 &&
+                  k.size(1) > 0 && k.scalar_type() == at::kChar &&
+                  v.sizes() == k.sizes() && v.scalar_type() == at::kChar,
+              "Scalar INT8 PTH q1 requires int8 [pages,page,1,256]");
+  TORCH_CHECK(k_scales.dim() == 3 && v_scales.sizes() == k_scales.sizes() &&
+                  k_scales.scalar_type() == at::kFloat &&
+                  v_scales.scalar_type() == at::kFloat &&
+                  k_scales.size(0) == k.size(0) &&
+                  k_scales.size(1) == k.size(1) && k_scales.size(2) == 1,
+              "Scalar INT8 PTH q1 requires matching float32 scales");
+  for (const auto* t : {&k, &v})
+    TORCH_CHECK(t->stride(3) == 1, "Head dimension must be contiguous");
+  TORCH_CHECK(out.sizes() == q.sizes() && out.scalar_type() == at::kHalf &&
+                  out.is_contiguous(),
+              "Output shape/dtype mismatch");
+  TORCH_CHECK(table.dim() == 2 && table.size(0) == 1 && table.size(1) > 0 &&
+                  table.scalar_type() == at::kInt && table.is_contiguous() &&
+                  table.size(1) <= (INT_MAX - 4096) / k.size(1) &&
+                  lengths.sizes() == at::IntArrayRef({1}) &&
+                  lengths.scalar_type() == at::kInt && lengths.is_contiguous() &&
+                  active.sizes() == at::IntArrayRef({1}) &&
+                  active.scalar_type() == at::kInt && active.is_contiguous(),
+              "Invalid scalar INT8 PTH q1 page/length metadata");
+  const int64_t partitions = partial.dim() == 4 ? partial.size(2) : 0;
+  TORCH_CHECK(
+      partitions > 0 &&
+          partitions <= (static_cast<int64_t>(INT_MAX) - 4096 + 1023) / 1024 &&
+          partial.sizes() == at::IntArrayRef({1, 6, partitions, 256}) &&
+          partial.scalar_type() == at::kFloat && partial.is_contiguous() &&
+          maximum.sizes() == at::IntArrayRef({1, 6, partitions}) &&
+          sums.sizes() == maximum.sizes() &&
+          maximum.scalar_type() == at::kFloat &&
+          sums.scalar_type() == at::kFloat && maximum.is_contiguous() &&
+          sums.is_contiguous(),
+      "Scalar INT8 PTH q1 requires matching FP32 partition workspaces");
+  TORCH_CHECK(table.size(1) <= (partitions * 1024 + k.size(1) - 1) / k.size(1),
+              "Scalar INT8 PTH q1 workspace does not cover the page table");
+  for (const auto* t :
+       {&k, &v, &k_scales, &v_scales, static_cast<const at::Tensor*>(&out),
+        &table, &lengths, static_cast<const at::Tensor*>(&partial),
+        static_cast<const at::Tensor*>(&maximum),
+        static_cast<const at::Tensor*>(&sums), &active})
+    TORCH_CHECK(t->device() == q.device(), "Device mismatch");
+  TORCH_CHECK(std::isfinite(scale), "Finite scale required");
+  c10::cuda::CUDAGuard guard(q.device());
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0, "SM70 only");
+  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      flash_attention_decode_partition_int8_pth_kernel<256, 1024>,
+      cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+  flash_attention_decode_partition_int8_pth_kernel<256, 1024>
+      <<<dim3(static_cast<unsigned>(partitions)), 256, 0, stream>>>(
+          reinterpret_cast<const __half*>(q.data_ptr()), k.data_ptr<int8_t>(),
+          v.data_ptr<int8_t>(), k_scales.data_ptr<float>(),
+          v_scales.data_ptr<float>(), partial.data_ptr<float>(),
+          maximum.data_ptr<float>(), sums.data_ptr<float>(),
+          table.data_ptr<int>(), lengths.data_ptr<int>(), active.data_ptr<int>(),
+          static_cast<int>(partitions), static_cast<int>(table.size(1)),
+          static_cast<int>(k.size(1)),
+          q.stride(1), partial.stride(1), partial.stride(2), maximum.stride(1),
+          k.stride(0), k.stride(1), v.stride(0), v.stride(1),
+          k_scales.stride(0), k_scales.stride(1), v_scales.stride(0),
+          v_scales.stride(1), scale);
+  flash_attention_decode_reduce_kernel<256, 1024, 0, float>
+      <<<dim3(1, 6, 1), 256, 0, stream>>>(
+          partial.data_ptr<float>(), maximum.data_ptr<float>(),
+          sums.data_ptr<float>(), lengths.data_ptr<int>(),
+          active.data_ptr<int>(), reinterpret_cast<__half*>(out.data_ptr()), 1,
+          static_cast<int>(partitions), 6, partial.stride(0), partial.stride(1),
+          partial.stride(2), maximum.stride(0), maximum.stride(1),
+          out.stride(0), out.stride(1), 0, 0, 0, 0);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
 // Registered into the shipped FA2 extension rather than a private pybind
 // module, so the compact scalar long-context tail is available by default
 // instead of requiring an externally built DSO selected by a manifest.
@@ -1354,6 +1578,16 @@ at::Tensor sm70_scalar_attention_entry(
       static_cast<float>(scale), static_cast<float>(k_scale),
       static_cast<float>(v_scale));
 }
+at::Tensor sm70_scalar_int8_pth_entry(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    const at::Tensor& k_scales, const at::Tensor& v_scales, at::Tensor& out,
+    const at::Tensor& table, const at::Tensor& lengths, at::Tensor& partial,
+    at::Tensor& maximum, at::Tensor& sums, const at::Tensor& active,
+    double scale) {
+  return scalar_attention_int8_pth_candidate(
+      q, k, v, k_scales, v_scales, out, table, lengths, partial, maximum, sums,
+      active, static_cast<float>(scale));
+}
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
@@ -1364,7 +1598,13 @@ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
       "Tensor table, Tensor lengths, Tensor(a!) partial, Tensor(a!) maximum, "
       "Tensor(a!) sums, Tensor active, float scale, float k_scale, "
       "float v_scale) -> Tensor(a!)");
+  ops.def(
+      "sm70_scalar_int8_pth_fwd(Tensor q, Tensor k, Tensor v, Tensor k_scales, "
+      "Tensor v_scales, Tensor(a!) out, Tensor table, Tensor lengths, "
+      "Tensor(a!) partial, Tensor(a!) maximum, Tensor(a!) sums, Tensor active, "
+      "float scale) -> Tensor(a!)");
 }
 TORCH_LIBRARY_IMPL(_vllm_fa2_C, CUDA, ops) {
   ops.impl("sm70_scalar_attention_fwd", &sm70_scalar_attention_entry);
+  ops.impl("sm70_scalar_int8_pth_fwd", &sm70_scalar_int8_pth_entry);
 }

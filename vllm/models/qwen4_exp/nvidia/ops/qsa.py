@@ -420,6 +420,7 @@ def _expand_qsa_indices_kernel(
     TOKEN_TOPK: tl.constexpr,
     OUTPUT_WIDTH: tl.constexpr,
     COLUMN_BLOCK: tl.constexpr,
+    FOLDED8: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     columns = tl.program_id(1) * COLUMN_BLOCK + tl.arange(0, COLUMN_BLOCK)
@@ -446,8 +447,18 @@ def _expand_qsa_indices_kernel(
     block_rank = columns // COMPRESS_RATIO
     offset = columns % COMPRESS_RATIO
     safe_rank = tl.minimum(block_rank, BLOCK_TOPK - 1)
+    if FOLDED8:
+        h_step = rows >> 3
+        seg = row // h_step
+        seg_off = row - seg * h_step
+        folded_seg = tl.where(seg < 4, seg * 2, (7 - seg) * 2 + 1)
+        src_row = folded_seg * h_step + seg_off
+    else:
+        src_row = row
     block = tl.load(
-        block_indices_ptr + row * stride_blocks_row + safe_rank * stride_blocks_column,
+        block_indices_ptr
+        + src_row * stride_blocks_row
+        + safe_rank * stride_blocks_column,
         mask=(row < rows) & is_expanded,
         other=-1,
     )
@@ -678,8 +689,19 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     HISTORY_LENGTHS=None,
     DEVICE_HISTORY: tl.constexpr = False,
     HISTORY_E4M3: tl.constexpr = False,
+    HISTORY_INT8: tl.constexpr = False,
     HOT_SCALES=None,
     HOST_CACHE_E4M3: tl.constexpr = False,
+    HOST_CACHE_INT8: tl.constexpr = False,
+    KV_INT8_PTH: tl.constexpr = False,
+    K_SCALES=None,
+    V_SCALES=None,
+    stride_ks_block: tl.int64 = 0,
+    stride_ks_token: tl.int64 = 0,
+    stride_ks_head: tl.int64 = 0,
+    stride_vs_block: tl.int64 = 0,
+    stride_vs_token: tl.int64 = 0,
+    stride_vs_head: tl.int64 = 0,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -779,7 +801,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 tl.cdiv(TOPK, 4) * 4,
                 HEAD_DIM,
                 HotScales=HOT_SCALES,
-                HOT_FP8=HOST_CACHE_E4M3,
+                HOT_FP8=HOST_CACHE_E4M3 or HOST_CACHE_INT8,
+                HOT_INT8=HOST_CACHE_INT8,
             )
         else:
             keys = tl.load(
@@ -800,12 +823,45 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 mask=valid[:, None],
                 other=0.0,
             )
-        if DEVICE_HISTORY and HISTORY_E4M3:
+        if DEVICE_HISTORY and (HISTORY_E4M3 or HISTORY_INT8):
             slot = safe_page * PAGE_SIZE + page_offset
             key_scales = tl.load(HISTORY_SCALES + slot * 2, valid, other=1.0)
             value_scales = tl.load(HISTORY_SCALES + slot * 2 + 1, valid, other=1.0)
-            keys = (fp8_e4m3fn_bits_to_fp32(keys) * key_scales[None, :]).to(query.dtype)
-            values = (fp8_e4m3fn_bits_to_fp32(values) * value_scales[:, None]).to(
+            if HISTORY_INT8:
+                keys = (keys.to(tl.int8).to(tl.float32) * key_scales[None, :]).to(
+                    query.dtype
+                )
+                values = (values.to(tl.int8).to(tl.float32) * value_scales[:, None]).to(
+                    query.dtype
+                )
+            else:
+                keys = (fp8_e4m3fn_bits_to_fp32(keys) * key_scales[None, :]).to(
+                    query.dtype
+                )
+                values = (fp8_e4m3fn_bits_to_fp32(values) * value_scales[:, None]).to(
+                    query.dtype
+                )
+        if KV_INT8_PTH:
+            key_scales = tl.load(
+                K_SCALES
+                + safe_page * stride_ks_block
+                + page_offset * stride_ks_token
+                + kv_head * stride_ks_head,
+                mask=valid,
+                other=1.0,
+            )
+            value_scales = tl.load(
+                V_SCALES
+                + safe_page * stride_vs_block
+                + page_offset * stride_vs_token
+                + kv_head * stride_vs_head,
+                mask=valid,
+                other=1.0,
+            )
+            keys = (keys.to(tl.int8).to(tl.float32) * key_scales[None, :]).to(
+                query.dtype
+            )
+            values = (values.to(tl.int8).to(tl.float32) * value_scales[:, None]).to(
                 query.dtype
             )
         if KV_E4M3:
@@ -1481,6 +1537,8 @@ def expand_qsa_block_indices_cuda(
     compress_ratio: int,
     token_topk: int,
     out: torch.Tensor | None = None,
+    *,
+    folded8: bool = False,
 ) -> torch.Tensor:
     """Expand compressed blocks and compact the causal tail of the open group."""
 
@@ -1526,6 +1584,7 @@ def expand_qsa_block_indices_cuda(
         TOKEN_TOPK=token_topk,
         OUTPUT_WIDTH=output_width,
         COLUMN_BLOCK=column_block,
+        FOLDED8=bool(folded8),
         num_warps=4,
     )
     return out
@@ -1569,6 +1628,7 @@ def _qsa_select_by_request(
     shared_key_scoring: bool = False,
     max_seq_len: int | None = None,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+    tp_group=None,
 ) -> bool:
     """Select a multi-request batch one long request at a time.
 
@@ -1650,6 +1710,7 @@ def _qsa_select_by_request(
                 out[start:end],
                 shared_key_scoring=shared_key_scoring,
                 max_seq_len=req_max_seq_len,
+                tp_group=tp_group,
             )
     return True
 
@@ -1669,6 +1730,7 @@ def qsa_select_paged_tokens(
     max_seq_len: int | None = None,
     tp_group=None,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+    q_already_folded8: bool = False,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization.
 
@@ -1677,7 +1739,7 @@ def qsa_select_paged_tokens(
     reading the device.
     """
 
-    rows = q.shape[0]
+    rows = q.shape[0] * 4 if q_already_folded8 else q.shape[0]
     output_width = token_topk + compress_ratio - 1
     if out is None:
         out = torch.empty((rows, output_width), dtype=torch.int32, device=q.device)
@@ -1685,20 +1747,25 @@ def qsa_select_paged_tokens(
         raise ValueError("QSA selection output has an invalid shape")
     if not rows:
         return out
-    if query_start_loc_cpu is not None and _qsa_select_by_request(
-        q,
-        k_cache,
-        page_table,
-        token_to_req,
-        query_positions,
-        sequence_lengths,
-        token_topk,
-        compress_ratio,
-        out,
-        query_start_loc_cpu,
-        shared_key_scoring=shared_key_scoring,
-        max_seq_len=max_seq_len,
-        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+    if (
+        not q_already_folded8
+        and query_start_loc_cpu is not None
+        and _qsa_select_by_request(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            token_topk,
+            compress_ratio,
+            out,
+            query_start_loc_cpu,
+            shared_key_scoring=shared_key_scoring,
+            max_seq_len=max_seq_len,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            tp_group=tp_group,
+        )
     ):
         return out
 
@@ -1714,8 +1781,8 @@ def qsa_select_paged_tokens(
     all_visible: torch.Tensor | None = None
     if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table):
         all_visible = _qsa_visible_blocks(
-            token_to_req,
-            query_positions,
+            token_to_req[:rows],
+            query_positions[:rows],
             sequence_lengths,
             compress_ratio,
         )
@@ -1752,10 +1819,11 @@ def qsa_select_paged_tokens(
     # Keep small work, mixed requests, other topologies and graph capture on
     # the existing selector. Cache writes have already completed on every rank.
     tp_step = 0
+    tp_folded8 = False
     if (
         tp_group is not None
         and tp_group.world_size == 4
-        and 4096 <= rows <= 9216
+        and 1024 <= rows <= 16384
         and q.shape[1:] == (4, 128)
         and token_topk == 2048
         and compress_ratio == 4
@@ -1768,12 +1836,23 @@ def qsa_select_paged_tokens(
             "qsa_cublas_min_rows"
         ) and _qsa_indexer_cublas_work_supported(smallest_partition, score_columns):
             tp_step = step
-            first = tp_group.rank_in_group * step
-            last = min(first + step, rows)
-            q = q[first:last]
             assert all_visible is not None
-            all_visible = all_visible[first:last]
-            rows = last - first
+            if (rows & 7) == 0 and rows >= 2048:
+                tp_folded8 = True
+                h_step = rows >> 3
+                rk = tp_group.rank_in_group
+                s0 = slice(rk * h_step, (rk + 1) * h_step)
+                s1 = slice((7 - rk) * h_step, (8 - rk) * h_step)
+                if not q_already_folded8:
+                    q = torch.cat((q[s0], q[s1]), dim=0)
+                all_visible = torch.cat((all_visible[s0], all_visible[s1]), dim=0)
+                rows = 2 * h_step
+            else:
+                first = tp_group.rank_in_group * step
+                last = min(first + step, rows)
+                q = q[first:last]
+                all_visible = all_visible[first:last]
+                rows = last - first
             logger.info_once(
                 "Using SM70 QSA TP4 prefill row partition with block-index AllGather."
             )
@@ -1799,16 +1878,23 @@ def qsa_select_paged_tokens(
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
         row_slice = slice(row_start, row_end)
-        if contiguous_keys is not None and key_valid is not None:
-            assert all_visible is not None
-            logits, visible_blocks = _qsa_mqa_cublas(
-                q[row_slice],
-                contiguous_keys,
-                key_valid,
-                all_visible[row_slice],
-            )
-        else:
-            logits, visible_blocks = qsa_mqa_paged(
+        blocks = (
+            blocks_buffer[row_slice]
+            if tp_step
+            else blocks_buffer[: row_end - row_start]
+        )
+        fused_done = False
+        if (
+            contiguous_keys is None
+            and exact_topk
+            and block_topk == 512
+            and shared_key_scoring
+            and 0 < score_columns <= capacity_columns
+            and row_end > row_start
+        ):
+            from .qsa_shared_key import maybe_shared_key_topk
+
+            fused_done = maybe_shared_key_topk(
                 q[row_slice],
                 k_cache,
                 page_table,
@@ -1816,58 +1902,79 @@ def qsa_select_paged_tokens(
                 query_positions[row_slice],
                 sequence_lengths,
                 compress_ratio,
-                num_columns=score_columns,
-                shared_key_scoring=shared_key_scoring,
-            )
-        blocks = (
-            blocks_buffer[row_slice]
-            if tp_step
-            else blocks_buffer[: row_end - row_start]
-        )
-        use_cooperative_topk = (
-            blocks.shape[0] <= 32
-            and logits.stride(0) % 4 == 0
-            and current_platform.has_device_capability(90)
-            and not current_platform.is_device_capability_family(120)
-        )
-        if exact_topk:
-            logger.info_once(
-                "Using exact SM70 QSA lexicographic top-k "
-                "(score descending, block index ascending)."
-            )
-            if (
-                sparse_policy().qsa_decode_partition_topk
-                and q.shape[0] in (5, 10)
-                and page_table.shape[0] == 1
-                and score_columns >= 32768
-            ):
-                from .qsa_partition_topk import qsa_partition_topk
-
-                qsa_partition_topk(logits, visible_blocks, blocks)
-                logger.info_once("Using exact SM70 QSA partitioned decode Top-K.")
-            elif sparse_policy().value("qsa_mtp_topk") and blocks.shape[0] in (5, 10):
-                torch.ops._C.qsa_lexicographic_topk(
-                    logits, visible_blocks, blocks, block_topk, True
-                )
-                logger.info_once("Using exact SM70 MTP batch QSA selector.")
-            else:
-                _sm70_qsa_lexicographic_topk_op()(
-                    logits, visible_blocks, blocks, block_topk
-                )
-        else:
-            topk_op = (
-                torch.ops._C.cooperative_topk
-                if use_cooperative_topk
-                else torch.ops._C.persistent_topk
-            )
-            topk_op(
-                logits,
-                visible_blocks,
-                blocks,
-                topk_workspace,
-                block_topk,
                 score_columns,
+                math.sqrt(q.shape[2]),
+                blocks,
             )
+        if not fused_done:
+            if contiguous_keys is not None and key_valid is not None:
+                assert all_visible is not None
+                logits, visible_blocks = _qsa_mqa_cublas(
+                    q[row_slice],
+                    contiguous_keys,
+                    key_valid,
+                    all_visible[row_slice],
+                )
+            else:
+                logits, visible_blocks = qsa_mqa_paged(
+                    q[row_slice],
+                    k_cache,
+                    page_table,
+                    token_to_req[row_slice],
+                    query_positions[row_slice],
+                    sequence_lengths,
+                    compress_ratio,
+                    num_columns=score_columns,
+                    shared_key_scoring=shared_key_scoring,
+                )
+            use_cooperative_topk = (
+                blocks.shape[0] <= 32
+                and logits.stride(0) % 4 == 0
+                and current_platform.has_device_capability(90)
+                and not current_platform.is_device_capability_family(120)
+            )
+            if exact_topk:
+                logger.info_once(
+                    "Using exact SM70 QSA lexicographic top-k "
+                    "(score descending, block index ascending)."
+                )
+                if (
+                    sparse_policy().qsa_decode_partition_topk
+                    and q.shape[0] in (5, 10)
+                    and page_table.shape[0] == 1
+                    and score_columns >= 32768
+                ):
+                    from .qsa_partition_topk import qsa_partition_topk
+
+                    qsa_partition_topk(logits, visible_blocks, blocks)
+                    logger.info_once("Using exact SM70 QSA partitioned decode Top-K.")
+                elif (
+                    sparse_policy().value("qsa_mtp_topk") and 2 <= blocks.shape[0] <= 64
+                ):
+                    torch.ops._C.qsa_lexicographic_topk(
+                        logits, visible_blocks, blocks, block_topk, True
+                    )
+                    logger.info_once("Using exact SM70 MTP batch QSA selector.")
+                else:
+                    _sm70_qsa_lexicographic_topk_op()(
+                        logits, visible_blocks, blocks, block_topk
+                    )
+            else:
+                topk_op = (
+                    torch.ops._C.cooperative_topk
+                    if use_cooperative_topk
+                    else torch.ops._C.persistent_topk
+                )
+                topk_op(
+                    logits,
+                    visible_blocks,
+                    blocks,
+                    topk_workspace,
+                    block_topk,
+                    score_columns,
+                )
+            # Each rank has consumed this tile, including in the TP row partition.
+            del logits, visible_blocks
         if not tp_step:
             expand_qsa_block_indices_cuda(
                 blocks,
@@ -1878,21 +1985,36 @@ def qsa_select_paged_tokens(
                 token_topk,
                 out[row_slice],
             )
-        # Each rank has consumed this tile, including in the TP row partition.
-        del logits, visible_blocks
     if tp_step:
         # Gather the compressed block IDs, not the four-times wider expanded
         # token matrix. Padding is confined to the last rank and discarded.
         blocks_buffer[rows:].fill_(-1)
-        gathered = tp_group.all_gather(blocks_buffer, dim=0)
+        from vllm.runtime_resources import current_runtime_resources
+
+        resources = current_runtime_resources()
+        peer_owner = resources.get("hc_prefill_peer") if resources is not None else None
+        if (
+            peer_owner is not None
+            and peer_owner.group is tp_group
+            and peer_owner.can_allgather_ag(blocks_buffer)
+        ):
+            gathered_blocks = torch.empty(
+                (out.shape[0], block_topk),
+                dtype=torch.int32,
+                device=blocks_buffer.device,
+            )
+            peer_owner.allgather_ag_into(gathered_blocks, blocks_buffer)
+        else:
+            gathered_blocks = tp_group.all_gather(blocks_buffer, dim=0)[: out.shape[0]]
         expand_qsa_block_indices_cuda(
-            gathered[: out.shape[0]],
+            gathered_blocks,
             query_positions,
             sequence_lengths,
             token_to_req,
             compress_ratio,
             token_topk,
             out,
+            folded8=tp_folded8,
         )
     return out
 
@@ -2824,6 +2946,8 @@ def qsa_sparse_paged_attention(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     lse: torch.Tensor | None = None,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
 
@@ -2850,6 +2974,7 @@ def qsa_sparse_paged_attention(
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("QSA sparse attention requires FP16 or BF16 queries")
     kv_e4m3 = kv_cache_dtype in ("fp8", "fp8_e4m3")
+    kv_int8_pth = kv_cache_dtype in ("int8", "int8_per_token_head")
     if kv_e4m3:
         if k_cache.dtype != torch.uint8 or v_cache.dtype != torch.uint8:
             raise ValueError("QSA E4M3 K/V caches must use uint8 storage")
@@ -2857,6 +2982,11 @@ def qsa_sparse_paged_attention(
             raise ValueError("QSA E4M3 K/V scales must be finite")
         if k_scale <= 0.0 or v_scale <= 0.0:
             raise ValueError("QSA E4M3 K/V scales must be positive")
+    elif kv_int8_pth:
+        if k_cache.dtype != torch.int8 or v_cache.dtype != torch.int8:
+            raise ValueError("QSA INT8 K/V caches must use int8 storage")
+        if k_scale_cache is None or v_scale_cache is None:
+            raise ValueError("QSA INT8 per-token-head K/V caches require scale views")
     else:
         if kv_cache_dtype not in ("auto", "float16", "bfloat16"):
             raise ValueError(f"Unsupported QSA K/V cache dtype: {kv_cache_dtype}")
@@ -3029,6 +3159,15 @@ def qsa_sparse_paged_attention(
         BLOCK_N=block_n,
         KV_E4M3=kv_e4m3,
         RESOLVED_INDICES=resolved_indices,
+        KV_INT8_PTH=kv_int8_pth,
+        K_SCALES=k_scale_cache,
+        V_SCALES=v_scale_cache,
+        stride_ks_block=k_scale_cache.stride(0) if k_scale_cache is not None else 0,
+        stride_ks_token=k_scale_cache.stride(1) if k_scale_cache is not None else 0,
+        stride_ks_head=k_scale_cache.stride(2) if k_scale_cache is not None else 0,
+        stride_vs_block=v_scale_cache.stride(0) if v_scale_cache is not None else 0,
+        stride_vs_token=v_scale_cache.stride(1) if v_scale_cache is not None else 0,
+        stride_vs_head=v_scale_cache.stride(2) if v_scale_cache is not None else 0,
         num_warps=partial_warps,
         num_stages=2,
     )

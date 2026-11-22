@@ -21,9 +21,9 @@ def _history_workspace(device, width, rows):
     key = (device, width, rows)
     if key not in _WORKSPACES:
         reference_elements = max(
-            m * 6 * _attention_profile(m, width)[2] for m in range(1, 21)
+            m * 12 * _attention_profile(m, width)[2] for m in range(1, 21)
         )
-        native_elements = rows * 6 * ((width + 63) // 64)
+        native_elements = rows * 12 * ((width + 63) // 64)
         _WORKSPACES[key] = (
             torch.empty(
                 max(reference_elements, native_elements) * 256,
@@ -124,7 +124,7 @@ def cfg_allows_host_native(cfg) -> bool:
 
 
 def device_history_attention(
-    query, state, indices, table, requests, positions, lengths, out, gate
+    query, state, indices, table, requests, positions, lengths, out, gate, lse=None
 ):
     workspace = state.device_history_workspace
     if workspace is None:
@@ -137,9 +137,11 @@ def device_history_attention(
     if not (
         query.dtype == torch.float16
         and 0 < query.shape[0] <= rows_limit
-        and query.shape[1:] == (6, 256)
+        and query.shape[1] > 0
+        and query.shape[1] % 6 == 0
+        and query.shape[2] == 256
     ):
-        state.device_history_reason = "requires_M1_resolve_rows_H6_D256"
+        state.device_history_reason = "requires_M1_resolve_rows_H6x_D256"
         return False
     if (
         query.data_ptr() % 16
@@ -193,6 +195,7 @@ def device_history_attention(
                 hot_tiles,
                 page_slots,
                 tags,
+                lse,
             )
         else:
             torch.ops.vllm_sm70_qsa_device.run_hot(
@@ -212,12 +215,15 @@ def device_history_attention(
                 1,
                 page_slots,
                 tags,
+                lse,
             )
         state.device_history_reason = None
         logger.info_once(
             "Using SM70 native QSA attention over host history with a device "
             "hot cache (%s storage, FP32 PV)",
-            "E4M3" if getattr(state, "hot_fp8", False) else "FP16",
+            ("INT8" if getattr(state, "int8", False) else "E4M3")
+            if getattr(state, "hot_fp8", False)
+            else "FP16",
         )
         return True
     torch.ops.vllm_sm70_qsa_device.run(
@@ -232,6 +238,7 @@ def device_history_attention(
         out,
         gate,
         *workspace,
+        lse,
     )
     state.device_history_reason = None
     logger.info_once("Using SM70 native QSA device-history attention (FP32 PV)")
@@ -319,7 +326,10 @@ def _direct_history_triton(
         HISTORY_POSITIONS=positions,
         HISTORY_LENGTHS=lengths,
         DEVICE_HISTORY=True,
-        HISTORY_E4M3=state.fp8,
+        HISTORY_E4M3=getattr(
+            state, "e4m3", state.fp8 and not getattr(state, "int8", False)
+        ),
+        HISTORY_INT8=getattr(state, "int8", False),
         num_warps=warps,
         num_stages=2,
     )

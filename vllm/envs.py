@@ -269,6 +269,8 @@ if TYPE_CHECKING:
     VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS: bool = False
     VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS: bool = False
     VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS: bool = False
+    VLLM_1CAT_ADAPTIVE_MTP: str = "auto"
+    VLLM_1CAT_ADAPTIVE_MTP_MIN_K: int = 2
     VLLM_SM70_QUANT_BACKEND: Literal["auto", "marlin", "turbomind"] = "auto"
     VLLM_SM70_AWQ_TURBOMIND: bool = True
     VLLM_SM70_GPTQ_TURBOMIND: bool = False
@@ -503,7 +505,9 @@ if TYPE_CHECKING:
     VLLM_V41_EM7: str = "1"
     VLLM_V41_EM8: str | None = None
     VLLM_V41_EMPTY_CACHE_TOKENS: str = "2048"
+    VLLM_V41_ENGRAM_PEER: str | None = None
     VLLM_V41_ENGRAM_READERS: str | None = None
+    VLLM_V41_ENGRAM_SPLIT_ROW: str = "0"
     VLLM_V41_EXACT_GEMM: str = "0"
     VLLM_V41_EXPERT_DIET: str = "0"
     VLLM_V41_EXPERT_FAST: str = "0"
@@ -552,7 +556,9 @@ if TYPE_CHECKING:
     VLLM_V41_HC_PARTS_CUDA: str = "0"
     VLLM_V41_HC_SIDE: str = "0"
     VLLM_V41_HC_SIDE_MAX: str = "64"
+    VLLM_V41_DECODE_PROTECT: str = "1"
     VLLM_V41_INDEX_SHARD: str = "0"
+    VLLM_V41_KV_SHARD: str = "0"
     VLLM_V41_INLINE_DRAFTS: str = "0"
     VLLM_V41_LATE_GATHER: str = "0"
     VLLM_V41_LAZY_OUTPUT_IDS: str = "0"
@@ -574,6 +580,7 @@ if TYPE_CHECKING:
     VLLM_V41_PP_SERIAL: str = "0"
     VLLM_V41_PP_TOKEN_NCCL: str = "0"
     VLLM_V41_PREFILL_PIPELINE: str = "0"
+    VLLM_V41_VISION: str = "0"
     VLLM_V41_PROPOSE_GRAPH: str = "0"
     VLLM_V41_PROPOSE_GRAPH_MODE: str = "relaxed"
     VLLM_V41_Q8: str = "1"
@@ -592,6 +599,8 @@ if TYPE_CHECKING:
     VLLM_V41_TRACE_NOSYNC: str = "0"
     VLLM_V41_W13_UNITS: str = ""
     VLLM_V41_W2_ROUTE: str = "0"
+    VLLM_V41_LL_CAP: str = "4194304"
+    VLLM_V41_MARKOV_CUDA: str = "1"
     VLLM_V41_HC_V3: str = "1"
     VLLM_V41_HC_V3_GROUPS: str = "8"
     VLLM_V41_HC_WINDOW: str = "2048"
@@ -1574,8 +1583,10 @@ def _get_weight_load_max_split_scope() -> bool:
 
 environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_PHASE_SEPARATION": env_var(
-        lambda: os.getenv("VLLM_SM70_PHASE_SEPARATION", "0").strip().lower()
-        not in ("", "0", "false", "no", "off"),
+        lambda: (
+            os.getenv("VLLM_SM70_PHASE_SEPARATION", "0").strip().lower()
+            not in ("", "0", "false", "no", "off")
+        ),
         description=(
             "Separate resident decode and prefill phases in synchronous PP1 "
             "chunked text generation. Cache recovery keeps its normal path. "
@@ -1646,8 +1657,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=True,
     ),
     "VLLM_KV_RETENTION_ENABLED": env_var(
-        lambda: os.getenv("VLLM_KV_RETENTION_ENABLED", "0").strip().lower()
-        not in ("", "0", "false", "no", "off"),
+        lambda: (
+            os.getenv("VLLM_KV_RETENTION_ENABLED", "0").strip().lower()
+            not in ("", "0", "false", "no", "off")
+        ),
         description=(
             "Opt into warm KV history-block retention using cache_config.retention. "
             "The default free queue already preserves valid prefix hashes until "
@@ -3626,6 +3639,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
         user_visible=False,
+    ),
+    "VLLM_1CAT_ADAPTIVE_MTP": env_var(
+        lambda: os.getenv("VLLM_1CAT_ADAPTIVE_MTP", "auto").strip().lower(),
+        description=(
+            "Async adaptive speculative depth (EntMTP) policy for MTP decode: "
+            "'auto' enables on SM70 when num_speculative_tokens >= 5, '1'/'on' "
+            "forces on for num_speculative_tokens >= 3, '0'/'off' disables."
+        ),
+        category="tuning",
+        declared_default="auto",
+        effective_default="auto",
+        automatic_conditions=(
+            "SM70 device with method='mtp' and num_speculative_tokens >= 5",
+        ),
+        acceleration_paths=("MTP verifier",),
+        user_visible=True,
+    ),
+    "VLLM_1CAT_ADAPTIVE_MTP_MIN_K": env_var(
+        lambda: int(os.getenv("VLLM_1CAT_ADAPTIVE_MTP_MIN_K", "2")),
+        description=(
+            "Minimum speculative draft depth k used by async adaptive MTP "
+            "(EntMTP) when shrinking depth on low-acceptance workloads."
+        ),
+        category="tuning",
+        declared_default="2",
+        effective_default="2",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
+        user_visible=True,
     ),
     "VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS": env_var(
         lambda: bool(int(os.getenv("VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS", "0"))),
@@ -7858,6 +7900,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=False,
     ),
+    "VLLM_V41_ENGRAM_PEER": env_var(
+        lambda: os.getenv("VLLM_V41_ENGRAM_PEER"),
+        description=(
+            "DS-V4.1 optional host:port of remote IB RAM peer serving Engram rows "
+            ">= VLLM_V41_ENGRAM_SPLIT_ROW."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_ENGRAM_SPLIT_ROW": env_var(
+        lambda: os.getenv("VLLM_V41_ENGRAM_SPLIT_ROW", "0"),
+        description=(
+            "DS-V4.1 row index above which Engram rows are served from "
+            "VLLM_V41_ENGRAM_PEER over InfiniBand."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
     "VLLM_V41_ENGRAM_READERS": env_var(
         lambda: os.getenv("VLLM_V41_ENGRAM_READERS"),
         description=("DS-V4.1 Engram reader tuning."),
@@ -8605,10 +8673,49 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=False,
     ),
+    "VLLM_V41_DECODE_PROTECT": env_var(
+        lambda: os.getenv("VLLM_V41_DECODE_PROTECT", "1"),
+        description=(
+            "DS-V4.1 PP: interleave pure CUDA-graph decode microbatches with "
+            "pure prefill microbatches when both active decoders and prefills exist."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_KV_SHARD": env_var(
+        lambda: os.getenv("VLLM_V41_KV_SHARD", "0"),
+        description=(
+            "DS-V4.1 TP4 DCP: shard compressed MLA latents and indexer keys "
+            "4x across TP4 ranks with NVLink online-softmax combine."
+        ),
+        category="tuning",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
     "VLLM_V41_PREFILL_PIPELINE": env_var(
         lambda: os.getenv("VLLM_V41_PREFILL_PIPELINE", "0"),
         description=(
             "DS-V4.1 PP: keep several prefill chunks in flight across stages."
+        ),
+        category="experimental",
+        declared_default="'0'",
+        effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_VISION": env_var(
+        lambda: os.getenv("VLLM_V41_VISION", "0"),
+        description=(
+            "DS-V4.1 native: image inputs (ViT + aligner on the first stage, "
+            "VL routing bias, no Engram n-grams over image spans)."
         ),
         category="experimental",
         declared_default="'0'",
@@ -8855,6 +8962,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="'0'",
         effective_default="'0'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_LL_CAP": env_var(
+        lambda: os.getenv("VLLM_V41_LL_CAP", "4194304"),
+        description=(
+            "DS-V4.1 SM70: per-slot byte capacity for ll_allreduce/ll_allgather."
+        ),
+        category="tuning",
+        declared_default="'4194304'",
+        effective_default="'4194304'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_V41_MARKOV_CUDA": env_var(
+        lambda: os.getenv("VLLM_V41_MARKOV_CUDA", "1"),
+        description=(
+            "DS-V4.1 SM70: single-launch 80-CTA 5-step sharded Markov CUDA kernel."
+        ),
+        category="tuning",
+        declared_default="'1'",
+        effective_default="'1'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
@@ -9432,8 +9563,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_INPLACE_AR_MIN": env_var(
-        lambda: os.getenv("VLLM_INPLACE_AR_MIN")
-        or ("4194304" if os.getenv("VLLM_V41_PACKED_KV") == "1" else "0"),
+        lambda: (
+            os.getenv("VLLM_INPLACE_AR_MIN")
+            or ("4194304" if os.getenv("VLLM_V41_PACKED_KV") == "1" else "0")
+        ),
         description=(
             "All-reduce large (prefill) temporaries in place at or above this many "
             "elements; 0 disables. The all_reduce op is declared out-of-place, so "
@@ -21817,7 +21950,9 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_EM7",
         "VLLM_V41_EM8",
         "VLLM_V41_EMPTY_CACHE_TOKENS",
+        "VLLM_V41_ENGRAM_PEER",
         "VLLM_V41_ENGRAM_READERS",
+        "VLLM_V41_ENGRAM_SPLIT_ROW",
         "VLLM_V41_EXACT_GEMM",
         "VLLM_V41_EXPERT_FAST_HIT",
         "VLLM_V41_FP8_GEMV",
@@ -21858,7 +21993,9 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_HC_PARTS_CUDA",
         "VLLM_V41_HC_SIDE",
         "VLLM_V41_HC_SIDE_MAX",
+        "VLLM_V41_DECODE_PROTECT",
         "VLLM_V41_INDEX_SHARD",
+        "VLLM_V41_KV_SHARD",
         "VLLM_V41_INLINE_DRAFTS",
         "VLLM_V41_LATE_GATHER",
         "VLLM_V41_LAZY_OUTPUT_IDS",
@@ -21880,6 +22017,7 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_V41_PP_SERIAL",
         "VLLM_V41_PP_TOKEN_NCCL",
         "VLLM_V41_PREFILL_PIPELINE",
+        "VLLM_V41_VISION",
         "VLLM_V41_PROPOSE_GRAPH",
         "VLLM_V41_PROPOSE_GRAPH_MODE",
         "VLLM_V41_Q8",

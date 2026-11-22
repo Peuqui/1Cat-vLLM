@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
@@ -104,6 +105,9 @@ class SingleTypeKVCacheManager(ABC):
         self.reuse_window: int | None = None
         # Cache-hit alignment, set by the coordinator (its ``lcm_block_size``).
         self.alignment_tokens: int | None = None
+        # Keep expired sliding-window pages until they trail by one alignment
+        # (see remove_skipped_blocks), so a follow-up turn hits after a reply.
+        self.hold_reply_window = False
         self.mamba_replay_lookbehind = False
         # The coordinator's ``prefix_cache_retention_interval``: a positive
         # value keeps a Mamba state every that many tokens, which a sliding
@@ -282,6 +286,10 @@ class SingleTypeKVCacheManager(ABC):
                 FullAttentionSpec,
                 TQFullAttentionSpec,
                 MLAAttentionSpec,
+            ) or (
+                isinstance(self.kv_cache_spec, MambaSpec)
+                and self.kv_cache_spec.mamba_type
+                in (MambaAttentionBackendEnum.SHORT_CONV, "short_conv")
             ):
                 self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
@@ -316,6 +324,10 @@ class SingleTypeKVCacheManager(ABC):
                 FullAttentionSpec,
                 TQFullAttentionSpec,
                 MLAAttentionSpec,
+            ) or (
+                isinstance(self.kv_cache_spec, MambaSpec)
+                and self.kv_cache_spec.mamba_type
+                in (MambaAttentionBackendEnum.SHORT_CONV, "short_conv")
             ):
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return new_blocks
@@ -610,10 +622,22 @@ class SingleTypeKVCacheManager(ABC):
             # A typical case is full attention that we never free any token
             # before the request is finished.
             return
-        num_skipped_blocks = num_skipped_tokens // self.block_size
         if self.reuse_window is None:
-            self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
+            self._remove_blocks_in_range(
+                request_id, 0, num_skipped_tokens // self.block_size
+            )
             return
+        if self.enable_caching and self.hold_reply_window:
+            # The window a hit at the sequence's final aligned boundary reads
+            # (a later turn resumes after this reply) trails the live window
+            # by up to one alignment and EAGLE's extra page: free those pages
+            # only once they are that far behind, so free() caches them.
+            num_skipped_tokens -= (
+                self.alignment_tokens or self.block_size
+            ) + 2 * self.block_size
+            if num_skipped_tokens <= 0:
+                return
+        num_skipped_blocks = num_skipped_tokens // self.block_size
         # Sliding window: blocks the window has moved past can serve no future
         # hit, so they are reused first -- otherwise a long prefill walks the
         # whole free queue and evicts other requests' prefixes. The exceptions
@@ -1540,6 +1564,11 @@ class MambaManager(SingleTypeKVCacheManager):
                     num_new_blocks, self.kv_cache_group_id
                 )
                 req_blocks.extend(new_blocks)
+                if self.kv_cache_spec.mamba_type in (
+                    MambaAttentionBackendEnum.SHORT_CONV,
+                    "short_conv",
+                ):
+                    self.new_block_ids.extend(b.block_id for b in new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 return req_blocks[prev_block_len:]
 
@@ -1614,6 +1643,22 @@ class MambaManager(SingleTypeKVCacheManager):
         boundaries = list(replay_boundaries)
         if boundary := getattr(request, "shared_prefix_boundary", 0):
             boundaries.append(boundary)
+        if req_boundaries := getattr(request, "prefix_cache_boundaries", None):
+            align = alignment_tokens or self.block_size
+            for b in req_boundaries:
+                if b > 0 and b % align == 0:
+                    boundaries.append(b)
+        if (
+            num_tokens > request.num_prompt_tokens
+            and not getattr(self.block_pool, "_device_state_blocks", 0)
+            and self.block_size >= 2048
+        ):
+            decode_start_blk = max(
+                num_cached_blocks_before,
+                request.num_prompt_tokens // self.block_size,
+            )
+            for blk_idx in range(decode_start_blk, num_full_blocks):
+                boundaries.append((blk_idx + 1) * self.block_size)
         mask = self.reachable_block_mask(
             num_cached_blocks_before,
             num_full_blocks,

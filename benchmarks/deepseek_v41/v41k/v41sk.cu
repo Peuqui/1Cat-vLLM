@@ -1601,7 +1601,7 @@ void moe_w13_swiglu(torch::Tensor x, torch::Tensor qcodes,
                     torch::Tensor activated, int64_t xch) {
   TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kHalf && x.is_contiguous() &&
               x.dim() == 2 && x.size(1) == 5120 && x.size(0) >= 1 &&
-              x.size(0) <= 8);
+              x.size(0) <= 8192);
   const c10::cuda::CUDAGuard guard(x.device());
   for (const auto& tensor :
        {qcodes, qscales, gscales, probabilities, perm, gids, goff, activated})
@@ -1750,12 +1750,15 @@ struct RingGather {
   // step come from the paged window cache, the step's own from values; every
   // token reads its request row of both block tables.
   bool paged = false;
+  bool paged_all_cached = false;
   const half* wcache = nullptr;  // [pages, wblock, 512]
   const int* wtable = nullptr;   // [reqs, wtable_stride]
   const int* rows = nullptr;     // token -> request row
   const int* bases = nullptr;    // token -> first token of its row
+  const int* key_counts = nullptr;
   int64_t wstride = 0;
   int wtable_stride = 0, wblock = 1, table_stride = 0;
+  int cshard_shift = 0, t_mod = 0, q_groups = 1;
 };
 
 template <bool GATHER>
@@ -1774,10 +1777,21 @@ __global__ void __launch_bounds__(32 * attn::DEC_WARPS)
   float* stage = reinterpret_cast<float*>(dsm + T_OFF);
   __shared__ unsigned live_mask;
   const int t = blockIdx.x, chunk = blockIdx.y, nchunk = gridDim.y;
+  const int tm = (GATHER && rg.t_mod) ? (t % rg.t_mod) : t;
+  const int qg = (GATHER && rg.t_mod) ? (t / rg.t_mod) : 0;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int k0 = chunk * KC;
+  if constexpr (GATHER) {
+    if (rg.key_counts != nullptr && k0 >= rg.key_counts[tm]) {
+      if (threadIdx.x < H) {
+        mpart[((size_t)t * nchunk + chunk) * H + threadIdx.x] = -1e30f;
+        lpart[((size_t)t * nchunk + chunk) * H + threadIdx.x] = 0.f;
+      }
+      return;
+    }
+  }
   const int kn = min(KC, width - k0);
-  const half* qt = q + (size_t)t * H * D;
+  const half* qt = q + ((size_t)tm * (GATHER ? rg.q_groups : 1) + qg) * H * D;
   const half* kt = keys + ((size_t)t * width + k0) * D;
   // Chunks without a live key (short contexts leave most of the 512 top-k
   // slots unused) read no keys: they report an empty softmax (l = 0).
@@ -1786,16 +1800,16 @@ __global__ void __launch_bounds__(32 * attn::DEC_WARPS)
     bool live;
     if constexpr (GATHER) {
       const int key = k0 + lane;
-      const int64_t pos = rg.positions[t];
-      live = lane < kn && rg.valid[t];
+      const int64_t pos = rg.positions[tm];
+      live = lane < kn && rg.valid[tm];
       const half* src = nullptr;
-      const int row = rg.paged ? rg.rows[t] : 0;
-      const int vbase = rg.paged ? rg.bases[t] : 0;
+      const int row = rg.paged ? rg.rows[tm] : 0;
+      const int vbase = rg.paged ? rg.bases[tm] : 0;
       if (key < rg.window) {
         const int64_t at = pos - rg.window + 1 + key;
         live &= at >= 0;
         const int64_t start = rg.paged ? rg.positions[vbase] : rg.starts[0];
-        if (at >= start) {
+        if (!rg.paged_all_cached && at >= start) {
           src = rg.values + (vbase + at - start) * D;
         } else if (rg.paged) {
           const int page =
@@ -1808,13 +1822,19 @@ __global__ void __launch_bounds__(32 * attn::DEC_WARPS)
               rg.ring + ((at % rg.ring_rows + rg.ring_rows) % rg.ring_rows) * D;
         }
       } else if (live) {
-        const int64_t index = rg.topk[(size_t)t * rg.ntopk + key - rg.window];
+        if (rg.key_counts != nullptr) {
+          live &= (key - rg.window) < rg.key_counts[tm];
+        }
+        const int64_t index =
+            live ? rg.topk[(size_t)tm * rg.ntopk + key - rg.window] : -1;
         const int per = rg.block / rg.ratio;
         live &= index >= 0 && index < (pos + 1) / rg.ratio;
         const int page =
             live ? rg.table[(size_t)row * rg.table_stride + index / per] : -1;
         live &= page >= 0;
-        if (live) src = rg.cache + page * rg.stride + (index % per) * D;
+        if (live)
+          src = rg.cache + page * rg.stride +
+                ((index % per) >> rg.cshard_shift) * D;
       }
       srcs[lane] = src;
     } else {
@@ -2102,12 +2122,14 @@ __device__ __forceinline__ const half* ring_key_src(const RingGather& rg, int t,
                : rg.ring +
                      ((at % rg.ring_rows + rg.ring_rows) % rg.ring_rows) * D;
   }
+  if (rg.key_counts != nullptr && (key - rg.window) >= rg.key_counts[t])
+    return nullptr;
   const int64_t index = rg.topk[(size_t)t * rg.ntopk + key - rg.window];
   const int per = rg.block / rg.ratio;
   if (index < 0 || index >= (pos + 1) / rg.ratio) return nullptr;
   const int page = rg.table[(size_t)row * rg.table_stride + index / per];
   if (page < 0) return nullptr;
-  return rg.cache + page * rg.stride + (index % per) * D;
+  return rg.cache + page * rg.stride + ((index % per) >> rg.cshard_shift) * D;
 }
 
 __global__ void __launch_bounds__(32 * attn::TKW)
@@ -2543,6 +2565,771 @@ void attn_paged_dec(torch::Tensor out, torch::Tensor q, torch::Tensor values,
         sink.data_ptr<float>(),
         reinterpret_cast<half*>(out.data_ptr<at::Half>()), nchunk, RingGather{},
         nullptr, 0, nullptr);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+__global__ void __launch_bounds__(128) dcp_compact_topk_kernel(
+    int* __restrict__ local_topk, int* __restrict__ local_cnt,
+    const int* __restrict__ topk, const int64_t* __restrict__ positions,
+    const bool* __restrict__ valid, int ntopk, int ratio, int shard) {
+  __shared__ int cnt_sh;
+  const int t = blockIdx.x;
+  const int lane = threadIdx.x & 31;
+  if (!valid[t]) {
+    if (threadIdx.x == 0) local_cnt[t] = 0;
+    return;
+  }
+  if (threadIdx.x == 0) cnt_sh = 0;
+  __syncthreads();
+  const int64_t limit = (positions[t] + 1) / ratio;
+  for (int k0 = 0; k0 < ntopk; k0 += 128) {
+    const int k = k0 + threadIdx.x;
+    const int idx = (k < ntopk) ? topk[(size_t)t * ntopk + k] : -1;
+    const bool keep = (idx >= 0) && (idx < limit) && ((idx & 3) == shard);
+    const unsigned m = __ballot_sync(0xffffffffu, keep);
+    int base = 0;
+    if (lane == 0 && m != 0u) base = atomicAdd(&cnt_sh, __popc(m));
+    base = __shfl_sync(0xffffffffu, base, 0);
+    if (keep) {
+      const int off = __popc(m & ((1u << lane) - 1u));
+      local_topk[(size_t)t * ntopk + base + off] = idx;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) local_cnt[t] = cnt_sh;
+}
+
+constexpr int DCP_OML_STRIDE = 258;  // 256 uint32 (512 FP16) + 2 float32 (M, L)
+constexpr int DCP_SPLIT_CTAS = 6;
+
+// True GQA-64 DCP=4 decode split kernel: loads each 32x512 compressed KV tile
+// ONCE into shared memory and computes WMMA QK + softmax + PV across all 4 TP
+// query groups (64 heads total), cutting global KV HBM traffic 4x and
+// CTAs 10.7x.
+__global__ void __launch_bounds__(32 * attn::DEC_WARPS)
+    dcp_gqa64_split_kernel(const half* __restrict__ q_all,
+                           half* __restrict__ opart, float* __restrict__ mpart,
+                           float* __restrict__ lpart, int T, int nchunk_stride,
+                           float scale, RingGather rg) {
+  using namespace nvcuda;
+  using namespace attn;
+  extern __shared__ __align__(128) unsigned char dsm[];
+  half* qs = reinterpret_cast<half*>(dsm + Q_OFF);
+  half* ks = reinterpret_cast<half*>(dsm + K_OFF);
+  float* sc = reinterpret_cast<float*>(dsm + S_OFF);
+  half* ps = reinterpret_cast<half*>(dsm + P_OFF);
+  float* stage = reinterpret_cast<float*>(dsm + T_OFF);
+  __shared__ unsigned live_mask;
+  __shared__ const half* srcs[KC];
+
+  const int t = blockIdx.x, split = blockIdx.y;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int cnt = rg.valid[t] ? rg.key_counts[t] : 0;
+  if (split * KC >= cnt) return;
+
+  const int64_t pos = rg.positions[t];
+  const int row = rg.rows[t];
+  const int per = rg.block / rg.ratio;
+  const int64_t limit = (pos + 1) / rg.ratio;
+
+  for (int chunk = split; chunk * KC < cnt; chunk += DCP_SPLIT_CTAS) {
+    const int k0 = chunk * KC;
+    const int kn = min(KC, cnt - k0);
+    if (warp == 0) {
+      bool live = lane < kn;
+      const int64_t index =
+          live ? rg.topk[(size_t)t * rg.ntopk + k0 + lane] : -1;
+      live &= index >= 0 && index < limit;
+      const int page =
+          live ? rg.table[(size_t)row * rg.table_stride + index / per] : -1;
+      live &= page >= 0;
+      srcs[lane] = live ? (rg.cache + page * rg.stride +
+                           ((index % per) >> rg.cshard_shift) * D)
+                        : nullptr;
+      const unsigned m = __ballot_sync(0xffffffffu, live);
+      if (lane == 0) live_mask = m;
+    }
+    __syncthreads();
+    const unsigned lm = live_mask;
+    if (lm == 0) {
+      if (threadIdx.x < 4 * H) {
+        const int g = threadIdx.x >> 4, h = threadIdx.x & 15;
+        const size_t idx =
+            (((size_t)g * T + t) * nchunk_stride + chunk) * H + h;
+        mpart[idx] = -1e30f;
+        lpart[idx] = 0.f;
+      }
+      __syncthreads();
+      continue;
+    }
+    {
+      constexpr int PER = KC * D / 8 / (32 * DEC_WARPS);
+      uint4 v[PER];
+#pragma unroll
+      for (int u = 0; u < PER; ++u) {
+        const int i = threadIdx.x + u * (32 * DEC_WARPS);
+        const int j = i / (D / 8), c = (i % (D / 8)) * 8;
+        v[u] = (lm >> j) & 1u
+                   ? __ldcg(reinterpret_cast<const uint4*>(srcs[j] + c))
+                   : make_uint4(0, 0, 0, 0);
+      }
+#pragma unroll
+      for (int u = 0; u < PER; ++u) {
+        const int i = threadIdx.x + u * (32 * DEC_WARPS);
+        const int j = i / (D / 8), c = (i % (D / 8)) * 8;
+        *reinterpret_cast<uint4*>(ks + j * KLD + c) = v[u];
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int g = 0; g < 4; ++g) {
+      const half* qt = q_all + ((size_t)t * 4 + g) * H * D;
+      for (int i = threadIdx.x; i < H * D / 8; i += 32 * DEC_WARPS) {
+        const int h = i / (D / 8), c = (i % (D / 8)) * 8;
+        *reinterpret_cast<uint4*>(qs + h * QLD + c) =
+            *reinterpret_cast<const uint4*>(qt + h * D + c);
+      }
+      __syncthreads();
+      if (warp < 4) {
+        const int tile = warp & 1, half_d = warp >> 1;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.f);
+#pragma unroll 1
+        for (int d = half_d * (D / 2); d < (half_d + 1) * (D / 2); d += 16) {
+          wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+          wmma::load_matrix_sync(a, qs + d, QLD);
+          wmma::load_matrix_sync(b, ks + tile * 16 * KLD + d, KLD);
+          wmma::mma_sync(acc, a, b, acc);
+        }
+        wmma::store_matrix_sync(sc + half_d * H * SLD + tile * 16, acc, SLD,
+                                wmma::mem_row_major);
+      }
+      __syncthreads();
+      const size_t ml_base = (((size_t)g * T + t) * nchunk_stride + chunk) * H;
+      for (int h = warp; h < H; h += DEC_WARPS) {
+        const bool live = (lm >> lane) & 1u;
+        const float raw = sc[h * SLD + lane] + sc[H * SLD + h * SLD + lane];
+        const float sv = live ? raw * scale : -INFINITY;
+        float m = sv;
+#pragma unroll
+        for (int o = 16; o; o >>= 1)
+          m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        const float e = live ? __expf(sv - m) : 0.f;
+        float l = e;
+#pragma unroll
+        for (int o = 16; o; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
+        ps[h * PLD + lane] = __float2half(e);
+        if (lane == 0) {
+          mpart[ml_base + h] = m;
+          lpart[ml_base + h] = l;
+        }
+      }
+      __syncthreads();
+      half* o_tok = opart + ml_base * D;
+      float* st = stage + warp * 256;
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa0,
+          pa1;
+      wmma::load_matrix_sync(pa0, ps, PLD);
+      wmma::load_matrix_sync(pa1, ps + 16, PLD);
+#pragma unroll 1
+      for (int tile = warp; tile < D / 16; tile += DEC_WARPS) {
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.f);
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b0,
+            b1;
+        wmma::load_matrix_sync(b0, ks + tile * 16, KLD);
+        wmma::load_matrix_sync(b1, ks + 16 * KLD + tile * 16, KLD);
+        wmma::mma_sync(acc, pa0, b0, acc);
+        wmma::mma_sync(acc, pa1, b1, acc);
+        wmma::store_matrix_sync(st, acc, 16, wmma::mem_row_major);
+        __syncwarp();
+#pragma unroll
+        for (int i = lane; i < 128; i += 32) {
+          const int r_h = i >> 3, col = (i & 7) * 2;
+          *reinterpret_cast<half2*>(o_tok + r_h * D + tile * 16 + col) =
+              __floats2half2_rn(st[r_h * 16 + col], st[r_h * 16 + col + 1]);
+        }
+        __syncwarp();
+      }
+      __syncthreads();
+    }
+  }
+}
+
+__global__ void __launch_bounds__(128) dcp_comp_reduce_kernel(
+    const half* __restrict__ opart, const float* __restrict__ mpart,
+    const float* __restrict__ lpart, const int* __restrict__ local_cnt,
+    const bool* __restrict__ valid, float* __restrict__ oml_send, int T,
+    int nchunk_stride) {
+  using namespace attn;
+  __shared__ float wsh[64];
+  __shared__ float inv_l;
+  __shared__ int nchunk_sh;
+  const int t = blockIdx.x, h_all = blockIdx.y;
+  const int g = h_all >> 4, h = h_all & 15;
+  const int t_ext = g * T + t;
+  const size_t base = ((size_t)t_ext * nchunk_stride) * H + h;
+  float* row_out = oml_send + (((size_t)g * T + t) * H + h) * DCP_OML_STRIDE;
+  if (threadIdx.x < 32) {
+    const int nchunk =
+        valid[t] ? min(nchunk_stride, (local_cnt[t] + KC - 1) / KC) : 0;
+    if (threadIdx.x == 0) nchunk_sh = nchunk;
+    float M = -1e30f;
+    for (int c = threadIdx.x; c < nchunk; c += 32) {
+      if (lpart[base + (size_t)c * H] > 0.f)
+        M = fmaxf(M, mpart[base + (size_t)c * H]);
+    }
+    for (int o = 16; o; o >>= 1)
+      M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+    float L = 0.f;
+    for (int c = threadIdx.x; c < nchunk; c += 32) {
+      const float l = lpart[base + (size_t)c * H];
+      const float w = l > 0.f ? __expf(mpart[base + (size_t)c * H] - M) : 0.f;
+      wsh[c] = w;
+      L += w * l;
+    }
+    for (int o = 16; o; o >>= 1) L += __shfl_xor_sync(0xffffffffu, L, o);
+    if (threadIdx.x == 0) {
+      inv_l = L > 0.f ? (1.f / L) : 0.f;
+      row_out[256] = M;
+      row_out[257] = L;
+    }
+  }
+  __syncthreads();
+  const float inv = inv_l;
+  const int nchunk = nchunk_sh;
+  const int d = threadIdx.x * 4;
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  if (inv > 0.f) {
+    for (int c = 0; c < nchunk; ++c) {
+      const float w = wsh[c];
+      if (w == 0.f) continue;
+      const uint2 v = *reinterpret_cast<const uint2*>(
+          opart + (((size_t)t_ext * nchunk_stride + c) * H + h) * D + d);
+      const half2* hv = reinterpret_cast<const half2*>(&v);
+      const float2 a = __half22float2(hv[0]), b = __half22float2(hv[1]);
+      acc[0] += w * a.x;
+      acc[1] += w * a.y;
+      acc[2] += w * b.x;
+      acc[3] += w * b.y;
+    }
+  }
+  half2* output =
+      reinterpret_cast<half2*>(reinterpret_cast<half*>(row_out) + d);
+  output[0] = __floats2half2_rn(acc[0] * inv, acc[1] * inv);
+  output[1] = __floats2half2_rn(acc[2] * inv, acc[3] * inv);
+}
+
+__global__ void __launch_bounds__(32 * attn::TKW)
+    dcp_comp_tok_kernel(const half* __restrict__ q_all,
+                        float* __restrict__ oml_send, int T, float scale,
+                        RingGather rg) {
+  using namespace nvcuda;
+  using namespace attn;
+  constexpr int NT = 32 * TKW;
+  constexpr int PER = KC * D / 8 / NT;
+  extern __shared__ __align__(128) unsigned char dsm[];
+  half* qs = reinterpret_cast<half*>(dsm + TK_Q);
+  half* ks = reinterpret_cast<half*>(dsm + TK_K);
+  float* sc = reinterpret_cast<float*>(dsm + TK_S);
+  half* ps = reinterpret_cast<half*>(dsm + TK_P);
+  float* os = reinterpret_cast<float*>(dsm + TK_O);
+  __shared__ const half* srcs[2][KC];
+  __shared__ unsigned live_mask[2];
+  __shared__ float run_m[H], run_l[H], alpha[H];
+  const int t = blockIdx.x, g = blockIdx.y;
+  const int cnt = rg.key_counts[t];
+  const size_t out_base = ((size_t)g * T + t) * H;
+  if (cnt <= 0 || !rg.valid[t]) {
+    for (int i = threadIdx.x * 2; i < H * D; i += 2 * NT) {
+      const int h = i / D, d = i % D;
+      half* o_row =
+          reinterpret_cast<half*>(oml_send + (out_base + h) * DCP_OML_STRIDE);
+      *reinterpret_cast<half2*>(o_row + d) = __floats2half2_rn(0.f, 0.f);
+    }
+    if (threadIdx.x < H) {
+      float* ml_row =
+          oml_send + (out_base + threadIdx.x) * DCP_OML_STRIDE + 256;
+      ml_row[0] = -1e30f;
+      ml_row[1] = 0.f;
+    }
+    return;
+  }
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int nchunk = (cnt + KC - 1) / KC;
+  const half* qt = q_all + ((size_t)t * 4 + g) * H * D;
+  const int64_t pos = rg.positions[t];
+  for (int i = threadIdx.x; i < H * D / 8; i += NT) {
+    const int h = i / (D / 8), c = (i % (D / 8)) * 8;
+    *reinterpret_cast<uint4*>(qs + h * QLD + c) =
+        *reinterpret_cast<const uint4*>(qt + h * D + c);
+  }
+  for (int i = threadIdx.x; i < H * D; i += NT) os[i] = 0.f;
+  if (threadIdx.x < H) {
+    run_m[threadIdx.x] = -1e30f;
+    run_l[threadIdx.x] = 0.f;
+  }
+  auto plan = [&](int chunk, int slot) {
+    const half* src = ring_key_src(rg, t, chunk * KC + lane, cnt, pos, true);
+    srcs[slot][lane] = src;
+    const unsigned m = __ballot_sync(0xffffffffu, src != nullptr);
+    if (lane == 0) live_mask[slot] = m;
+  };
+  uint4 v[PER];
+  auto fetch = [&](int slot) {
+    const unsigned lm = live_mask[slot];
+#pragma unroll
+    for (int u = 0; u < PER; ++u) {
+      const int i = threadIdx.x + u * NT;
+      const int j = i / (D / 8), c = (i % (D / 8)) * 8;
+      v[u] = (lm >> j) & 1u
+                 ? __ldcg(reinterpret_cast<const uint4*>(srcs[slot][j] + c))
+                 : make_uint4(0, 0, 0, 0);
+    }
+  };
+  if (warp == 0) plan(0, 0);
+  __syncthreads();
+  fetch(0);
+  for (int chunk = 0; chunk < nchunk; ++chunk) {
+    const int slot = chunk & 1;
+    const unsigned lm = live_mask[slot];
+#pragma unroll
+    for (int u = 0; u < PER; ++u) {
+      const int i = threadIdx.x + u * NT;
+      const int j = i / (D / 8), c = (i % (D / 8)) * 8;
+      *reinterpret_cast<uint4*>(ks + j * KLD + c) = v[u];
+    }
+    if (warp == 0 && chunk + 1 < nchunk) plan(chunk + 1, slot ^ 1);
+    __syncthreads();
+    if (chunk + 1 < nchunk) fetch(slot ^ 1);
+    if (lm != 0) {
+      {
+        const int tile = warp & 1, part = warp >> 1;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.f);
+#pragma unroll
+        for (int d = part * (D / 4); d < (part + 1) * (D / 4); d += 16) {
+          wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+          wmma::load_matrix_sync(a, qs + d, QLD);
+          wmma::load_matrix_sync(b, ks + tile * 16 * KLD + d, KLD);
+          wmma::mma_sync(acc, a, b, acc);
+        }
+        wmma::store_matrix_sync(sc + part * H * SLD + tile * 16, acc, SLD,
+                                wmma::mem_row_major);
+      }
+      __syncthreads();
+      for (int h = warp; h < H; h += TKW) {
+        const bool live = (lm >> lane) & 1u;
+        const int o = h * SLD + lane;
+        const float raw =
+            sc[o] + sc[H * SLD + o] + sc[2 * H * SLD + o] + sc[3 * H * SLD + o];
+        const float sv = live ? raw * scale : -INFINITY;
+        float m = sv;
+#pragma unroll
+        for (int x = 16; x; x >>= 1)
+          m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, x));
+        const float l_prev = run_l[h];
+        const float m_old = run_m[h];
+        const float m_new = l_prev > 0.f ? fmaxf(m_old, m) : m;
+        const float e = live ? __expf(sv - m_new) : 0.f;
+        float l = e;
+#pragma unroll
+        for (int x = 16; x; x >>= 1) l += __shfl_xor_sync(0xffffffffu, l, x);
+        ps[h * PLD + lane] = __float2half(e);
+        if (lane == 0) {
+          const float a = l_prev > 0.f ? __expf(m_old - m_new) : 0.f;
+          alpha[h] = a;
+          run_l[h] = l_prev * a + l;
+          run_m[h] = m_new;
+        }
+      }
+      __syncthreads();
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa0,
+          pa1;
+      wmma::load_matrix_sync(pa0, ps, PLD);
+      wmma::load_matrix_sync(pa1, ps + 16, PLD);
+#pragma unroll
+      for (int tile = warp; tile < D / 16; tile += TKW) {
+        for (int i = lane; i < 256; i += 32)
+          os[(i >> 4) * D + tile * 16 + (i & 15)] *= alpha[i >> 4];
+        __syncwarp();
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::load_matrix_sync(acc, os + tile * 16, D, wmma::mem_row_major);
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b0,
+            b1;
+        wmma::load_matrix_sync(b0, ks + tile * 16, KLD);
+        wmma::load_matrix_sync(b1, ks + 16 * KLD + tile * 16, KLD);
+        wmma::mma_sync(acc, pa0, b0, acc);
+        wmma::mma_sync(acc, pa1, b1, acc);
+        wmma::store_matrix_sync(os + tile * 16, acc, D, wmma::mem_row_major);
+      }
+    }
+    __syncthreads();
+  }
+  for (int i = threadIdx.x * 2; i < H * D; i += 2 * NT) {
+    const int h = i / D, d = i % D;
+    const float rl = run_l[h];
+    const float inv = rl > 0.f ? (1.f / rl) : 0.f;
+    half* o_row =
+        reinterpret_cast<half*>(oml_send + (out_base + h) * DCP_OML_STRIDE);
+    *reinterpret_cast<half2*>(o_row + d) =
+        __floats2half2_rn(os[i] * inv, os[i + 1] * inv);
+  }
+  if (threadIdx.x < H) {
+    float* ml_row = oml_send + (out_base + threadIdx.x) * DCP_OML_STRIDE + 256;
+    ml_row[0] = run_m[threadIdx.x];
+    ml_row[1] = run_l[threadIdx.x];
+  }
+}
+
+template <bool POST>
+__global__ void __launch_bounds__(128)
+    dcp_win_combine_kernel(const half* __restrict__ opart_w,
+                           const float* __restrict__ mpart_w,
+                           const float* __restrict__ lpart_w,
+                           const float* __restrict__ oml_recv,
+                           const float* __restrict__ sink,
+                           half* __restrict__ out, int T, int nchunk_w,
+                           RingGather rg, const float* rope, int rope_length) {
+  using namespace attn;
+  __shared__ float wsh[16];
+  __shared__ float csh[4];
+  __shared__ float inv_l;
+  const int t = blockIdx.x, h = blockIdx.y;
+  if constexpr (POST) {
+    if (h == H) {
+      const int64_t position = rg.positions[t];
+      if (rg.valid[t] && position >= 0) {
+        const int page = rg.wtable[(size_t)rg.rows[t] * rg.wtable_stride +
+                                   position / rg.wblock];
+        if (page < 0) return;
+        const half* source = rg.values + (size_t)t * D;
+        half* destination = const_cast<half*>(rg.wcache) + page * rg.wstride +
+                            (position % rg.wblock) * D;
+        for (int i = threadIdx.x; i < D / 8; i += blockDim.x)
+          reinterpret_cast<uint4*>(destination)[i] =
+              reinterpret_cast<const uint4*>(source)[i];
+      }
+      return;
+    }
+  }
+  const size_t wbase = (size_t)t * nchunk_w * H + h;
+  if (threadIdx.x < 32) {
+    float M = sink[h];
+    if (threadIdx.x < nchunk_w) {
+      const float lw = lpart_w[wbase + (size_t)threadIdx.x * H];
+      if (lw > 0.f) M = fmaxf(M, mpart_w[wbase + (size_t)threadIdx.x * H]);
+    } else if (threadIdx.x >= 16 && threadIdx.x < 20) {
+      const int s = threadIdx.x - 16;
+      const float* ml =
+          oml_recv + (((size_t)s * T + t) * H + h) * DCP_OML_STRIDE + 256;
+      if (ml[1] > 0.f) M = fmaxf(M, ml[0]);
+    }
+    for (int o = 16; o; o >>= 1)
+      M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+    float L = 0.f;
+    if (threadIdx.x < nchunk_w) {
+      const float lw = lpart_w[wbase + (size_t)threadIdx.x * H];
+      const float w =
+          lw > 0.f ? __expf(mpart_w[wbase + (size_t)threadIdx.x * H] - M) : 0.f;
+      wsh[threadIdx.x] = w;
+      L += w * lw;
+    } else if (threadIdx.x >= 16 && threadIdx.x < 20) {
+      const int s = threadIdx.x - 16;
+      const float* ml =
+          oml_recv + (((size_t)s * T + t) * H + h) * DCP_OML_STRIDE + 256;
+      const float wc = ml[1] > 0.f ? (__expf(ml[0] - M) * ml[1]) : 0.f;
+      csh[s] = wc;
+      L += wc;
+    }
+    for (int o = 16; o; o >>= 1) L += __shfl_xor_sync(0xffffffffu, L, o);
+    if (threadIdx.x == 0) inv_l = 1.f / (L + __expf(sink[h] - M));
+  }
+  __syncthreads();
+  const float inv = inv_l;
+  const int d = threadIdx.x * 4;
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  for (int c = 0; c < nchunk_w; ++c) {
+    const float w = wsh[c];
+    if (w == 0.f) continue;
+    const uint2 v = *reinterpret_cast<const uint2*>(
+        opart_w + ((size_t)(t * nchunk_w + c) * H + h) * D + d);
+    const half2* hv = reinterpret_cast<const half2*>(&v);
+    const float2 a = __half22float2(hv[0]), b = __half22float2(hv[1]);
+    acc[0] += w * a.x;
+    acc[1] += w * a.y;
+    acc[2] += w * b.x;
+    acc[3] += w * b.y;
+  }
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+    const float wc = csh[s];
+    if (wc == 0.f) continue;
+    const half* o_row = reinterpret_cast<const half*>(
+        oml_recv + (((size_t)s * T + t) * H + h) * DCP_OML_STRIDE);
+    const uint2 v = *reinterpret_cast<const uint2*>(o_row + d);
+    const half2* hv = reinterpret_cast<const half2*>(&v);
+    const float2 a = __half22float2(hv[0]), b = __half22float2(hv[1]);
+    acc[0] += wc * a.x;
+    acc[1] += wc * a.y;
+    acc[2] += wc * b.x;
+    acc[3] += wc * b.y;
+  }
+  if constexpr (POST) {
+    float value[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      value[i] = __half2float(__float2half_rn(acc[i] * inv));
+    if (d >= D - 64) {
+      const int64_t position = rg.positions[t];
+      const int first_pair = (d - (D - 64)) / 2;
+#pragma unroll
+      for (int pair = 0; pair < 2; ++pair) {
+        const int index = first_pair + pair;
+        float cosine, sine;
+        if (position < rope_length) {
+          cosine = rope[position * 64 + index];
+          sine = -rope[position * 64 + 32 + index];
+        } else {
+          const float angle = (float)position * rope[rope_length * 64 + index];
+          sincosf(angle, &sine, &cosine);
+          sine = -sine;
+        }
+        const float a = value[pair * 2], b = value[pair * 2 + 1];
+        value[pair * 2] = __half2float(__float2half_rn(
+            __fsub_rn(__fmul_rn(a, cosine), __fmul_rn(b, sine))));
+        value[pair * 2 + 1] = __half2float(__float2half_rn(
+            __fadd_rn(__fmul_rn(a, sine), __fmul_rn(b, cosine))));
+      }
+    }
+    float maximum = fmaxf(fmaxf(fabsf(value[0]), fabsf(value[1])),
+                          fmaxf(fabsf(value[2]), fabsf(value[3])));
+#pragma unroll
+    for (int delta = 16; delta; delta >>= 1)
+      maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, delta));
+    const unsigned bits =
+        __float_as_uint(fmaxf(maximum, 1e-4f) * (1.f / 448.f));
+    const unsigned exponent = (bits >> 23) + ((bits & 0x7fffffu) != 0);
+    const float quant_scale = __uint_as_float(exponent << 23);
+    const float reciprocal = __uint_as_float((254u - exponent) << 23);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      value[i] = attn_fp8_round(value[i] * reciprocal) * quant_scale;
+    half2* output = reinterpret_cast<half2*>(out + ((size_t)t * H + h) * D + d);
+    output[0] = __floats2half2_rn(value[0], value[1]);
+    output[1] = __floats2half2_rn(value[2], value[3]);
+  } else {
+    half2* output = reinterpret_cast<half2*>(out + ((size_t)t * H + h) * D + d);
+    output[0] = __floats2half2_rn(acc[0] * inv, acc[1] * inv);
+    output[1] = __floats2half2_rn(acc[2] * inv, acc[3] * inv);
+  }
+}
+
+struct DCPWorkspace {
+  torch::Tensor opart_c;
+  torch::Tensor ml_c;
+  torch::Tensor opart_w;
+  torch::Tensor ml_w;
+};
+
+static DCPWorkspace& get_dcp_ws(int dev,
+                                const torch::TensorOptions& half_opts) {
+  static DCPWorkspace ws[8];
+  TORCH_CHECK(dev >= 0 && dev < 8);
+  DCPWorkspace& w = ws[dev];
+  if (!w.opart_c.defined() &&
+      at::cuda::currentStreamCaptureStatusMayInitCtx() ==
+          at::cuda::CaptureStatus::None) {
+    constexpr int64_t T_MAX = 192, NC_MAX = 16, NW_MAX = 8;
+    auto f32_opts = half_opts.dtype(torch::kFloat32);
+    w.opart_c =
+        torch::empty({4 * T_MAX * NC_MAX * attn::H * attn::D}, half_opts);
+    w.ml_c = torch::empty({2 * 4 * T_MAX * NC_MAX * attn::H}, f32_opts);
+    w.opart_w = torch::empty({T_MAX * NW_MAX * attn::H * attn::D}, half_opts);
+    w.ml_w = torch::empty({2 * T_MAX * NW_MAX * attn::H}, f32_opts);
+  }
+  return w;
+}
+
+void dcp_compact_topk(torch::Tensor local_topk, torch::Tensor local_cnt,
+                      torch::Tensor topk, torch::Tensor positions,
+                      torch::Tensor valid, int64_t ratio, int64_t shard) {
+  const int T = topk.size(0);
+  const int ntopk = topk.size(1);
+  if (T <= 0) return;
+  TORCH_CHECK(topk.is_cuda() && topk.scalar_type() == torch::kInt32 &&
+              topk.is_contiguous() && local_topk.is_contiguous() &&
+              local_cnt.is_contiguous());
+  const at::cuda::OptionalCUDAGuard guard(device_of(topk));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dcp_compact_topk_kernel<<<T, 128, 0, stream>>>(
+      local_topk.data_ptr<int>(), local_cnt.data_ptr<int>(),
+      topk.data_ptr<int>(), positions.data_ptr<int64_t>(),
+      valid.data_ptr<bool>(), ntopk, (int)ratio, (int)shard);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void attn_dcp_comp(torch::Tensor oml_send, torch::Tensor q_all,
+                   torch::Tensor cache, torch::Tensor table, torch::Tensor rows,
+                   torch::Tensor positions, torch::Tensor valid,
+                   torch::Tensor local_topk, torch::Tensor local_cnt,
+                   double scale, int64_t block, int64_t ratio) {
+  using namespace attn;
+  const int T = q_all.size(0);
+  const int ntopk = local_topk.size(1);
+  TORCH_CHECK(q_all.is_cuda() && q_all.scalar_type() == torch::kFloat16 &&
+              q_all.is_contiguous() && q_all.size(1) == 4 * H &&
+              q_all.size(2) == D);
+  TORCH_CHECK(oml_send.is_contiguous() &&
+              oml_send.scalar_type() == torch::kFloat32 &&
+              oml_send.numel() == (int64_t)4 * T * H * DCP_OML_STRIDE);
+  TORCH_CHECK(
+      local_topk.scalar_type() == torch::kInt32 && local_topk.is_contiguous() &&
+      local_cnt.scalar_type() == torch::kInt32 && local_cnt.is_contiguous());
+  if (T <= 0) return;
+  const at::cuda::OptionalCUDAGuard guard(device_of(q_all));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  RingGather rg{};
+  rg.cache = reinterpret_cast<const half*>(cache.data_ptr<at::Half>());
+  rg.table = table.data_ptr<int>();
+  rg.positions = positions.data_ptr<int64_t>();
+  rg.valid = valid.data_ptr<bool>();
+  rg.topk = local_topk.data_ptr<int>();
+  rg.key_counts = local_cnt.data_ptr<int>();
+  rg.stride = cache.stride(0);
+  rg.block = (int)block;
+  rg.ratio = (int)ratio;
+  rg.window = 0;
+  rg.ntopk = ntopk;
+  rg.paged = true;
+  rg.rows = rows.data_ptr<int>();
+  rg.bases = rows.data_ptr<int>();
+  rg.table_stride = (int)table.stride(0);
+  rg.cshard_shift = 2;
+  const int nchunk = (ntopk + KC - 1) / KC;
+  if (T <= 192 && nchunk <= 16) {
+    rg.t_mod = T;
+    rg.q_groups = 4;
+    DCPWorkspace& ws = get_dcp_ws(q_all.get_device(), q_all.options());
+    torch::Tensor opart =
+        ws.opart_c.defined()
+            ? ws.opart_c
+            : torch::empty({4 * (int64_t)T * nchunk * H * D}, q_all.options());
+    torch::Tensor ml =
+        ws.ml_c.defined()
+            ? ws.ml_c
+            : torch::empty({2 * 4 * (int64_t)T * nchunk * H},
+                           q_all.options().dtype(torch::kFloat32));
+    float* mp = ml.data_ptr<float>();
+    float* lp = mp + 4 * (int64_t)T * nchunk * H;
+    static bool smem_set_dcp_dec = false;
+    if (!smem_set_dcp_dec) {
+      cudaFuncSetAttribute(dcp_gqa64_split_kernel,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           (int)DEC_SMEM);
+      smem_set_dcp_dec = true;
+    }
+    dcp_gqa64_split_kernel<<<dim3(T, DCP_SPLIT_CTAS), 32 * DEC_WARPS, DEC_SMEM,
+                             stream>>>(
+        reinterpret_cast<const half*>(q_all.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(opart.data_ptr<at::Half>()), mp, lp, T, nchunk,
+        (float)scale, rg);
+    dcp_comp_reduce_kernel<<<dim3(T, 4 * H), 128, 0, stream>>>(
+        reinterpret_cast<const half*>(opart.data_ptr<at::Half>()), mp, lp,
+        local_cnt.data_ptr<int>(), valid.data_ptr<bool>(),
+        oml_send.data_ptr<float>(), T, nchunk);
+  } else {
+    static bool smem_set_dcp_tok = false;
+    if (!smem_set_dcp_tok) {
+      cudaFuncSetAttribute(dcp_comp_tok_kernel,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           (int)TK_SMEM);
+      smem_set_dcp_tok = true;
+    }
+    dcp_comp_tok_kernel<<<dim3(T, 4), 32 * TKW, TK_SMEM, stream>>>(
+        reinterpret_cast<const half*>(q_all.data_ptr<at::Half>()),
+        oml_send.data_ptr<float>(), T, (float)scale, rg);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void attn_dcp_win_combine(torch::Tensor out, torch::Tensor q_local,
+                          torch::Tensor values, torch::Tensor wcache,
+                          torch::Tensor wtable, torch::Tensor rows,
+                          torch::Tensor bases, torch::Tensor positions,
+                          torch::Tensor valid, torch::Tensor oml_recv,
+                          torch::Tensor sink, double scale, int64_t wblock,
+                          int64_t window, bool paged_fused,
+                          std::optional<torch::Tensor> rope) {
+  using namespace attn;
+  const int T = q_local.size(0);
+  if (T <= 0) return;
+  TORCH_CHECK(q_local.scalar_type() == torch::kFloat16 &&
+              q_local.is_contiguous() && q_local.size(1) == H &&
+              q_local.size(2) == D);
+  TORCH_CHECK(oml_recv.is_contiguous() &&
+              oml_recv.scalar_type() == torch::kFloat32 &&
+              oml_recv.numel() == (int64_t)4 * T * H * DCP_OML_STRIDE);
+  const int nchunk_w = ((int)window + KC - 1) / KC;
+  TORCH_CHECK(nchunk_w <= 16);
+  const at::cuda::OptionalCUDAGuard guard(device_of(q_local));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  DCPWorkspace& ws = get_dcp_ws(q_local.get_device(), q_local.options());
+  const bool use_ws = (T <= 192 && nchunk_w <= 8 && ws.opart_w.defined());
+  torch::Tensor opart_w =
+      use_ws ? ws.opart_w
+             : torch::empty({(int64_t)T * nchunk_w * H * D}, q_local.options());
+  torch::Tensor ml_w =
+      use_ws ? ws.ml_w
+             : torch::empty({2 * (int64_t)T * nchunk_w * H},
+                            q_local.options().dtype(torch::kFloat32));
+  float* mp_w = ml_w.data_ptr<float>();
+  float* lp_w = mp_w + (int64_t)T * nchunk_w * H;
+  RingGather rg{};
+  rg.values = paged_fused
+                  ? reinterpret_cast<const half*>(values.data_ptr<at::Half>())
+                  : nullptr;
+  rg.positions = positions.data_ptr<int64_t>();
+  rg.valid = valid.data_ptr<bool>();
+  rg.window = (int)window;
+  rg.ntopk = 0;
+  rg.paged = true;
+  rg.paged_all_cached = !paged_fused;
+  rg.wcache = reinterpret_cast<const half*>(wcache.data_ptr<at::Half>());
+  rg.wtable = wtable.data_ptr<int>();
+  rg.rows = rows.data_ptr<int>();
+  rg.bases = bases.data_ptr<int>();
+  rg.wstride = wcache.stride(0);
+  rg.wtable_stride = (int)wtable.stride(0);
+  rg.wblock = (int)wblock;
+  static bool smem_set_win = false;
+  if (!smem_set_win) {
+    cudaFuncSetAttribute(attn_dec_split<true>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)DEC_SMEM);
+    smem_set_win = true;
+  }
+  attn_dec_split<true><<<dim3(T, nchunk_w), 32 * DEC_WARPS, DEC_SMEM, stream>>>(
+      reinterpret_cast<const half*>(q_local.data_ptr<at::Half>()), nullptr,
+      nullptr, reinterpret_cast<half*>(opart_w.data_ptr<at::Half>()), mp_w,
+      lp_w, (int)window, (float)scale, rg);
+  if (rope.has_value()) {
+    dcp_win_combine_kernel<true>
+        <<<dim3(T, H + (paged_fused ? 1 : 0)), 128, 0, stream>>>(
+            reinterpret_cast<const half*>(opart_w.data_ptr<at::Half>()), mp_w,
+            lp_w, oml_recv.data_ptr<float>(), sink.data_ptr<float>(),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()), T, nchunk_w, rg,
+            rope->data_ptr<float>(), (int)rope->size(0) - 1);
+  } else {
+    dcp_win_combine_kernel<false><<<dim3(T, H), 128, 0, stream>>>(
+        reinterpret_cast<const half*>(opart_w.data_ptr<at::Half>()), mp_w, lp_w,
+        oml_recv.data_ptr<float>(), sink.data_ptr<float>(),
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()), T, nchunk_w, rg,
+        nullptr, 0);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -2997,7 +3784,7 @@ __global__ void __launch_bounds__(W * 32)
       for (int p = 0; p < parts; ++p) v += __ldcg(all + p * 256 + e);
       store(e, v);
     }
-    if (threadIdx.x == 0) tickets[tile] = 0;
+    if (threadIdx.x == 0) atomicExch(tickets + tile, 0);
   }
   if constexpr (ROUTE) {
     __threadfence();
@@ -3009,7 +3796,255 @@ __global__ void __launch_bounds__(W * 32)
     route_plan_body<EPL, true, true, MATCH_GROUPS>(
         workspace + (size_t)tiles * parts * 256, bias, probs, ids, perm,
         experts, offsets, m, topk, scale);
-    if (threadIdx.x == 0) tickets[tiles] = 0;
+    if (threadIdx.x == 0) atomicExch(tickets + tiles, 0);
+  }
+}
+
+constexpr int RPW_MAX_SLOTS = 640;
+
+template <int EPL>
+struct RouteWideSmem {
+  int slot_ids[RPW_MAX_SLOTS];
+  float sh_score[8][EPL * 32];
+  unsigned sh_key[8][EPL * 32];
+  int cnt[EPL * 32];
+  int start[EPL * 32];
+  int gid[EPL * 32];
+  int groups_total;
+};
+
+template <int EPL, bool COHERENT, bool PREPARED>
+__device__ __forceinline__ void route_plan_wide_body(
+    RouteWideSmem<EPL>& sm, const float* __restrict__ logits,
+    const float* __restrict__ bias, float* __restrict__ probs,
+    int* __restrict__ ids, int* __restrict__ perm, int* __restrict__ experts,
+    int* __restrict__ offsets, int T, int K, float scale) {
+  constexpr int E = EPL * 32;
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const unsigned full = 0xffffffffu;
+  for (int e = threadIdx.x; e < E; e += blockDim.x) sm.cnt[e] = 0;
+  for (int t = warp; t < T; t += 8) {
+    float* sc = sm.sh_score[warp];
+    unsigned* ky = sm.sh_key[warp];
+#pragma unroll
+    for (int i = 0; i < EPL; ++i) {
+      const int e = lane + 32 * i;
+      sc[e] = COHERENT ? __ldcg(logits + (size_t)t * E + e)
+                       : logits[(size_t)t * E + e];
+      ky[e] = __float_as_uint(bias[e]);
+    }
+#pragma unroll 1
+    for (int i = 0; i < EPL; ++i) {
+      const int e = lane + 32 * i;
+      const float score = PREPARED ? sc[e] : route_score(sc[e]);
+      sc[e] = score;
+      unsigned key = __float_as_uint(score + __uint_as_float(ky[e]));
+      ky[e] = (key & 0x80000000u) ? ~key : (key | 0x80000000u);
+    }
+    __syncwarp();
+    float my_v = 0.0f;
+    int my_e = 0;
+#pragma unroll 1
+    for (int j = 0; j < K; ++j) {
+      unsigned long long best = 0ull;
+#pragma unroll 4
+      for (int i = 0; i < EPL; ++i) {
+        const unsigned u = ky[lane + 32 * i];
+        const unsigned long long packed =
+            ((unsigned long long)u << 32) | (0xffffffffu - (lane + 32 * i));
+        best = packed > best ? packed : best;
+      }
+#pragma unroll
+      for (int o = 16; o; o >>= 1) {
+        const unsigned long long other = __shfl_xor_sync(full, best, o);
+        best = other > best ? other : best;
+      }
+      const int best_e =
+          (int)(0xffffffffu - (unsigned int)(best & 0xffffffffu));
+      if (lane == j) {
+        my_v = sc[best_e];
+        my_e = best_e;
+      }
+      if (lane == (best_e & 31)) ky[best_e] = 0x007fffffu;
+      __syncwarp();
+    }
+    float total = my_v + __shfl_xor_sync(full, my_v, 4);
+    total += __shfl_xor_sync(full, total, 2);
+    total += __shfl_xor_sync(full, total, 1);
+    const float denom = __shfl_sync(full, total, 0) + 1e-20f;
+    if (lane < K) {
+      probs[t * K + lane] = rp_div(my_v, denom) * scale;
+      ids[t * K + lane] = my_e;
+      sm.slot_ids[t * K + lane] = my_e;
+    }
+    __syncwarp();
+  }
+  __syncthreads();
+  const int S = T * K;
+  for (int s = threadIdx.x; s < S; s += blockDim.x)
+    atomicAdd(&sm.cnt[sm.slot_ids[s]], 1);
+  __syncthreads();
+  if (warp == 0) {
+    int run = 0, grun = 0;
+    for (int base = 0; base < E; base += 32) {
+      const int c = sm.cnt[base + lane];
+      int inc = c, ginc = c > 0;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const int a = __shfl_up_sync(full, inc, o),
+                  b = __shfl_up_sync(full, ginc, o);
+        if (lane >= o) {
+          inc += a;
+          ginc += b;
+        }
+      }
+      sm.start[base + lane] = run + inc - c;
+      sm.gid[base + lane] = grun + ginc - (c > 0);
+      run += __shfl_sync(full, inc, 31);
+      grun += __shfl_sync(full, ginc, 31);
+    }
+    if (lane == 0) sm.groups_total = grun;
+  }
+  __syncthreads();
+  for (int s = threadIdx.x; s < S; s += blockDim.x) {
+    const int e = sm.slot_ids[s];
+    int rank = 0;
+    for (int j = 0; j < s; ++j) rank += sm.slot_ids[j] == e;
+    perm[sm.start[e] + rank] = s;
+  }
+  for (int e = threadIdx.x; e < E; e += blockDim.x) {
+    if (sm.cnt[e] > 0) {
+      experts[sm.gid[e]] = e;
+      offsets[sm.gid[e]] = sm.start[e];
+    }
+  }
+  const int groups = sm.groups_total;
+  for (int j = threadIdx.x; j <= S; j += blockDim.x) {
+    if (j >= groups && j < S) experts[j] = 0;
+    if (j >= groups) offsets[j] = S;
+  }
+}
+
+template <int W, int MTILES, bool OUT_F32, bool ROUTE = false, int EPL = 12>
+__global__ void __launch_bounds__(W * 32) h16_gemv_mtile_kernel(
+    const uint4* __restrict__ packed, const half* __restrict__ x,
+    void* __restrict__ out, float* __restrict__ workspace,
+    int* __restrict__ tickets, int n, int k, int m, float oscale,
+    const float* __restrict__ bias = nullptr,
+    float* __restrict__ probs = nullptr, int* __restrict__ ids = nullptr,
+    int* __restrict__ perm = nullptr, int* __restrict__ experts = nullptr,
+    int* __restrict__ offsets = nullptr, int topk = 0, float scale = 0.f) {
+  struct PlainPartials {
+    float partials[W][256];
+  };
+  union RouteUnion {
+    float partials[W][256];
+    RouteWideSmem<EPL> rw;
+  };
+  using SmemT =
+      typename std::conditional<ROUTE, RouteUnion, PlainPartials>::type;
+  __shared__ SmemT smu;
+  __shared__ bool last;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int tile = blockIdx.x, part = blockIdx.y, parts = gridDim.y;
+  const int tiles = gridDim.x;
+  const int quadpair = (lane >> 2) & 3;
+  const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int G = k >> 4;
+  const int gpw = G / (W * parts);
+  const int g0 = (part * W + warp) * gpw;
+  const uint4* wp = packed + ((size_t)tile * G * 32 + lane) * 2;
+  float acc[MTILES][8];
+#pragma unroll
+  for (int t = 0; t < MTILES; ++t)
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[t][i] = 0.f;
+#pragma unroll 2
+  for (int g = g0; g < g0 + gpw; ++g) {
+    const uint4 w0 = __ldcs(wp + (size_t)g * 64);
+    const uint4 w1 = __ldcs(wp + (size_t)g * 64 + 1);
+    const unsigned* B0 = reinterpret_cast<const unsigned*>(&w0);
+    const unsigned* B1 = reinterpret_cast<const unsigned*>(&w1);
+#pragma unroll
+    for (int t = 0; t < MTILES; ++t) {
+      const int r = t * 8 + row;
+      uint4 a01 = make_uint4(0, 0, 0, 0), a23 = make_uint4(0, 0, 0, 0);
+      if (r < m) {
+        const half* xr = x + (size_t)r * k + g * 16;
+        a01 = *reinterpret_cast<const uint4*>(xr);
+        a23 = *reinterpret_cast<const uint4*>(xr + 8);
+      }
+      const unsigned* A0 = reinterpret_cast<const unsigned*>(&a01);
+      const unsigned* A1 = reinterpret_cast<const unsigned*>(&a23);
+      H16_MMA(acc[t], A0[0], A0[1], B0[0], B0[1]);
+      H16_MMA(acc[t], A0[2], A0[3], B0[2], B0[3]);
+      H16_MMA(acc[t], A1[0], A1[1], B1[0], B1[1]);
+      H16_MMA(acc[t], A1[2], A1[3], B1[2], B1[3]);
+    }
+  }
+  constexpr int SLICE = MTILES * 256;
+  auto store = [&](int r, int c, float v) {
+    const size_t o = (size_t)r * n + tile * 32 + c;
+    if constexpr (OUT_F32) {
+      const float value = v * oscale;
+      reinterpret_cast<float*>(out)[o] = value;
+      if constexpr (ROUTE)
+        workspace[(size_t)tiles * parts * SLICE + o] = route_score(value);
+    } else {
+      reinterpret_cast<half*>(out)[o] = __float2half(v * oscale);
+    }
+  };
+  float* mine = workspace + ((size_t)tile * parts + part) * SLICE;
+#pragma unroll
+  for (int t = 0; t < MTILES; ++t) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int orow = (i & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
+      const int ocol = (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
+      smu.partials[warp][orow * 32 + quadpair * 8 + ocol] = acc[t][i];
+    }
+    __syncthreads();
+    const int rem = m - t * 8;
+    const int live_n = (rem >= 8 ? 8 : (rem > 0 ? rem : 0)) * 32;
+    for (int e = threadIdx.x; e < live_n; e += blockDim.x) {
+      float v = 0.f;
+#pragma unroll
+      for (int w = 0; w < W; ++w) v += smu.partials[w][e];
+      if (parts == 1) {
+        store(t * 8 + (e >> 5), e & 31, v);
+      } else {
+        mine[t * 256 + e] = v;
+      }
+    }
+    if (t + 1 < MTILES) __syncthreads();
+  }
+  if (parts > 1) {
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(tickets + tile, 1) == parts - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const float* all = workspace + (size_t)tile * parts * SLICE;
+    const int total_n = m * 32;
+    for (int e = threadIdx.x; e < total_n; e += blockDim.x) {
+      float v = 0.f;
+      for (int p = 0; p < parts; ++p) v += __ldcg(all + p * SLICE + e);
+      store(e >> 5, e & 31, v);
+    }
+    if (threadIdx.x == 0) atomicExch(tickets + tile, 0);
+  }
+  if constexpr (ROUTE) {
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(tickets + tiles, 1) == tiles - 1;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    route_plan_wide_body<EPL, true, true>(
+        smu.rw, workspace + (size_t)tiles * parts * SLICE, bias, probs, ids,
+        perm, experts, offsets, m, topk, scale);
+    if (threadIdx.x == 0) atomicExch(tickets + tiles, 0);
   }
 }
 
@@ -3021,7 +4056,7 @@ void h16_gemv(torch::Tensor out, torch::Tensor x, torch::Tensor packed,
   const int m = x.size(0), k = x.size(1), n = out.size(1);
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16 &&
               x.is_contiguous());
-  TORCH_CHECK(m >= 1 && m <= 8 && out.size(0) == m && out.is_contiguous());
+  TORCH_CHECK(m >= 1 && m <= 32 && out.size(0) == m && out.is_contiguous());
   TORCH_CHECK(n % 32 == 0 && k % 16 == 0 && packed.numel() == (int64_t)n * k &&
               packed.scalar_type() == torch::kFloat16);
   TORCH_CHECK((k / 16) % (warps * parts) == 0,
@@ -3029,35 +4064,53 @@ void h16_gemv(torch::Tensor out, torch::Tensor x, torch::Tensor packed,
   TORCH_CHECK(tickets.numel() >= n / 32 + 1);
   const at::cuda::OptionalCUDAGuard guard(device_of(x));
   auto stream = at::cuda::getCurrentCUDAStream();
-  auto ws = torch::empty({parts > 1 ? (int64_t)(n / 32) * parts * 256 : 1},
-                         x.options().dtype(torch::kFloat32));
+  const int mtiles = (m + 7) / 8;
+  auto ws =
+      torch::empty({parts > 1 ? (int64_t)(n / 32) * parts * 256 * mtiles : 1},
+                   x.options().dtype(torch::kFloat32));
   const dim3 grid(n / 32, parts);
   const bool f32 = out.scalar_type() == torch::kFloat32;
   const auto* pk = reinterpret_cast<const uint4*>(packed.data_ptr<at::Half>());
   const auto* xp = reinterpret_cast<const half*>(x.data_ptr<at::Half>());
-#define H16(Wv, F32v)                                                        \
-  h16_gemv_kernel<Wv, 2, F32v, false, 12><<<grid, Wv * 32, 0, stream>>>(     \
-      pk, xp, out.data_ptr(), ws.data_ptr<float>(), tickets.data_ptr<int>(), \
-      n, k, m, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0.f, \
-      (float)oscale)
+#define H16_DISPATCH(Wv, F32v)                                               \
+  do {                                                                       \
+    if (mtiles == 1) {                                                       \
+      h16_gemv_kernel<Wv, 2, F32v, false, 12><<<grid, Wv * 32, 0, stream>>>( \
+          pk, xp, out.data_ptr(), ws.data_ptr<float>(),                      \
+          tickets.data_ptr<int>(), n, k, m, nullptr, nullptr, nullptr,       \
+          nullptr, nullptr, nullptr, 0, 0.f, (float)oscale);                 \
+    } else if (mtiles == 2) {                                                \
+      h16_gemv_mtile_kernel<Wv, 2, F32v><<<grid, Wv * 32, 0, stream>>>(      \
+          pk, xp, out.data_ptr(), ws.data_ptr<float>(),                      \
+          tickets.data_ptr<int>(), n, k, m, (float)oscale);                  \
+    } else if (mtiles == 3) {                                                \
+      h16_gemv_mtile_kernel<Wv, 3, F32v><<<grid, Wv * 32, 0, stream>>>(      \
+          pk, xp, out.data_ptr(), ws.data_ptr<float>(),                      \
+          tickets.data_ptr<int>(), n, k, m, (float)oscale);                  \
+    } else {                                                                 \
+      h16_gemv_mtile_kernel<Wv, 4, F32v><<<grid, Wv * 32, 0, stream>>>(      \
+          pk, xp, out.data_ptr(), ws.data_ptr<float>(),                      \
+          tickets.data_ptr<int>(), n, k, m, (float)oscale);                  \
+    }                                                                        \
+  } while (0)
   if (warps == 4) {
     if (f32)
-      H16(4, true);
+      H16_DISPATCH(4, true);
     else
-      H16(4, false);
+      H16_DISPATCH(4, false);
   } else if (warps == 8) {
     if (f32)
-      H16(8, true);
+      H16_DISPATCH(8, true);
     else
-      H16(8, false);
+      H16_DISPATCH(8, false);
   } else if (warps == 16) {
     if (f32)
-      H16(16, true);
+      H16_DISPATCH(16, true);
     else
-      H16(16, false);
+      H16_DISPATCH(16, false);
   } else
     TORCH_CHECK(false, "h16_gemv: warps in {4, 8, 16}");
-#undef H16
+#undef H16_DISPATCH
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -3071,16 +4124,19 @@ void gate_route(torch::Tensor logits, torch::Tensor x, torch::Tensor packed,
   const int m = x.size(0), k = x.size(1), n = logits.size(1), K = ids.size(1);
   TORCH_CHECK(x.scalar_type() == torch::kFloat16 && x.is_contiguous());
   TORCH_CHECK(logits.scalar_type() == torch::kFloat32 && logits.size(0) == m);
-  TORCH_CHECK(m >= 1 && m <= 8 && K <= 8 && m * K < 64 &&
+  TORCH_CHECK(m >= 1 && m <= 32 && K <= 8 && m * K <= RPW_MAX_SLOTS &&
               (n == 384 || n == 128));
   TORCH_CHECK((k / 16) % (8 * parts) == 0, "gate_route: K/16 % (8*parts)");
   const at::cuda::OptionalCUDAGuard guard(device_of(x));
   auto stream = at::cuda::getCurrentCUDAStream();
-  auto ws = torch::empty({(int64_t)(n / 32) * parts * 256 + (int64_t)m * n},
-                         x.options().dtype(torch::kFloat32));
+  const int mtiles = (m + 7) / 8;
+  auto ws =
+      torch::empty({(int64_t)(n / 32) * parts * 256 * mtiles + (int64_t)m * n},
+                   x.options().dtype(torch::kFloat32));
   const dim3 grid(n / 32, parts);
   const auto* pk = reinterpret_cast<const uint4*>(packed.data_ptr<at::Half>());
   const auto* xp = reinterpret_cast<const half*>(x.data_ptr<at::Half>());
+  if (m <= 8 && m * K < 64) {
 #define GR(EPLv, MATCH)                                                     \
   h16_gemv_kernel<8, 2, true, true, EPLv, MATCH><<<grid, 256, 0, stream>>>( \
       pk, xp, logits.data_ptr(), ws.data_ptr<float>(),                      \
@@ -3088,20 +4144,44 @@ void gate_route(torch::Tensor logits, torch::Tensor x, torch::Tensor packed,
       probs.data_ptr<float>(), ids.data_ptr<int>(), perm.data_ptr<int>(),   \
       experts.data_ptr<int>(), offsets.data_ptr<int>(), K, (float)scale,    \
       (float)oscale)
-  if (n == 384) {
-    if (match_groups) {
-      GR(12, true);
+    if (n == 384) {
+      if (match_groups) {
+        GR(12, true);
+      } else {
+        GR(12, false);
+      }
     } else {
-      GR(12, false);
+      if (match_groups) {
+        GR(4, true);
+      } else {
+        GR(4, false);
+      }
     }
-  } else {
-    if (match_groups) {
-      GR(4, true);
-    } else {
-      GR(4, false);
-    }
-  }
 #undef GR
+  } else {
+#define GR_WIDE(MTv, EPLv)                                                     \
+  h16_gemv_mtile_kernel<8, MTv, true, true, EPLv><<<grid, 256, 0, stream>>>(   \
+      pk, xp, logits.data_ptr(), ws.data_ptr<float>(),                         \
+      tickets.data_ptr<int>(), n, k, m, (float)oscale, bias.data_ptr<float>(), \
+      probs.data_ptr<float>(), ids.data_ptr<int>(), perm.data_ptr<int>(),      \
+      experts.data_ptr<int>(), offsets.data_ptr<int>(), K, (float)scale)
+#define GR_WIDE_MT(EPLv) \
+  if (mtiles == 1)       \
+    GR_WIDE(1, EPLv);    \
+  else if (mtiles == 2)  \
+    GR_WIDE(2, EPLv);    \
+  else if (mtiles == 3)  \
+    GR_WIDE(3, EPLv);    \
+  else                   \
+    GR_WIDE(4, EPLv)
+    if (n == 384) {
+      GR_WIDE_MT(12);
+    } else {
+      GR_WIDE_MT(4);
+    }
+#undef GR_WIDE_MT
+#undef GR_WIDE
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -3303,6 +4383,75 @@ void ll_allgather(torch::Tensor out, torch::Tensor inp, int64_t p0, int64_t p1,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+template <bool HALF>
+__global__ void __launch_bounds__(LL_THREADS)
+    ll_alltoall_kernel(uint4* __restrict__ out, const uint4* __restrict__ in,
+                       LLPeers peers, int rank, int slice_packs, int64_t cap,
+                       int* __restrict__ counter) {
+  const int64_t base = (int64_t)(counter[blockIdx.x] & 1) * 4 * cap;
+  const int stride = gridDim.x * blockDim.x;
+  const int first = blockIdx.x * blockDim.x + threadIdx.x;
+  for (int p = first; p < slice_packs; p += stride) {
+    out[(int64_t)rank * slice_packs + p] = in[(int64_t)rank * slice_packs + p];
+#pragma unroll
+    for (int r = 1; r < 4; ++r) {
+      const int dst = (rank + r) & 3;
+      uint4 v = in[(int64_t)dst * slice_packs + p];
+      v.x = ll_escape<HALF>(v.x);
+      v.y = ll_escape<HALF>(v.y);
+      v.z = ll_escape<HALF>(v.z);
+      v.w = ll_escape<HALF>(v.w);
+      ll_store(peers.p[dst] + base + rank * cap + (int64_t)p * 16, v);
+    }
+  }
+  char* mine = peers.p[rank] + base;
+  const uint4 empty = make_uint4(~0u, ~0u, ~0u, ~0u);
+  for (int p = first; p < slice_packs; p += stride) {
+#pragma unroll
+    for (int src = 0; src < 4; ++src) {
+      if (src == rank) continue;
+      char* a = mine + src * cap + (int64_t)p * 16;
+      uint4 v;
+      do {
+        v = ll_load(a);
+      } while (!ll_ready4<HALF>(v));
+      ll_store(a, empty);
+      out[(int64_t)src * slice_packs + p] = v;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) counter[blockIdx.x] += 1;
+}
+
+void ll_alltoall(torch::Tensor out, torch::Tensor inp, int64_t p0, int64_t p1,
+                 int64_t p2, int64_t p3, int64_t rank, int64_t cap,
+                 torch::Tensor counter) {
+  const bool half_t = inp.scalar_type() == torch::kFloat16;
+  TORCH_CHECK(half_t || inp.scalar_type() == torch::kFloat32);
+  TORCH_CHECK(inp.dim() == 2 && out.dim() == 2 && inp.is_contiguous() &&
+              out.is_contiguous() && inp.size(0) == 4 && out.size(0) == 4 &&
+              out.size(1) == inp.size(1) &&
+              out.scalar_type() == inp.scalar_type());
+  const int64_t slice_bytes = inp.size(1) * inp.element_size();
+  TORCH_CHECK(slice_bytes % 16 == 0 && slice_bytes <= cap, "ll_alltoall: size");
+  TORCH_CHECK(counter.numel() >= LL_BLOCKS &&
+              counter.scalar_type() == torch::kInt32);
+  const at::cuda::OptionalCUDAGuard guard(device_of(inp));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  LLPeers peers{{reinterpret_cast<char*>(p0), reinterpret_cast<char*>(p1),
+                 reinterpret_cast<char*>(p2), reinterpret_cast<char*>(p3)}};
+  auto* o = reinterpret_cast<uint4*>(out.data_ptr());
+  const auto* i = reinterpret_cast<const uint4*>(inp.data_ptr());
+  const int sp = (int)(slice_bytes / 16);
+  if (half_t)
+    ll_alltoall_kernel<true><<<LL_BLOCKS, LL_THREADS, 0, stream>>>(
+        o, i, peers, (int)rank, sp, cap, counter.data_ptr<int>());
+  else
+    ll_alltoall_kernel<false><<<LL_BLOCKS, LL_THREADS, 0, stream>>>(
+        o, i, peers, (int)rank, sp, cap, counter.data_ptr<int>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // out may alias inp. peers: the four ranks' receive buffers (2 * 4 * cap bytes,
 // all-ones when armed); counter: LL_BLOCKS int32 zeros, private to this rank.
 void ll_allreduce(torch::Tensor out, torch::Tensor inp, int64_t p0, int64_t p1,
@@ -3331,6 +4480,1639 @@ void ll_allreduce(torch::Tensor out, torch::Tensor inp, int64_t p0, int64_t p1,
     ll_allreduce_kernel<false><<<LL_BLOCKS, LL_THREADS, 0, stream>>>(
         o, i, peers, (int)rank, (int)(bytes / 16), cap,
         counter.data_ptr<int>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---- Ultra-Fused TP4 KV-Sharded DCP=4 v2 (3 Launches/Layer, 16-Warp GQA-64 +
+// Overlapped Window + Direct NVLink P2P) ----
+constexpr int DCP_MAX_T = 384;
+constexpr int DCP_OML_ROW =
+    260;  // 256 uint32 (512 FP16) + 4 float32 (M, L, pad, pad) = 65 uint4s
+constexpr int64_t DCP_Q_CAP = (int64_t)DCP_MAX_T * 16 * 512 * 2;  // 6,291,456 B
+constexpr int64_t DCP_OML_CAP =
+    (int64_t)DCP_MAX_T * 16 * 65 * 16;                     // 6,389,760 B
+constexpr int64_t DCP_SLOT_CAP = DCP_Q_CAP + DCP_OML_CAP;  // 12,681,216 B
+
+struct DCPFusedWorkspace {
+  torch::Tensor oml_local;  // [DCP_MAX_T * 16 * 260] FP32 (6.1 MiB)
+  torch::Tensor oml_win;    // [DCP_MAX_T * 16 * 260] FP32 (6.1 MiB)
+};
+
+static DCPFusedWorkspace& get_dcp_fused_ws(
+    int dev, const torch::TensorOptions& half_opts) {
+  static DCPFusedWorkspace ws[8];
+  TORCH_CHECK(dev >= 0 && dev < 8);
+  DCPFusedWorkspace& w = ws[dev];
+  if (!w.oml_local.defined() &&
+      at::cuda::currentStreamCaptureStatusMayInitCtx() ==
+          at::cuda::CaptureStatus::None) {
+    auto f32_opts = half_opts.dtype(torch::kFloat32);
+    w.oml_local =
+        torch::empty({(int64_t)DCP_MAX_T * 16 * DCP_OML_ROW}, f32_opts);
+    w.oml_win = torch::empty({(int64_t)DCP_MAX_T * 16 * DCP_OML_ROW}, f32_opts);
+  }
+  return w;
+}
+
+void dcp_fused_warmup(torch::Tensor sample_half) {
+  const at::cuda::OptionalCUDAGuard guard(device_of(sample_half));
+  get_dcp_fused_ws(sample_half.get_device(),
+                   sample_half.options().dtype(torch::kFloat16));
+}
+
+// Zero-stack peer pointer selector & register-only half2->uint32 packer
+// (prevents nvcc local-memory STACK spills)
+__device__ __forceinline__ char* dcp_peer_ptr(const LLPeers& peers, int idx) {
+  return idx == 0
+             ? peers.p[0]
+             : (idx == 1 ? peers.p[1] : (idx == 2 ? peers.p[2] : peers.p[3]));
+}
+
+__device__ __forceinline__ uint32_t dcp_pack_h2(float a, float b) {
+  union {
+    half2 h;
+    uint32_t u;
+  } cvt;
+  cvt.h = __floats2half2_rn(a, b);
+  return cvt.u;
+}
+
+__device__ __forceinline__ float2 dcp_unpack_h2(uint32_t u) {
+  union {
+    uint32_t u;
+    half2 h;
+  } cvt;
+  cvt.u = u;
+  return __half22float2(cvt.h);
+}
+
+// Launch 1: CUDA attn_prep (query RoPE + kv_norm/RoPE/FP8-QDQ) + optional
+// direct NVLink Q push.
+__global__ void __launch_bounds__(128) attn_prep_dcp_kernel(
+    half* __restrict__ q_out, half* __restrict__ window,
+    const half* __restrict__ q_in, const half* __restrict__ kv_in,
+    const float* __restrict__ kv_weight, const int64_t* __restrict__ positions,
+    const float* __restrict__ rope, int rope_length, float eps, LLPeers peers,
+    int rank, int64_t slot_cap, const int* __restrict__ dcp_cnt) {
+  using namespace attn;
+  __shared__ float w_sq[4];
+  __shared__ float inv_rms;
+  const int t = blockIdx.x, h = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int64_t pos = positions[t];
+
+  if (h < H) {
+    if (tid >= 64) return;
+    const size_t row_u4 = ((size_t)t * H + h) * 64 + tid;
+    uint4 raw = reinterpret_cast<const uint4*>(q_in)[row_u4];
+    if (tid >= 56) {
+      const int base_pair = (tid - 56) * 4;
+      auto rot_pair = [&](uint32_t w, int index) -> uint32_t {
+        float cosine, sine;
+        if (pos < rope_length) {
+          cosine = rope[pos * 64 + index];
+          sine = rope[pos * 64 + 32 + index];
+        } else {
+          const float angle = (float)pos * rope[rope_length * 64 + index];
+          sincosf(angle, &sine, &cosine);
+        }
+        const float2 ab = dcp_unpack_h2(w);
+        const float r0 =
+            __fsub_rn(__fmul_rn(ab.x, cosine), __fmul_rn(ab.y, sine));
+        const float r1 =
+            __fadd_rn(__fmul_rn(ab.x, sine), __fmul_rn(ab.y, cosine));
+        return dcp_pack_h2(r0, r1);
+      };
+      raw.x = rot_pair(raw.x, base_pair + 0);
+      raw.y = rot_pair(raw.y, base_pair + 1);
+      raw.z = rot_pair(raw.z, base_pair + 2);
+      raw.w = rot_pair(raw.w, base_pair + 3);
+    }
+    reinterpret_cast<uint4*>(q_out)[row_u4] = raw;
+    if (peers.p[0] != nullptr) {
+      const int parity = dcp_cnt[t * H + h] & 1;
+      const int64_t q_off = (int64_t)parity * 4 * slot_cap +
+                            (int64_t)rank * slot_cap + (int64_t)row_u4 * 16;
+      uint4 esc = make_uint4(ll_escape<true>(raw.x), ll_escape<true>(raw.y),
+                             ll_escape<true>(raw.z), ll_escape<true>(raw.w));
+#pragma unroll
+      for (int r = 1; r < 4; ++r)
+        ll_store(dcp_peer_ptr(peers, (rank + r) & 3) + q_off, esc);
+    }
+    return;
+  }
+
+  // h == H: kv RMSNorm + RoPE + FP8 QDQ (4 groups of 128 across 4 warps)
+  const int col4 = tid * 4;
+  const int warp = tid >> 5, lane = tid & 31;
+  const uint2 kv_u2 =
+      *reinterpret_cast<const uint2*>(kv_in + (size_t)t * D + col4);
+  const float4 w4 = *reinterpret_cast<const float4*>(kv_weight + col4);
+  const half2* kh = reinterpret_cast<const half2*>(&kv_u2);
+  const float2 k01 = __half22float2(kh[0]), k23 = __half22float2(kh[1]);
+  float v[4] = {k01.x, k01.y, k23.x, k23.y};
+  const float ww[4] = {w4.x, w4.y, w4.z, w4.w};
+  float sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3];
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+  if (lane == 0) w_sq[warp] = sq;
+  __syncthreads();
+  if (tid == 0) {
+    const float var = (w_sq[0] + w_sq[1] + w_sq[2] + w_sq[3]) * (1.f / 512.f);
+    inv_rms = rsqrtf(var + eps);
+  }
+  __syncthreads();
+  const float inv = inv_rms;
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+    v[i] = __half2float(__float2half_rn(v[i] * inv * ww[i]));
+  if (tid >= 112) {
+    const int base_pair = (tid - 112) * 2;
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+      const int index = base_pair + p;
+      float cosine, sine;
+      if (pos < rope_length) {
+        cosine = rope[pos * 64 + index];
+        sine = rope[pos * 64 + 32 + index];
+      } else {
+        const float angle = (float)pos * rope[rope_length * 64 + index];
+        sincosf(angle, &sine, &cosine);
+      }
+      const float a = v[2 * p], b = v[2 * p + 1];
+      v[2 * p] = __half2float(
+          __float2half_rn(__fsub_rn(__fmul_rn(a, cosine), __fmul_rn(b, sine))));
+      v[2 * p + 1] = __half2float(
+          __float2half_rn(__fadd_rn(__fmul_rn(a, sine), __fmul_rn(b, cosine))));
+    }
+  }
+  float maximum =
+      fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, o));
+  const unsigned bits = __float_as_uint(fmaxf(maximum, 1e-4f) * (1.f / 448.f));
+  const unsigned exponent = (bits >> 23) + ((bits & 0x7fffffu) != 0);
+  const float quant_scale = __uint_as_float(exponent << 23);
+  const float reciprocal = __uint_as_float((254u - exponent) << 23);
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+    v[i] = attn_fp8_round(v[i] * reciprocal) * quant_scale;
+  half2* out_h2 = reinterpret_cast<half2*>(window + (size_t)t * D + col4);
+  out_h2[0] = __floats2half2_rn(v[0], v[1]);
+  out_h2[1] = __floats2half2_rn(v[2], v[3]);
+}
+
+void attn_prep_dcp(torch::Tensor q_out, torch::Tensor window, torch::Tensor q,
+                   torch::Tensor kv, torch::Tensor kv_weight,
+                   torch::Tensor positions, torch::Tensor rope, double eps,
+                   int64_t p0, int64_t p1, int64_t p2, int64_t p3, int64_t rank,
+                   int64_t slot_cap, std::optional<torch::Tensor> dcp_cnt) {
+  using namespace attn;
+  const int T = q.size(0);
+  if (T <= 0) return;
+  TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kFloat16 &&
+              q.is_contiguous() && q.size(1) == H && q.size(2) == D);
+  TORCH_CHECK(kv.scalar_type() == torch::kFloat16 && kv.is_contiguous() &&
+              kv.size(0) == T && kv.size(1) == D);
+  TORCH_CHECK(positions.scalar_type() == torch::kInt64 &&
+              rope.scalar_type() == torch::kFloat32);
+  const at::cuda::OptionalCUDAGuard guard(device_of(q));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  LLPeers peers{{reinterpret_cast<char*>(p0), reinterpret_cast<char*>(p1),
+                 reinterpret_cast<char*>(p2), reinterpret_cast<char*>(p3)}};
+  const int* cnt_ptr =
+      (p0 != 0 && dcp_cnt.has_value()) ? dcp_cnt->data_ptr<int>() : nullptr;
+  if (cnt_ptr == nullptr) peers.p[0] = nullptr;
+  attn_prep_dcp_kernel<<<dim3(T, H + 1), 128, 0, stream>>>(
+      reinterpret_cast<half*>(q_out.data_ptr<at::Half>()),
+      reinterpret_cast<half*>(window.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
+      reinterpret_cast<const half*>(kv.data_ptr<at::Half>()),
+      kv_weight.data_ptr<float>(), positions.data_ptr<int64_t>(),
+      rope.data_ptr<float>(), (int)rope.size(0) - 1, (float)eps, peers,
+      (int)rank, slot_cap, cnt_ptr);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Dynamic SMEM layout for dcp_gqa64_win_p2p_kernel (74,240 B + 1,288 B static <
+// 96 KiB): [0 .. 33280):     half ks[32][520] [33280 .. 69120): union { half
+// qs_half[64][264]; float sc[2][64][36];
+//                           struct { half qs_win[16][520]; float
+//                           sc_win[8][16][36]; }; float st[16][256]; }
+// [69120 .. 74240): half ps_sh[64][40]
+namespace dcp_p2p {
+constexpr int KLD2 = 520;
+constexpr int QLD_H = 264;
+constexpr int SLD2 = 36;
+constexpr int PLD2 = 40;
+constexpr size_t KS_OFF = 0;
+constexpr size_t U_OFF = 33280;
+constexpr size_t PS_OFF = 69120;
+constexpr size_t TOTAL_SMEM = 74240;
+}  // namespace dcp_p2p
+
+// Launch 2 (Zero-Spill True GQA-64 + Wave-Aligned Split-K + Overlapped Window +
+// Direct NVLink P2P):
+// - blockIdx.y in [0, CSPLIT): cs = blockIdx.y. Covers ALL 4 Q-groups (64
+// heads) in ONE CTA so every
+//   compressed key is read ONCE from HBM. Uses #pragma unroll 1 on D-loops +
+//   sequential pa0/pa1 PV passes
+//   + dcp_peer_ptr (~96 regs, 0 STACK, 0 STL/LDL!), reading remote Q directly
+//   from local L2 IPC buffer.
+// - blockIdx.y in [CSPLIT, CSPLIT + WSPLIT): ws_idx = blockIdx.y - CSPLIT,
+// local sliding window.
+template <int CSPLIT, int WSPLIT>
+__global__ void __launch_bounds__(512)
+    dcp_gqa64_win_p2p_kernel(const half* __restrict__ q_local,
+                             float* __restrict__ oml_local,
+                             float* __restrict__ oml_win, LLPeers peers,
+                             int rank, int64_t slot_cap,
+                             const int* __restrict__ dcp_cnt, float scale,
+                             RingGather rg_comp, RingGather rg_win) {
+  using namespace nvcuda;
+  using namespace attn;
+  using namespace dcp_p2p;
+  extern __shared__ __align__(128) unsigned char dsm[];
+  half* ks = reinterpret_cast<half*>(dsm + KS_OFF);
+  unsigned char* u_raw = dsm + U_OFF;
+  half* ps_sh = reinterpret_cast<half*>(dsm + PS_OFF);
+
+  __shared__ const half* srcs[2][KC];
+  __shared__ unsigned live_mask[2];
+  __shared__ float run_m[64], run_l[64], alpha[64];
+
+  const int t = blockIdx.x;
+  const int T = gridDim.x;
+  const int bid_y = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5, lane = tid & 31;
+  char* my_ipc = dcp_peer_ptr(peers, rank);
+
+  if (bid_y < CSPLIT) {
+    // ---- Branch 0: Sharded Compressed True GQA-64 (All 4 Q-groups = 64 heads
+    // in 1 CTA!) ----
+    const int cs = bid_y;
+    const int slot_t = cs * T + t;
+
+    const int parity = dcp_cnt[t * H] & 1;
+    const int64_t q_base = (int64_t)parity * 4 * slot_cap;
+    const int64_t oml_base = q_base + DCP_Q_CAP;
+    const bool tvalid = rg_comp.valid[t];
+    const int cnt = tvalid ? rg_comp.key_counts[t] : 0;
+    const bool has_work = (cs * KC < cnt);
+
+    // Ensure all 3 remote peers' Q rows have arrived in local IPC memory (warm
+    // in L2!). cs == 0 always waits even when !has_work so Launch 3 can safely
+    // re-arm mine_Q.
+    if (has_work || cs == 0) {
+#pragma unroll
+      for (int r = 1; r < 4; ++r) {
+        const int src = (rank + r) & 3;
+        char* peer_q =
+            my_ipc + q_base + (int64_t)src * slot_cap + (int64_t)t * H * 1024;
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+          char* a = peer_q + (int64_t)(tid + u * 512) * 16;
+          uint4 v;
+          do {
+            v = ll_load(a);
+          } while (!ll_ready4<true>(v));
+        }
+      }
+    }
+
+    if (!has_work) {
+      if (tid < 64) {
+        const int g = tid >> 4, h = tid & 15;
+        if (g == rank) {
+          float* loc = oml_local + ((size_t)slot_t * H + h) * DCP_OML_ROW + 256;
+          loc[0] = -1e30f;
+          loc[1] = 0.f;
+        } else {
+          uint4 hdr =
+              make_uint4(ll_escape<false>(__float_as_uint(-1e30f)),
+                         ll_escape<false>(__float_as_uint(0.f)), 0u, 0u);
+          ll_store(dcp_peer_ptr(peers, g) + oml_base +
+                       (int64_t)rank * slot_cap +
+                       ((int64_t)(slot_t * H + h) * 65 + 64) * 16,
+                   hdr);
+        }
+      }
+      return;
+    }
+
+    const int nchunk = (cnt + KC - 1) / KC;
+    const int64_t pos = rg_comp.positions[t];
+    const int row = rg_comp.rows[t];
+    const int per = rg_comp.block / rg_comp.ratio;
+    const int64_t limit = (pos + 1) / rg_comp.ratio;
+
+    if (tid < 64) {
+      run_m[tid] = -1e30f;
+      run_l[tid] = 0.f;
+    }
+
+    float* tmp_rmap = reinterpret_cast<float*>(ks);
+    if (tid < 256) tmp_rmap[tid] = (float)(tid >> 4);
+
+    auto plan_comp = [&](int chunk, int slot) {
+      const int k_idx = chunk * KC + lane;
+      bool live = k_idx < cnt;
+      const int64_t index =
+          live ? rg_comp.topk[(size_t)t * rg_comp.ntopk + k_idx] : -1;
+      live &= index >= 0 && index < limit;
+      const int page =
+          live ? rg_comp.table[(size_t)row * rg_comp.table_stride + index / per]
+               : -1;
+      live &= page >= 0;
+      srcs[slot][lane] = live ? (rg_comp.cache + page * rg_comp.stride +
+                                 ((index % per) >> rg_comp.cshard_shift) * D)
+                              : nullptr;
+      const unsigned m = __ballot_sync(0xffffffffu, live);
+      if (lane == 0) live_mask[slot] = m;
+    };
+
+    if (warp == 0) plan_comp(cs, 0);
+    __syncthreads();
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> rfrag;
+    wmma::load_matrix_sync(rfrag, tmp_rmap, 16, wmma::mem_row_major);
+    uint32_t rmap = 0u;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      rmap |= ((uint32_t)(int)rfrag.x[i] & 15u) << (4 * i);
+    __syncthreads();
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_o[8];
+#pragma unroll
+    for (int u = 0; u < 8; ++u) wmma::fill_fragment(acc_o[u], 0.f);
+
+    half* qs_half = reinterpret_cast<half*>(u_raw);
+    float* sc = reinterpret_cast<float*>(u_raw);
+
+    for (int iter = 0, chunk = cs; chunk < nchunk; ++iter, chunk += CSPLIT) {
+      const int slot = iter & 1;
+      const unsigned lm = live_mask[slot];
+      {
+        uint4 kv_tmp[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+          const int i = tid + u * 512;
+          const int j = i >> 6, c = (i & 63) * 8;
+          kv_tmp[u] =
+              (lm >> j) & 1u
+                  ? __ldcg(reinterpret_cast<const uint4*>(srcs[slot][j] + c))
+                  : make_uint4(0, 0, 0, 0);
+        }
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+          const int i = tid + u * 512;
+          const int j = i >> 6, c = (i & 63) * 8;
+          *reinterpret_cast<uint4*>(ks + j * KLD2 + c) = kv_tmp[u];
+        }
+      }
+      if (warp == 0 && chunk + CSPLIT < nchunk)
+        plan_comp(chunk + CSPLIT, slot ^ 1);
+      __syncthreads();
+
+      if (lm != 0) {
+        // 1. All 16 warps compute QK across all 4 Q-groups (64 heads)
+        const int g_qk = warp >> 2;          // 0..3
+        const int n_tile = (warp >> 1) & 1;  // 0..1
+        const int sub_d = warp & 1;          // 0..1 (128 dims per half)
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_qk;
+        wmma::fill_fragment(acc_qk, 0.f);
+
+        for (int hd = 0; hd < 2; ++hd) {
+#pragma unroll
+          for (int u_q = 0; u_q < 4; ++u_q) {
+            const int idx = tid + u_q * 512;
+            const int gh = idx >> 5, c8 = (idx & 31) * 8;
+            const int gs = gh >> 4, hs = gh & 15;
+            const half* src_q =
+                (gs == rank)
+                    ? (q_local + ((size_t)t * H + hs) * D + hd * 256 + c8)
+                    : (reinterpret_cast<const half*>(my_ipc + q_base +
+                                                     (int64_t)gs * slot_cap +
+                                                     (int64_t)t * H * 1024) +
+                       hs * D + hd * 256 + c8);
+            *reinterpret_cast<uint4*>(qs_half + gh * QLD_H + c8) =
+                __ldg(reinterpret_cast<const uint4*>(src_q));
+          }
+          __syncthreads();
+#pragma unroll 1
+          for (int d = sub_d * 128; d < (sub_d + 1) * 128; d += 16) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+            wmma::load_matrix_sync(a, qs_half + g_qk * H * QLD_H + d, QLD_H);
+            wmma::load_matrix_sync(b, ks + n_tile * 16 * KLD2 + hd * 256 + d,
+                                   KLD2);
+            wmma::mma_sync(acc_qk, a, b, acc_qk);
+          }
+          __syncthreads();
+        }
+        wmma::store_matrix_sync(
+            sc + (sub_d * 64 + g_qk * H) * SLD2 + n_tile * 16, acc_qk, SLD2,
+            wmma::mem_row_major);
+        __syncthreads();
+
+        // 2. Online Softmax across 64 heads (4 heads per warp)
+#pragma unroll
+        for (int uh = 0; uh < 4; ++uh) {
+          const int h_all = warp * 4 + uh;
+          const bool live = (lm >> lane) & 1u;
+          const float raw =
+              sc[h_all * SLD2 + lane] + sc[(64 + h_all) * SLD2 + lane];
+          const float sv = live ? raw * scale : -INFINITY;
+          float m = sv;
+#pragma unroll
+          for (int o = 16; o > 0; o >>= 1)
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+          const float l_prev = run_l[h_all];
+          const float m_old = run_m[h_all];
+          const float m_new = l_prev > 0.f ? fmaxf(m_old, m) : m;
+          const float e = live ? __expf(sv - m_new) : 0.f;
+          float l = e;
+#pragma unroll
+          for (int o = 16; o > 0; o >>= 1)
+            l += __shfl_xor_sync(0xffffffffu, l, o);
+          ps_sh[h_all * PLD2 + lane] = __float2half(e);
+          if (lane == 0) {
+            const float a = l_prev > 0.f ? __expf(m_old - m_new) : 0.f;
+            alpha[h_all] = a;
+            run_l[h_all] = l_prev * a + l;
+            run_m[h_all] = m_new;
+          }
+        }
+        __syncthreads();
+
+        // 3. Register-resident PV (~92 regs peak: sequential pa0 then pa1!)
+        const int g_pv = warp >> 2;
+        const int w_sub = warp & 3;
+        if (iter > 0) {
+          float a_elem[8];
+#pragma unroll
+          for (int i = 0; i < 8; ++i)
+            a_elem[i] = alpha[g_pv * H + ((rmap >> (4 * i)) & 15u)];
+#pragma unroll
+          for (int u = 0; u < 8; ++u)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc_o[u].x[i] *= a_elem[i];
+        }
+        {
+          wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa0;
+          wmma::load_matrix_sync(pa0, ps_sh + g_pv * H * PLD2, PLD2);
+#pragma unroll
+          for (int u = 0; u < 8; ++u) {
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>
+                b0;
+            wmma::load_matrix_sync(b0, ks + (w_sub * 8 + u) * 16, KLD2);
+            wmma::mma_sync(acc_o[u], pa0, b0, acc_o[u]);
+          }
+        }
+        {
+          wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa1;
+          wmma::load_matrix_sync(pa1, ps_sh + g_pv * H * PLD2 + 16, PLD2);
+#pragma unroll
+          for (int u = 0; u < 8; ++u) {
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>
+                b1;
+            wmma::load_matrix_sync(b1, ks + 16 * KLD2 + (w_sub * 8 + u) * 16,
+                                   KLD2);
+            wmma::mma_sync(acc_o[u], pa1, b1, acc_o[u]);
+          }
+        }
+      }
+      __syncthreads();
+    }
+
+    // 4. Direct NVLink P2P Epilogue (8 tiles per warp -> 64 uint4s per head)
+    float* st_warp = reinterpret_cast<float*>(u_raw) + warp * 256;
+    const int g_ep = warp >> 2;
+    const int w_sub = warp & 3;
+    const int h_ep = lane >> 1;
+    const int c8_ep = (lane & 1) * 8;
+    const float rl_ep = run_l[g_ep * H + h_ep];
+    const float inv_ep = rl_ep > 0.f ? (1.f / rl_ep) : 0.f;
+    char* dst_peer = dcp_peer_ptr(peers, g_ep);
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+      wmma::store_matrix_sync(st_warp, acc_o[u], 16, wmma::mem_row_major);
+      __syncwarp();
+      if (rl_ep > 0.f) {
+        const float* row_f = st_warp + h_ep * 16 + c8_ep;
+        uint4 pkt =
+            make_uint4(dcp_pack_h2(row_f[0] * inv_ep, row_f[1] * inv_ep),
+                       dcp_pack_h2(row_f[2] * inv_ep, row_f[3] * inv_ep),
+                       dcp_pack_h2(row_f[4] * inv_ep, row_f[5] * inv_ep),
+                       dcp_pack_h2(row_f[6] * inv_ep, row_f[7] * inv_ep));
+        const int u4_idx = (w_sub * 8 + u) * 2 + (lane & 1);
+        if (g_ep == rank) {
+          reinterpret_cast<uint4*>(oml_local + ((size_t)slot_t * H + h_ep) *
+                                                   DCP_OML_ROW)[u4_idx] = pkt;
+        } else {
+          pkt.x = ll_escape<true>(pkt.x);
+          pkt.y = ll_escape<true>(pkt.y);
+          pkt.z = ll_escape<true>(pkt.z);
+          pkt.w = ll_escape<true>(pkt.w);
+          ll_store(dst_peer + oml_base + (int64_t)rank * slot_cap +
+                       ((int64_t)(slot_t * H + h_ep) * 65 + u4_idx) * 16,
+                   pkt);
+        }
+      }
+      __syncwarp();
+    }
+    if (tid < 64) {
+      const int g = tid >> 4, h = tid & 15;
+      const float rm = run_m[tid], rl = run_l[tid];
+      if (g == rank) {
+        float* loc = oml_local + ((size_t)slot_t * H + h) * DCP_OML_ROW + 256;
+        loc[0] = rm;
+        loc[1] = rl;
+      } else {
+        uint4 hdr = make_uint4(ll_escape<false>(__float_as_uint(rm)),
+                               ll_escape<false>(__float_as_uint(rl)), 0u, 0u);
+        ll_store(dcp_peer_ptr(peers, g) + oml_base + (int64_t)rank * slot_cap +
+                     ((int64_t)(slot_t * H + h) * 65 + 64) * 16,
+                 hdr);
+      }
+    }
+    return;
+  }
+
+  // ---- Branch 1: Local Sliding Window Attention (Split-WSPLIT, Overlapped)
+  // ----
+  const int ws_idx = bid_y - CSPLIT;
+  const int wslot_t = ws_idx * T + t;
+  const int nchunk_w = (rg_win.window + KC - 1) / KC;
+  const bool tvalid = rg_win.valid[t];
+  if (!tvalid || ws_idx >= nchunk_w) {
+    if (tid < H) {
+      float* wml = oml_win + ((size_t)wslot_t * H + tid) * DCP_OML_ROW + 256;
+      wml[0] = -1e30f;
+      wml[1] = 0.f;
+    }
+    return;
+  }
+
+  half* qs_win = reinterpret_cast<half*>(u_raw);
+  float* sc_win = reinterpret_cast<float*>(u_raw + 16640);
+  const half* qt = q_local + (size_t)t * H * D;
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int idx = tid + u * 512;
+    const int h = idx >> 6, c8 = (idx & 63) * 8;
+    *reinterpret_cast<uint4*>(qs_win + h * KLD2 + c8) =
+        *reinterpret_cast<const uint4*>(qt + h * D + c8);
+  }
+  if (tid < H) {
+    run_m[tid] = -1e30f;
+    run_l[tid] = 0.f;
+  }
+
+  float* tmp_rmap = reinterpret_cast<float*>(ks);
+  if (tid < 256) tmp_rmap[tid] = (float)(tid >> 4);
+
+  const int64_t pos = rg_win.positions[t];
+  const int row = rg_win.rows[t];
+  const int vbase = rg_win.bases[t];
+  const int64_t start = rg_win.positions[vbase];
+
+  auto plan_win = [&](int chunk, int slot) {
+    const int key = chunk * KC + lane;
+    bool live = key < rg_win.window;
+    const int64_t at = pos - rg_win.window + 1 + key;
+    live &= at >= 0;
+    const half* src = nullptr;
+    if (!rg_win.paged_all_cached && at >= start) {
+      if (live) src = rg_win.values + (vbase + at - start) * D;
+    } else {
+      const int page = live ? rg_win.wtable[(size_t)row * rg_win.wtable_stride +
+                                            at / rg_win.wblock]
+                            : -1;
+      live &= page >= 0;
+      if (live)
+        src = rg_win.wcache + page * rg_win.wstride + (at % rg_win.wblock) * D;
+    }
+    srcs[slot][lane] = src;
+    const unsigned m = __ballot_sync(0xffffffffu, live);
+    if (lane == 0) live_mask[slot] = m;
+  };
+
+  if (warp == 0) plan_win(ws_idx, 0);
+  __syncthreads();
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> rfrag;
+  wmma::load_matrix_sync(rfrag, tmp_rmap, 16, wmma::mem_row_major);
+  uint32_t rmap = 0u;
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    rmap |= ((uint32_t)(int)rfrag.x[i] & 15u) << (4 * i);
+  __syncthreads();
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_w[2];
+  wmma::fill_fragment(acc_w[0], 0.f);
+  wmma::fill_fragment(acc_w[1], 0.f);
+
+  for (int witer = 0, chunk = ws_idx; chunk < nchunk_w;
+       ++witer, chunk += WSPLIT) {
+    const int slot = witer & 1;
+    const unsigned lm = live_mask[slot];
+    {
+      uint4 w_tmp[4];
+#pragma unroll
+      for (int u = 0; u < 4; ++u) {
+        const int i = tid + u * 512;
+        const int j = i >> 6, c = (i & 63) * 8;
+        w_tmp[u] =
+            (lm >> j) & 1u
+                ? __ldcg(reinterpret_cast<const uint4*>(srcs[slot][j] + c))
+                : make_uint4(0, 0, 0, 0);
+      }
+#pragma unroll
+      for (int u = 0; u < 4; ++u) {
+        const int i = tid + u * 512;
+        const int j = i >> 6, c = (i & 63) * 8;
+        *reinterpret_cast<uint4*>(ks + j * KLD2 + c) = w_tmp[u];
+      }
+    }
+    if (warp == 0 && chunk + WSPLIT < nchunk_w)
+      plan_win(chunk + WSPLIT, slot ^ 1);
+    __syncthreads();
+
+    if (lm != 0) {
+      const int n_tile = warp & 1, part_d = warp >> 1;
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_qk;
+      wmma::fill_fragment(acc_qk, 0.f);
+#pragma unroll 1
+      for (int d = part_d * 64; d < (part_d + 1) * 64; d += 16) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+        wmma::load_matrix_sync(a, qs_win + d, KLD2);
+        wmma::load_matrix_sync(b, ks + n_tile * 16 * KLD2 + d, KLD2);
+        wmma::mma_sync(acc_qk, a, b, acc_qk);
+      }
+      wmma::store_matrix_sync(sc_win + (part_d * H) * SLD2 + n_tile * 16,
+                              acc_qk, SLD2, wmma::mem_row_major);
+      __syncthreads();
+
+      const int h = warp;
+      const bool live = (lm >> lane) & 1u;
+      const int o_idx = h * SLD2 + lane;
+      const float raw =
+          sc_win[o_idx] + sc_win[H * SLD2 + o_idx] +
+          sc_win[2 * H * SLD2 + o_idx] + sc_win[3 * H * SLD2 + o_idx] +
+          sc_win[4 * H * SLD2 + o_idx] + sc_win[5 * H * SLD2 + o_idx] +
+          sc_win[6 * H * SLD2 + o_idx] + sc_win[7 * H * SLD2 + o_idx];
+      const float sv = live ? raw * scale : -INFINITY;
+      float m = sv;
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1)
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+      const float l_prev = run_l[h];
+      const float m_old = run_m[h];
+      const float m_new = l_prev > 0.f ? fmaxf(m_old, m) : m;
+      const float e = live ? __expf(sv - m_new) : 0.f;
+      float l = e;
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
+      ps_sh[h * PLD2 + lane] = __float2half(e);
+      if (lane == 0) {
+        const float a = l_prev > 0.f ? __expf(m_old - m_new) : 0.f;
+        alpha[h] = a;
+        run_l[h] = l_prev * a + l;
+        run_m[h] = m_new;
+      }
+      __syncthreads();
+
+      if (witer > 0) {
+        float a_elem[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) a_elem[i] = alpha[(rmap >> (4 * i)) & 15u];
+#pragma unroll
+        for (int u = 0; u < 2; ++u)
+#pragma unroll
+          for (int i = 0; i < 8; ++i) acc_w[u].x[i] *= a_elem[i];
+      }
+      {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa0;
+        wmma::load_matrix_sync(pa0, ps_sh, PLD2);
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b0;
+          wmma::load_matrix_sync(b0, ks + (warp * 2 + u) * 16, KLD2);
+          wmma::mma_sync(acc_w[u], pa0, b0, acc_w[u]);
+        }
+      }
+      {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa1;
+        wmma::load_matrix_sync(pa1, ps_sh + 16, PLD2);
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b1;
+          wmma::load_matrix_sync(b1, ks + 16 * KLD2 + (warp * 2 + u) * 16,
+                                 KLD2);
+          wmma::mma_sync(acc_w[u], pa1, b1, acc_w[u]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  float* st_warp = reinterpret_cast<float*>(u_raw) + warp * 256;
+  const int h_ep = lane >> 1;
+  const int c8_ep = (lane & 1) * 8;
+  const float rl_ep = run_l[h_ep];
+  const float inv_ep = rl_ep > 0.f ? (1.f / rl_ep) : 0.f;
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    wmma::store_matrix_sync(st_warp, acc_w[u], 16, wmma::mem_row_major);
+    __syncwarp();
+    if (rl_ep > 0.f) {
+      const float* row_f = st_warp + h_ep * 16 + c8_ep;
+      uint4 pkt = make_uint4(dcp_pack_h2(row_f[0] * inv_ep, row_f[1] * inv_ep),
+                             dcp_pack_h2(row_f[2] * inv_ep, row_f[3] * inv_ep),
+                             dcp_pack_h2(row_f[4] * inv_ep, row_f[5] * inv_ep),
+                             dcp_pack_h2(row_f[6] * inv_ep, row_f[7] * inv_ep));
+      const int u4_idx = (warp * 2 + u) * 2 + (lane & 1);
+      reinterpret_cast<uint4*>(oml_win + ((size_t)wslot_t * H + h_ep) *
+                                             DCP_OML_ROW)[u4_idx] = pkt;
+    }
+    __syncwarp();
+  }
+  if (tid < H) {
+    float* wml = oml_win + ((size_t)wslot_t * H + tid) * DCP_OML_ROW + 256;
+    wml[0] = run_m[tid];
+    wml[1] = run_l[tid];
+  }
+}
+
+// Launch 3: 64-thread uint4-vectorized NVLink P2P OML Combine + Q Re-arm +
+// Inverse RoPE + FP8 QDQ + Window Insert
+template <bool POST, int CSPLIT, int WSPLIT>
+__global__ void __launch_bounds__(64)
+    dcp_p2p_combine_kernel(const float* __restrict__ oml_local,
+                           const float* __restrict__ oml_win,
+                           const float* __restrict__ sink,
+                           half* __restrict__ out, LLPeers peers, int rank,
+                           int64_t slot_cap, int* __restrict__ dcp_cnt,
+                           RingGather rg_win, const float* __restrict__ rope,
+                           int rope_length) {
+  using namespace attn;
+  constexpr int N_COMP = 4 * CSPLIT;
+  constexpr int N_PARTS = N_COMP + WSPLIT;
+  static_assert(N_PARTS <= 32, "N_PARTS must fit in one warp");
+  __shared__ float sh_m[N_PARTS], sh_l[N_PARTS], sh_w[N_PARTS];
+  __shared__ float sh_inv_l;
+  const int t = blockIdx.x, h = blockIdx.y;
+  const int T = gridDim.x;
+  const int tid = threadIdx.x;
+  char* my_ipc = dcp_peer_ptr(peers, rank);
+
+  if constexpr (POST) {
+    if (h == H) {
+      const int64_t position = rg_win.positions[t];
+      if (rg_win.valid[t] && position >= 0) {
+        const int page =
+            rg_win.wtable[(size_t)rg_win.rows[t] * rg_win.wtable_stride +
+                          position / rg_win.wblock];
+        if (page < 0) return;
+        const half* source = rg_win.values + (size_t)t * D;
+        half* destination = const_cast<half*>(rg_win.wcache) +
+                            page * rg_win.wstride +
+                            (position % rg_win.wblock) * D;
+        reinterpret_cast<uint4*>(destination)[tid] =
+            reinterpret_cast<const uint4*>(source)[tid];
+      }
+      return;
+    }
+  }
+
+  const int parity = dcp_cnt[t * H + h] & 1;
+  const int64_t q_base = (int64_t)parity * 4 * slot_cap;
+  const int64_t oml_base = q_base + DCP_Q_CAP;
+  const uint4 empty = make_uint4(~0u, ~0u, ~0u, ~0u);
+
+  // Re-arm incoming NVLink Q buffer (guaranteed already consumed by Launch 2)
+#pragma unroll
+  for (int r = 1; r < 4; ++r) {
+    const int src = (rank + r) & 3;
+    ll_store(my_ipc + q_base + (int64_t)src * slot_cap +
+                 ((int64_t)(t * H + h) * 64 + tid) * 16,
+             empty);
+  }
+
+  if (tid < N_COMP) {
+    const int s = tid & 3;
+    const int cs = tid >> 2;
+    const int slot_t = cs * T + t;
+    float ms, ls;
+    if (s == rank) {
+      const float* loc =
+          oml_local + ((size_t)slot_t * H + h) * DCP_OML_ROW + 256;
+      ms = loc[0];
+      ls = loc[1];
+    } else {
+      char* hdr_addr = my_ipc + oml_base + (int64_t)s * slot_cap +
+                       ((int64_t)(slot_t * H + h) * 65 + 64) * 16;
+      uint4 hdr;
+      do {
+        hdr = ll_load(hdr_addr);
+      } while (!ll_ready<false>(hdr.x) || !ll_ready<false>(hdr.y));
+      ll_store(hdr_addr, empty);
+      ms = __uint_as_float(hdr.x);
+      ls = __uint_as_float(hdr.y);
+    }
+    sh_m[tid] = ms;
+    sh_l[tid] = ls;
+  } else if (tid < N_PARTS) {
+    const int ws_idx = tid - N_COMP;
+    const int wslot_t = ws_idx * T + t;
+    const float* wml = oml_win + ((size_t)wslot_t * H + h) * DCP_OML_ROW + 256;
+    sh_m[tid] = wml[0];
+    sh_l[tid] = wml[1];
+  }
+  __syncthreads();
+
+  if (tid < 32) {
+    float M = sink[h];
+    if (tid < N_PARTS && sh_l[tid] > 0.f) M = fmaxf(M, sh_m[tid]);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+    float L = 0.f;
+    if (tid < N_PARTS) {
+      const float l = sh_l[tid];
+      const float w = l > 0.f ? (__expf(sh_m[tid] - M) * l) : 0.f;
+      sh_w[tid] = w;
+      L = w;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) L += __shfl_xor_sync(0xffffffffu, L, o);
+    if (tid == 0) sh_inv_l = 1.f / (L + __expf(sink[h] - M));
+  }
+  __syncthreads();
+
+  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  auto accum_u4 = [&](const uint4& u, float w) {
+    if (w == 0.f) return;
+    const half2* hv = reinterpret_cast<const half2*>(&u);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const float2 f = __half22float2(hv[i]);
+      acc[2 * i] += w * f.x;
+      acc[2 * i + 1] += w * f.y;
+    }
+  };
+
+#pragma unroll
+  for (int k = 0; k < N_COMP; ++k) {
+    if (sh_l[k] > 0.f) {
+      const int s = k & 3;
+      const int cs = k >> 2;
+      const int slot_t = cs * T + t;
+      uint4 u;
+      if (s == rank) {
+        u = reinterpret_cast<const uint4*>(
+            oml_local + ((size_t)slot_t * H + h) * DCP_OML_ROW)[tid];
+      } else {
+        char* a = my_ipc + oml_base + (int64_t)s * slot_cap +
+                  ((int64_t)(slot_t * H + h) * 65 + tid) * 16;
+        do {
+          u = ll_load(a);
+        } while (!ll_ready4<true>(u));
+        ll_store(a, empty);
+      }
+      accum_u4(u, sh_w[k]);
+    }
+  }
+#pragma unroll
+  for (int ws_idx = 0; ws_idx < WSPLIT; ++ws_idx) {
+    if (sh_l[N_COMP + ws_idx] > 0.f) {
+      const int wslot_t = ws_idx * T + t;
+      const uint4 uw = reinterpret_cast<const uint4*>(
+          oml_win + ((size_t)wslot_t * H + h) * DCP_OML_ROW)[tid];
+      accum_u4(uw, sh_w[N_COMP + ws_idx]);
+    }
+  }
+
+  const float inv = sh_inv_l;
+  uint4* out_u4 = reinterpret_cast<uint4*>(out + ((size_t)t * H + h) * D);
+  if constexpr (POST) {
+    float val[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      val[i] = __half2float(__float2half_rn(acc[i] * inv));
+    if (tid >= 56) {
+      const int64_t position = rg_win.positions[t];
+      const int base_pair = (tid - 56) * 4;
+#pragma unroll
+      for (int p = 0; p < 4; ++p) {
+        const int index = base_pair + p;
+        float cosine, sine;
+        if (position < rope_length) {
+          cosine = rope[position * 64 + index];
+          sine = -rope[position * 64 + 32 + index];
+        } else {
+          const float angle = (float)position * rope[rope_length * 64 + index];
+          sincosf(angle, &sine, &cosine);
+          sine = -sine;
+        }
+        const float a = val[2 * p], b = val[2 * p + 1];
+        val[2 * p] = __half2float(__float2half_rn(
+            __fsub_rn(__fmul_rn(a, cosine), __fmul_rn(b, sine))));
+        val[2 * p + 1] = __half2float(__float2half_rn(
+            __fadd_rn(__fmul_rn(a, sine), __fmul_rn(b, cosine))));
+      }
+    }
+    float maximum = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) maximum = fmaxf(maximum, fabsf(val[i]));
+#pragma unroll
+    for (int delta = 8; delta > 0; delta >>= 1)
+      maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, delta));
+    const unsigned bits =
+        __float_as_uint(fmaxf(maximum, 1e-4f) * (1.f / 448.f));
+    const unsigned exponent = (bits >> 23) + ((bits & 0x7fffffu) != 0);
+    const float quant_scale = __uint_as_float(exponent << 23);
+    const float reciprocal = __uint_as_float((254u - exponent) << 23);
+    out_u4[tid] = make_uint4(
+        dcp_pack_h2(attn_fp8_round(val[0] * reciprocal) * quant_scale,
+                    attn_fp8_round(val[1] * reciprocal) * quant_scale),
+        dcp_pack_h2(attn_fp8_round(val[2] * reciprocal) * quant_scale,
+                    attn_fp8_round(val[3] * reciprocal) * quant_scale),
+        dcp_pack_h2(attn_fp8_round(val[4] * reciprocal) * quant_scale,
+                    attn_fp8_round(val[5] * reciprocal) * quant_scale),
+        dcp_pack_h2(attn_fp8_round(val[6] * reciprocal) * quant_scale,
+                    attn_fp8_round(val[7] * reciprocal) * quant_scale));
+  } else {
+    out_u4[tid] = make_uint4(dcp_pack_h2(acc[0] * inv, acc[1] * inv),
+                             dcp_pack_h2(acc[2] * inv, acc[3] * inv),
+                             dcp_pack_h2(acc[4] * inv, acc[5] * inv),
+                             dcp_pack_h2(acc[6] * inv, acc[7] * inv));
+  }
+
+  __syncthreads();
+  if (tid == 0) dcp_cnt[t * H + h] = parity ^ 1;
+}
+
+// Small-batch (T <= 12, N=1..2) Zero-Spill SMEM-Resident GQA-32 + Split-K +
+// Overlapped Window: Stages 2 Q-groups (32 heads x 512 dims) ONCE in SMEM
+// (87,552 B dynamic SMEM), 1-pass QK, 4 PV tiles/warp.
+template <int CSPLIT, int WSPLIT>
+__global__ void __launch_bounds__(512)
+    dcp_gqa32_win_p2p_kernel(const half* __restrict__ q_local,
+                             float* __restrict__ oml_local,
+                             float* __restrict__ oml_win, LLPeers peers,
+                             int rank, int64_t slot_cap,
+                             const int* __restrict__ dcp_cnt, float scale,
+                             RingGather rg_comp, RingGather rg_win) {
+  using namespace nvcuda;
+  using namespace attn;
+  using namespace dcp_p2p;
+  extern __shared__ __align__(128) unsigned char dsm[];
+  half* ks = reinterpret_cast<half*>(dsm + 0);
+  half* qs = reinterpret_cast<half*>(dsm + 33280);
+  float* sc = reinterpret_cast<float*>(dsm + 66560);
+  half* ps_sh = reinterpret_cast<half*>(dsm + 84992);
+
+  __shared__ const half* srcs[2][KC];
+  __shared__ unsigned live_mask[2];
+  __shared__ float run_m[32], run_l[32], alpha[32];
+
+  const int t = blockIdx.x;
+  const int T = gridDim.x;
+  const int bid_y = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5, lane = tid & 31;
+  char* my_ipc = dcp_peer_ptr(peers, rank);
+
+  if (bid_y < 2 * CSPLIT) {
+    const int g_pair = bid_y / CSPLIT;
+    const int cs = bid_y % CSPLIT;
+    const int g_base = g_pair * 2;
+    const int slot_t = cs * T + t;
+
+    const int parity = dcp_cnt[t * H] & 1;
+    const int64_t q_base = (int64_t)parity * 4 * slot_cap;
+    const int64_t oml_base = q_base + DCP_Q_CAP;
+    const bool tvalid = rg_comp.valid[t];
+    const int cnt = tvalid ? rg_comp.key_counts[t] : 0;
+    const bool has_work = (cs * KC < cnt);
+
+#pragma unroll
+    for (int sub_g = 0; sub_g < 2; ++sub_g) {
+      const int g = g_base + sub_g;
+      if (g == rank) {
+        if (has_work) {
+          const half* src_q = q_local + (size_t)t * H * D;
+#pragma unroll
+          for (int u = 0; u < 2; ++u) {
+            const int idx = tid + u * 512;
+            const int h = idx >> 6, c8 = (idx & 63) * 8;
+            *reinterpret_cast<uint4*>(qs + (sub_g * H + h) * KLD2 + c8) =
+                *reinterpret_cast<const uint4*>(src_q + h * D + c8);
+          }
+        }
+      } else if (has_work || cs == 0) {
+        char* peer_q =
+            my_ipc + q_base + (int64_t)g * slot_cap + (int64_t)t * H * 1024;
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+          const int idx = tid + u * 512;
+          char* a = peer_q + (int64_t)idx * 16;
+          uint4 v;
+          do {
+            v = ll_load(a);
+          } while (!ll_ready4<true>(v));
+          if (has_work) {
+            const int h = idx >> 6, c8 = (idx & 63) * 8;
+            *reinterpret_cast<uint4*>(qs + (sub_g * H + h) * KLD2 + c8) = v;
+          }
+        }
+      }
+    }
+
+    if (!has_work) {
+      if (tid < 32) {
+        const int sub_g = tid >> 4, h = tid & 15;
+        const int g = g_base + sub_g;
+        if (g == rank) {
+          float* loc = oml_local + ((size_t)slot_t * H + h) * DCP_OML_ROW + 256;
+          loc[0] = -1e30f;
+          loc[1] = 0.f;
+        } else {
+          uint4 hdr =
+              make_uint4(ll_escape<false>(__float_as_uint(-1e30f)),
+                         ll_escape<false>(__float_as_uint(0.f)), 0u, 0u);
+          ll_store(dcp_peer_ptr(peers, g) + oml_base +
+                       (int64_t)rank * slot_cap +
+                       ((int64_t)(slot_t * H + h) * 65 + 64) * 16,
+                   hdr);
+        }
+      }
+      return;
+    }
+
+    const int nchunk = (cnt + KC - 1) / KC;
+    const int64_t pos = rg_comp.positions[t];
+    const int row = rg_comp.rows[t];
+    const int per = rg_comp.block / rg_comp.ratio;
+    const int64_t limit = (pos + 1) / rg_comp.ratio;
+
+    if (tid < 32) {
+      run_m[tid] = -1e30f;
+      run_l[tid] = 0.f;
+    }
+    float* tmp_rmap = reinterpret_cast<float*>(ks);
+    if (tid < 256) tmp_rmap[tid] = (float)(tid >> 4);
+
+    auto plan_comp = [&](int chunk, int slot) {
+      const int k_idx = chunk * KC + lane;
+      bool live = k_idx < cnt;
+      const int64_t index =
+          live ? rg_comp.topk[(size_t)t * rg_comp.ntopk + k_idx] : -1;
+      live &= index >= 0 && index < limit;
+      const int page =
+          live ? rg_comp.table[(size_t)row * rg_comp.table_stride + index / per]
+               : -1;
+      live &= page >= 0;
+      srcs[slot][lane] = live ? (rg_comp.cache + page * rg_comp.stride +
+                                 ((index % per) >> rg_comp.cshard_shift) * D)
+                              : nullptr;
+      const unsigned m = __ballot_sync(0xffffffffu, live);
+      if (lane == 0) live_mask[slot] = m;
+    };
+
+    if (warp == 0) plan_comp(cs, 0);
+    __syncthreads();
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> rfrag;
+    wmma::load_matrix_sync(rfrag, tmp_rmap, 16, wmma::mem_row_major);
+    uint32_t rmap = 0u;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      rmap |= ((uint32_t)(int)rfrag.x[i] & 15u) << (4 * i);
+    __syncthreads();
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_o[4];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) wmma::fill_fragment(acc_o[u], 0.f);
+
+    for (int iter = 0, chunk = cs; chunk < nchunk; ++iter, chunk += CSPLIT) {
+      const int slot = iter & 1;
+      const unsigned lm = live_mask[slot];
+      {
+        uint4 kv_tmp[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+          const int i = tid + u * 512;
+          const int j = i >> 6, c = (i & 63) * 8;
+          kv_tmp[u] =
+              (lm >> j) & 1u
+                  ? __ldcg(reinterpret_cast<const uint4*>(srcs[slot][j] + c))
+                  : make_uint4(0, 0, 0, 0);
+        }
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+          const int i = tid + u * 512;
+          const int j = i >> 6, c = (i & 63) * 8;
+          *reinterpret_cast<uint4*>(ks + j * KLD2 + c) = kv_tmp[u];
+        }
+      }
+      if (warp == 0 && chunk + CSPLIT < nchunk)
+        plan_comp(chunk + CSPLIT, slot ^ 1);
+      __syncthreads();
+
+      if (lm != 0) {
+        const int sub_g = warp >> 3;
+        const int n_tile = (warp >> 2) & 1;
+        const int part_d = warp & 3;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_qk;
+        wmma::fill_fragment(acc_qk, 0.f);
+#pragma unroll 1
+        for (int d = part_d * 128; d < (part_d + 1) * 128; d += 16) {
+          wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+          wmma::load_matrix_sync(a, qs + sub_g * H * KLD2 + d, KLD2);
+          wmma::load_matrix_sync(b, ks + n_tile * 16 * KLD2 + d, KLD2);
+          wmma::mma_sync(acc_qk, a, b, acc_qk);
+        }
+        wmma::store_matrix_sync(
+            sc + (part_d * 32 + sub_g * H) * SLD2 + n_tile * 16, acc_qk, SLD2,
+            wmma::mem_row_major);
+        __syncthreads();
+
+#pragma unroll
+        for (int uh = 0; uh < 2; ++uh) {
+          const int h32 = warp * 2 + uh;
+          const bool live = (lm >> lane) & 1u;
+          const int o_idx = h32 * SLD2 + lane;
+          const float raw = sc[o_idx] + sc[32 * SLD2 + o_idx] +
+                            sc[64 * SLD2 + o_idx] + sc[96 * SLD2 + o_idx];
+          const float sv = live ? raw * scale : -INFINITY;
+          float m = sv;
+#pragma unroll
+          for (int o = 16; o > 0; o >>= 1)
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+          const float l_prev = run_l[h32];
+          const float m_old = run_m[h32];
+          const float m_new = l_prev > 0.f ? fmaxf(m_old, m) : m;
+          const float e = live ? __expf(sv - m_new) : 0.f;
+          float l = e;
+#pragma unroll
+          for (int o = 16; o > 0; o >>= 1)
+            l += __shfl_xor_sync(0xffffffffu, l, o);
+          ps_sh[h32 * PLD2 + lane] = __float2half(e);
+          if (lane == 0) {
+            const float a = l_prev > 0.f ? __expf(m_old - m_new) : 0.f;
+            alpha[h32] = a;
+            run_l[h32] = l_prev * a + l;
+            run_m[h32] = m_new;
+          }
+        }
+        __syncthreads();
+
+        const int w_sub = warp & 7;
+        if (iter > 0) {
+          float a_elem[8];
+#pragma unroll
+          for (int i = 0; i < 8; ++i)
+            a_elem[i] = alpha[sub_g * H + ((rmap >> (4 * i)) & 15u)];
+#pragma unroll
+          for (int u = 0; u < 4; ++u)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc_o[u].x[i] *= a_elem[i];
+        }
+        {
+          wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa0;
+          wmma::load_matrix_sync(pa0, ps_sh + sub_g * H * PLD2, PLD2);
+#pragma unroll
+          for (int u = 0; u < 4; ++u) {
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>
+                b0;
+            wmma::load_matrix_sync(b0, ks + (w_sub * 4 + u) * 16, KLD2);
+            wmma::mma_sync(acc_o[u], pa0, b0, acc_o[u]);
+          }
+        }
+        {
+          wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa1;
+          wmma::load_matrix_sync(pa1, ps_sh + sub_g * H * PLD2 + 16, PLD2);
+#pragma unroll
+          for (int u = 0; u < 4; ++u) {
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>
+                b1;
+            wmma::load_matrix_sync(b1, ks + 16 * KLD2 + (w_sub * 4 + u) * 16,
+                                   KLD2);
+            wmma::mma_sync(acc_o[u], pa1, b1, acc_o[u]);
+          }
+        }
+      }
+      __syncthreads();
+    }
+
+    float* st_warp = sc + warp * 256;
+    const int sub_g = warp >> 3;
+    const int g_ep = g_base + sub_g;
+    const int w_sub = warp & 7;
+    const int h_ep = lane >> 1;
+    const int c8_ep = (lane & 1) * 8;
+    const float rl_ep = run_l[sub_g * H + h_ep];
+    const float inv_ep = rl_ep > 0.f ? (1.f / rl_ep) : 0.f;
+    char* dst_peer = dcp_peer_ptr(peers, g_ep);
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      wmma::store_matrix_sync(st_warp, acc_o[u], 16, wmma::mem_row_major);
+      __syncwarp();
+      if (rl_ep > 0.f) {
+        const float* row_f = st_warp + h_ep * 16 + c8_ep;
+        uint4 pkt =
+            make_uint4(dcp_pack_h2(row_f[0] * inv_ep, row_f[1] * inv_ep),
+                       dcp_pack_h2(row_f[2] * inv_ep, row_f[3] * inv_ep),
+                       dcp_pack_h2(row_f[4] * inv_ep, row_f[5] * inv_ep),
+                       dcp_pack_h2(row_f[6] * inv_ep, row_f[7] * inv_ep));
+        const int u4_idx = (w_sub * 4 + u) * 2 + (lane & 1);
+        if (g_ep == rank) {
+          reinterpret_cast<uint4*>(oml_local + ((size_t)slot_t * H + h_ep) *
+                                                   DCP_OML_ROW)[u4_idx] = pkt;
+        } else {
+          pkt.x = ll_escape<true>(pkt.x);
+          pkt.y = ll_escape<true>(pkt.y);
+          pkt.z = ll_escape<true>(pkt.z);
+          pkt.w = ll_escape<true>(pkt.w);
+          ll_store(dst_peer + oml_base + (int64_t)rank * slot_cap +
+                       ((int64_t)(slot_t * H + h_ep) * 65 + u4_idx) * 16,
+                   pkt);
+        }
+      }
+      __syncwarp();
+    }
+    if (tid < 32) {
+      const int sg = tid >> 4, h = tid & 15;
+      const int g = g_base + sg;
+      const float rm = run_m[tid], rl = run_l[tid];
+      if (g == rank) {
+        float* loc = oml_local + ((size_t)slot_t * H + h) * DCP_OML_ROW + 256;
+        loc[0] = rm;
+        loc[1] = rl;
+      } else {
+        uint4 hdr = make_uint4(ll_escape<false>(__float_as_uint(rm)),
+                               ll_escape<false>(__float_as_uint(rl)), 0u, 0u);
+        ll_store(dcp_peer_ptr(peers, g) + oml_base + (int64_t)rank * slot_cap +
+                     ((int64_t)(slot_t * H + h) * 65 + 64) * 16,
+                 hdr);
+      }
+    }
+    return;
+  }
+
+  const int ws_idx = bid_y - 2 * CSPLIT;
+  const int wslot_t = ws_idx * T + t;
+  const int nchunk_w = (rg_win.window + KC - 1) / KC;
+  const bool tvalid = rg_win.valid[t];
+  if (!tvalid || ws_idx >= nchunk_w) {
+    if (tid < H) {
+      float* wml = oml_win + ((size_t)wslot_t * H + tid) * DCP_OML_ROW + 256;
+      wml[0] = -1e30f;
+      wml[1] = 0.f;
+    }
+    return;
+  }
+
+  half* qs_win = qs;
+  float* sc_win = sc;
+  const half* qt = q_local + (size_t)t * H * D;
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    const int idx = tid + u * 512;
+    const int h = idx >> 6, c8 = (idx & 63) * 8;
+    *reinterpret_cast<uint4*>(qs_win + h * KLD2 + c8) =
+        *reinterpret_cast<const uint4*>(qt + h * D + c8);
+  }
+  if (tid < H) {
+    run_m[tid] = -1e30f;
+    run_l[tid] = 0.f;
+  }
+  float* tmp_rmap = reinterpret_cast<float*>(ks);
+  if (tid < 256) tmp_rmap[tid] = (float)(tid >> 4);
+
+  const int64_t pos = rg_win.positions[t];
+  const int row = rg_win.rows[t];
+  const int vbase = rg_win.bases[t];
+  const int64_t start = rg_win.positions[vbase];
+
+  auto plan_win = [&](int chunk, int slot) {
+    const int key = chunk * KC + lane;
+    bool live = key < rg_win.window;
+    const int64_t at = pos - rg_win.window + 1 + key;
+    live &= at >= 0;
+    const half* src = nullptr;
+    if (!rg_win.paged_all_cached && at >= start) {
+      if (live) src = rg_win.values + (vbase + at - start) * D;
+    } else {
+      const int page = live ? rg_win.wtable[(size_t)row * rg_win.wtable_stride +
+                                            at / rg_win.wblock]
+                            : -1;
+      live &= page >= 0;
+      if (live)
+        src = rg_win.wcache + page * rg_win.wstride + (at % rg_win.wblock) * D;
+    }
+    srcs[slot][lane] = src;
+    const unsigned m = __ballot_sync(0xffffffffu, live);
+    if (lane == 0) live_mask[slot] = m;
+  };
+
+  if (warp == 0) plan_win(ws_idx, 0);
+  __syncthreads();
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> rfrag;
+  wmma::load_matrix_sync(rfrag, tmp_rmap, 16, wmma::mem_row_major);
+  uint32_t rmap = 0u;
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    rmap |= ((uint32_t)(int)rfrag.x[i] & 15u) << (4 * i);
+  __syncthreads();
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_w[2];
+  wmma::fill_fragment(acc_w[0], 0.f);
+  wmma::fill_fragment(acc_w[1], 0.f);
+
+  for (int witer = 0, chunk = ws_idx; chunk < nchunk_w;
+       ++witer, chunk += WSPLIT) {
+    const int slot = witer & 1;
+    const unsigned lm = live_mask[slot];
+    {
+      uint4 w_tmp[4];
+#pragma unroll
+      for (int u = 0; u < 4; ++u) {
+        const int i = tid + u * 512;
+        const int j = i >> 6, c = (i & 63) * 8;
+        w_tmp[u] =
+            (lm >> j) & 1u
+                ? __ldcg(reinterpret_cast<const uint4*>(srcs[slot][j] + c))
+                : make_uint4(0, 0, 0, 0);
+      }
+#pragma unroll
+      for (int u = 0; u < 4; ++u) {
+        const int i = tid + u * 512;
+        const int j = i >> 6, c = (i & 63) * 8;
+        *reinterpret_cast<uint4*>(ks + j * KLD2 + c) = w_tmp[u];
+      }
+    }
+    if (warp == 0 && chunk + WSPLIT < nchunk_w)
+      plan_win(chunk + WSPLIT, slot ^ 1);
+    __syncthreads();
+
+    if (lm != 0) {
+      const int n_tile = warp & 1, part_d = warp >> 1;
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_qk;
+      wmma::fill_fragment(acc_qk, 0.f);
+#pragma unroll 1
+      for (int d = part_d * 64; d < (part_d + 1) * 64; d += 16) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b;
+        wmma::load_matrix_sync(a, qs_win + d, KLD2);
+        wmma::load_matrix_sync(b, ks + n_tile * 16 * KLD2 + d, KLD2);
+        wmma::mma_sync(acc_qk, a, b, acc_qk);
+      }
+      wmma::store_matrix_sync(sc_win + (part_d * H) * SLD2 + n_tile * 16,
+                              acc_qk, SLD2, wmma::mem_row_major);
+      __syncthreads();
+
+      const int h = warp;
+      const bool live = (lm >> lane) & 1u;
+      const int o_idx = h * SLD2 + lane;
+      const float raw =
+          sc_win[o_idx] + sc_win[H * SLD2 + o_idx] +
+          sc_win[2 * H * SLD2 + o_idx] + sc_win[3 * H * SLD2 + o_idx] +
+          sc_win[4 * H * SLD2 + o_idx] + sc_win[5 * H * SLD2 + o_idx] +
+          sc_win[6 * H * SLD2 + o_idx] + sc_win[7 * H * SLD2 + o_idx];
+      const float sv = live ? raw * scale : -INFINITY;
+      float m = sv;
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1)
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+      const float l_prev = run_l[h];
+      const float m_old = run_m[h];
+      const float m_new = l_prev > 0.f ? fmaxf(m_old, m) : m;
+      const float e = live ? __expf(sv - m_new) : 0.f;
+      float l = e;
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) l += __shfl_xor_sync(0xffffffffu, l, o);
+      ps_sh[h * PLD2 + lane] = __float2half(e);
+      if (lane == 0) {
+        const float a = l_prev > 0.f ? __expf(m_old - m_new) : 0.f;
+        alpha[h] = a;
+        run_l[h] = l_prev * a + l;
+        run_m[h] = m_new;
+      }
+      __syncthreads();
+
+      if (witer > 0) {
+        float a_elem[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) a_elem[i] = alpha[(rmap >> (4 * i)) & 15u];
+#pragma unroll
+        for (int u = 0; u < 2; ++u)
+#pragma unroll
+          for (int i = 0; i < 8; ++i) acc_w[u].x[i] *= a_elem[i];
+      }
+      {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa0;
+        wmma::load_matrix_sync(pa0, ps_sh, PLD2);
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b0;
+          wmma::load_matrix_sync(b0, ks + (warp * 2 + u) * 16, KLD2);
+          wmma::mma_sync(acc_w[u], pa0, b0, acc_w[u]);
+        }
+      }
+      {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pa1;
+        wmma::load_matrix_sync(pa1, ps_sh + 16, PLD2);
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b1;
+          wmma::load_matrix_sync(b1, ks + 16 * KLD2 + (warp * 2 + u) * 16,
+                                 KLD2);
+          wmma::mma_sync(acc_w[u], pa1, b1, acc_w[u]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  float* st_warp = sc_win + warp * 256;
+  const int h_ep = lane >> 1;
+  const int c8_ep = (lane & 1) * 8;
+  const float rl_ep = run_l[h_ep];
+  const float inv_ep = rl_ep > 0.f ? (1.f / rl_ep) : 0.f;
+#pragma unroll
+  for (int u = 0; u < 2; ++u) {
+    wmma::store_matrix_sync(st_warp, acc_w[u], 16, wmma::mem_row_major);
+    __syncwarp();
+    if (rl_ep > 0.f) {
+      const float* row_f = st_warp + h_ep * 16 + c8_ep;
+      uint4 pkt = make_uint4(dcp_pack_h2(row_f[0] * inv_ep, row_f[1] * inv_ep),
+                             dcp_pack_h2(row_f[2] * inv_ep, row_f[3] * inv_ep),
+                             dcp_pack_h2(row_f[4] * inv_ep, row_f[5] * inv_ep),
+                             dcp_pack_h2(row_f[6] * inv_ep, row_f[7] * inv_ep));
+      const int u4_idx = (warp * 2 + u) * 2 + (lane & 1);
+      reinterpret_cast<uint4*>(oml_win + ((size_t)wslot_t * H + h_ep) *
+                                             DCP_OML_ROW)[u4_idx] = pkt;
+    }
+    __syncwarp();
+  }
+  if (tid < H) {
+    float* wml = oml_win + ((size_t)wslot_t * H + tid) * DCP_OML_ROW + 256;
+    wml[0] = run_m[tid];
+    wml[1] = run_l[tid];
+  }
+}
+
+template <bool USE_GQA32, int CSPLIT, int WSPLIT>
+static inline void launch_dcp_fused_impl(
+    torch::Tensor& out, torch::Tensor& q_local, DCPFusedWorkspace& ws,
+    torch::Tensor& sink, bool paged_fused,
+    const std::optional<torch::Tensor>& rope, const LLPeers& peers, int rank,
+    int64_t slot_cap, torch::Tensor& dcp_cnt, float scale,
+    const RingGather& rg_comp, const RingGather& rg_win, cudaStream_t stream) {
+  using namespace attn;
+  const int T = q_local.size(0);
+  if constexpr (USE_GQA32) {
+    constexpr int SMEM32 = 87552;
+    static bool smem_set32 = false;
+    if (!smem_set32) {
+      C10_CUDA_CHECK(cudaFuncSetAttribute(
+          dcp_gqa32_win_p2p_kernel<CSPLIT, WSPLIT>,
+          cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM32));
+      smem_set32 = true;
+    }
+    dcp_gqa32_win_p2p_kernel<CSPLIT, WSPLIT>
+        <<<dim3(T, 2 * CSPLIT + WSPLIT), 512, SMEM32, stream>>>(
+            reinterpret_cast<const half*>(q_local.data_ptr<at::Half>()),
+            ws.oml_local.data_ptr<float>(), ws.oml_win.data_ptr<float>(), peers,
+            rank, slot_cap, dcp_cnt.data_ptr<int>(), scale, rg_comp, rg_win);
+  } else {
+    static bool smem_set64 = false;
+    if (!smem_set64) {
+      C10_CUDA_CHECK(
+          cudaFuncSetAttribute(dcp_gqa64_win_p2p_kernel<CSPLIT, WSPLIT>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               (int)dcp_p2p::TOTAL_SMEM));
+      smem_set64 = true;
+    }
+    dcp_gqa64_win_p2p_kernel<CSPLIT, WSPLIT>
+        <<<dim3(T, CSPLIT + WSPLIT), 512, dcp_p2p::TOTAL_SMEM, stream>>>(
+            reinterpret_cast<const half*>(q_local.data_ptr<at::Half>()),
+            ws.oml_local.data_ptr<float>(), ws.oml_win.data_ptr<float>(), peers,
+            rank, slot_cap, dcp_cnt.data_ptr<int>(), scale, rg_comp, rg_win);
+  }
+  if (rope.has_value()) {
+    dcp_p2p_combine_kernel<true, CSPLIT, WSPLIT>
+        <<<dim3(T, H + (paged_fused ? 1 : 0)), 64, 0, stream>>>(
+            ws.oml_local.data_ptr<float>(), ws.oml_win.data_ptr<float>(),
+            sink.data_ptr<float>(),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()), peers, rank,
+            slot_cap, dcp_cnt.data_ptr<int>(), rg_win, rope->data_ptr<float>(),
+            (int)rope->size(0) - 1);
+  } else {
+    dcp_p2p_combine_kernel<false, CSPLIT, WSPLIT>
+        <<<dim3(T, H), 64, 0, stream>>>(
+            ws.oml_local.data_ptr<float>(), ws.oml_win.data_ptr<float>(),
+            sink.data_ptr<float>(),
+            reinterpret_cast<half*>(out.data_ptr<at::Half>()), peers, rank,
+            slot_cap, dcp_cnt.data_ptr<int>(), rg_win, nullptr, 0);
+  }
+}
+
+void attn_dcp_fused(
+    torch::Tensor out, torch::Tensor q_local, torch::Tensor values,
+    torch::Tensor wcache, torch::Tensor wtable, torch::Tensor ccache,
+    torch::Tensor ctable, torch::Tensor rows, torch::Tensor bases,
+    torch::Tensor positions, torch::Tensor valid, torch::Tensor local_topk,
+    torch::Tensor local_cnt, torch::Tensor sink, double scale, int64_t wblock,
+    int64_t cblock, int64_t ratio, int64_t window, bool paged_fused,
+    std::optional<torch::Tensor> rope, int64_t p0, int64_t p1, int64_t p2,
+    int64_t p3, int64_t rank, int64_t slot_cap, torch::Tensor dcp_cnt) {
+  using namespace attn;
+  const int T = q_local.size(0);
+  if (T <= 0) return;
+  TORCH_CHECK(T <= DCP_MAX_T && slot_cap >= DCP_SLOT_CAP);
+  TORCH_CHECK(q_local.is_cuda() && q_local.scalar_type() == torch::kFloat16 &&
+              q_local.is_contiguous() && q_local.size(1) == H &&
+              q_local.size(2) == D);
+  const at::cuda::OptionalCUDAGuard guard(device_of(q_local));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  DCPFusedWorkspace& ws =
+      get_dcp_fused_ws(q_local.get_device(), q_local.options());
+  TORCH_CHECK(ws.oml_local.defined(),
+              "DCPFusedWorkspace must be warmed up before capture");
+
+  RingGather rg_comp{};
+  rg_comp.cache = reinterpret_cast<const half*>(ccache.data_ptr<at::Half>());
+  rg_comp.table = ctable.data_ptr<int>();
+  rg_comp.positions = positions.data_ptr<int64_t>();
+  rg_comp.valid = valid.data_ptr<bool>();
+  rg_comp.topk = local_topk.data_ptr<int>();
+  rg_comp.key_counts = local_cnt.data_ptr<int>();
+  rg_comp.stride = ccache.stride(0);
+  rg_comp.block = (int)cblock;
+  rg_comp.ratio = (int)ratio;
+  rg_comp.ntopk = (int)local_topk.size(1);
+  rg_comp.paged = true;
+  rg_comp.rows = rows.data_ptr<int>();
+  rg_comp.bases = rows.data_ptr<int>();
+  rg_comp.table_stride = (int)ctable.stride(0);
+  rg_comp.cshard_shift = 2;
+
+  RingGather rg_win{};
+  rg_win.values =
+      paged_fused ? reinterpret_cast<const half*>(values.data_ptr<at::Half>())
+                  : nullptr;
+  rg_win.positions = positions.data_ptr<int64_t>();
+  rg_win.valid = valid.data_ptr<bool>();
+  rg_win.window = (int)window;
+  rg_win.paged = true;
+  rg_win.paged_all_cached = !paged_fused;
+  rg_win.wcache = reinterpret_cast<const half*>(wcache.data_ptr<at::Half>());
+  rg_win.wtable = wtable.data_ptr<int>();
+  rg_win.rows = rows.data_ptr<int>();
+  rg_win.bases = bases.data_ptr<int>();
+  rg_win.wstride = wcache.stride(0);
+  rg_win.wtable_stride = (int)wtable.stride(0);
+  rg_win.wblock = (int)wblock;
+
+  LLPeers peers{{reinterpret_cast<char*>(p0), reinterpret_cast<char*>(p1),
+                 reinterpret_cast<char*>(p2), reinterpret_cast<char*>(p3)}};
+
+  // Hybrid wave-aligned dispatch on V100 (80 SMs, 0 STL/LDL spills):
+  // - T <= 6  (N=1):  GQA-32<4, 4> -> 6 * 12 = 72 CTAs <= 80 SMs (1 wave,
+  // SMEM-resident qs, 1-pass QK!)
+  // - T <= 12 (N=2):  GQA-32<2, 2> -> 12 * 6 = 72 CTAs <= 80 SMs (1 wave,
+  // SMEM-resident qs, 1-pass QK!)
+  // - T <= 24 (N=4):  GQA-64<2, 1> -> 24 * 3 = 72 CTAs <= 80 SMs (1 wave, 1x KV
+  // HBM read!)
+  // - T > 24  (N>=8): GQA-64<1, 1> -> T * 2  = 2T CTAs (1x KV HBM read +
+  // minimum NVLink traffic!)
+  if (T <= 6) {
+    launch_dcp_fused_impl<true, 4, 4>(out, q_local, ws, sink, paged_fused, rope,
+                                      peers, (int)rank, slot_cap, dcp_cnt,
+                                      (float)scale, rg_comp, rg_win, stream);
+  } else if (T <= 12) {
+    launch_dcp_fused_impl<true, 2, 2>(out, q_local, ws, sink, paged_fused, rope,
+                                      peers, (int)rank, slot_cap, dcp_cnt,
+                                      (float)scale, rg_comp, rg_win, stream);
+  } else if (T <= 24) {
+    launch_dcp_fused_impl<false, 2, 1>(
+        out, q_local, ws, sink, paged_fused, rope, peers, (int)rank, slot_cap,
+        dcp_cnt, (float)scale, rg_comp, rg_win, stream);
+  } else {
+    launch_dcp_fused_impl<false, 1, 1>(
+        out, q_local, ws, sink, paged_fused, rope, peers, (int)rank, slot_cap,
+        dcp_cnt, (float)scale, rg_comp, rg_win, stream);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -3655,7 +6437,8 @@ __global__ void __launch_bounds__(128)
                         const int64_t* __restrict__ positions,
                         const int* __restrict__ qsl, int table_stride,
                         int n_out, int64_t page_stride, int keys_per_page,
-                        int ratio, int H, int shard, int nshard) {
+                        int ratio, int H, int shard, int nshard,
+                        bool kv_sharded) {
   using namespace bidx;
   using namespace nvcuda;
   extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -3667,7 +6450,10 @@ __global__ void __launch_bounds__(128)
   const int first = qsl[r], count = qsl[r + 1] - first;
   if (count <= 0) return;
   const int64_t end = (positions[first + count - 1] + 1) / ratio;
-  if (((int64_t)blockIdx.y * nshard + shard) * KT >= end) return;
+  const int64_t min_key = kv_sharded
+                              ? (((int64_t)blockIdx.y * KT) * nshard + shard)
+                              : (((int64_t)blockIdx.y * nshard + shard) * KT);
+  if (min_key >= end) return;
   const int rows = count * H, mtiles = (rows + 15) / 16;
   if (rows > ROWS) return;  // callers keep decode rows within ROWS / H
   // Stage the request's query rows (zero padding) and weights.
@@ -3684,18 +6470,20 @@ __global__ void __launch_bounds__(128)
   const int* trow = table + (size_t)r * table_stride;
   const int warp = threadIdx.x >> 5;
   for (int64_t local = blockIdx.y;; local += gridDim.y) {
-    const int64_t n0 = (local * nshard + shard) * KT;
+    const int64_t n0 = kv_sharded ? ((local * KT) * nshard + shard)
+                                  : ((local * nshard + shard) * KT);
     if (n0 >= end) break;
     __syncthreads();  // qs ready / previous tile's sc consumed
     for (int i = threadIdx.x; i < KT * (D / 8); i += blockDim.x) {
       const int j = i / (D / 8), c = (i % (D / 8)) * 8;
-      const int64_t n = n0 + j;
+      const int64_t lk = kv_sharded ? (local * KT + j) : (n0 + j);
+      const int64_t n = kv_sharded ? (lk * nshard + shard) : lk;
       uint4 v = make_uint4(0, 0, 0, 0);
       if (n < end) {
-        const int page = trow[n / keys_per_page];
+        const int page = trow[lk / keys_per_page];
         if (page >= 0)
           v = __ldcg(reinterpret_cast<const uint4*>(
-              cache + (int64_t)page * page_stride + (n % keys_per_page) * D +
+              cache + (int64_t)page * page_stride + (lk % keys_per_page) * D +
               c));
       }
       *reinterpret_cast<uint4*>(ks + j * KLD + c) = v;
@@ -3720,7 +6508,9 @@ __global__ void __launch_bounds__(128)
     const int64_t column0 = local * KT;
     for (int i = threadIdx.x; i < count * KT; i += blockDim.x) {
       const int t = i / KT, j = i % KT;
-      if (n0 + j >= end) continue;
+      const int64_t n =
+          kv_sharded ? ((column0 + j) * nshard + shard) : (n0 + j);
+      if (n >= end) continue;
       float total = 0.f;
       for (int h = 0; h < H; ++h) {
         float v = __half2float(__float2half(sc[(t * H + h) * SLD + j]));
@@ -3738,7 +6528,7 @@ static void index_scores_launch(torch::Tensor out, torch::Tensor q,
                                 torch::Tensor table, torch::Tensor positions,
                                 torch::Tensor qsl, int64_t num_reqs,
                                 int64_t ratio, int64_t ctas, int64_t shard,
-                                int64_t nshard) {
+                                int64_t nshard, bool kv_sharded) {
   using namespace bidx;
   const int H = q.size(1);
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kFloat16 &&
@@ -3770,7 +6560,7 @@ static void index_scores_launch(torch::Tensor out, torch::Tensor q,
       reinterpret_cast<const __half*>(cache.data_ptr<at::Half>()),
       table.data_ptr<int>(), positions.data_ptr<int64_t>(), qsl.data_ptr<int>(),
       (int)table.stride(0), (int)out.size(1), cache.stride(0),
-      (int)cache.size(1), (int)ratio, H, (int)shard, (int)nshard);
+      (int)cache.size(1), (int)ratio, H, (int)shard, (int)nshard, kv_sharded);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -3781,7 +6571,7 @@ void index_scores(torch::Tensor out, torch::Tensor q, torch::Tensor w,
                   int64_t ratio, int64_t ctas) {
   TORCH_CHECK(8 * q.size(1) <= 64);
   index_scores_launch<64>(out, q, w, cache, table, positions, qsl, num_reqs,
-                          ratio, ctas, 0, 1);
+                          ratio, ctas, 0, 1, false);
 }
 
 // Key-sharded: all H heads (32), at most 192 / H query rows (6) per request.
@@ -3789,9 +6579,201 @@ void index_scores_shard(torch::Tensor out, torch::Tensor q, torch::Tensor w,
                         torch::Tensor cache, torch::Tensor table,
                         torch::Tensor positions, torch::Tensor qsl,
                         int64_t num_reqs, int64_t ratio, int64_t ctas,
-                        int64_t shard, int64_t nshard) {
+                        int64_t shard, int64_t nshard, bool kv_sharded) {
   index_scores_launch<192>(out, q, w, cache, table, positions, qsl, num_reqs,
-                           ratio, ctas, shard, nshard);
+                           ratio, ctas, shard, nshard, kv_sharded);
+}
+
+// Key-stationary WMMA prefill indexer for key-sharded TP4:
+// Each CTA (256 threads = 8 warps) owns up to 2 local 32-key tiles (64 keys),
+// loads those 64 keys into shared memory ONCE from the paged FP16 index cache
+// (eliminating the 342x HBM key re-reads of running 6-row decode groups), skips
+// causal future query rows, and streams BT=4 query tokens (128 query-head rows)
+// at a time across SM70 Tensor Cores with identical FP16 rounding points.
+__global__ void __launch_bounds__(256) index_scores_prefill_shard_kernel(
+    __half* __restrict__ out, const __half* __restrict__ q,
+    const __half* __restrict__ w, const __half* __restrict__ cache,
+    const int* __restrict__ table, const int64_t* __restrict__ positions, int T,
+    int n_out, int64_t page_stride, int keys_per_page, int ratio, int shard,
+    int nshard, bool kv_sharded) {
+  using namespace nvcuda;
+  constexpr int D = 128, H = 32, BT = 4, ROWS = BT * H;  // 128 rows
+  constexpr int QLD = D + 8, KLD = D + 8, SLD = 64 + 4;
+  extern __shared__ __align__(16) unsigned char smem_pf[];
+  __half* ks = reinterpret_cast<__half*>(smem_pf);  // [64][136]  = 17408 B
+  __half* qs = ks + 64 * KLD;                       // [128][136] = 34816 B
+  float* sc =
+      reinterpret_cast<float*>(qs + ROWS * QLD);  // [128][68]  = 34816 B
+  float* ws = sc + ROWS * SLD;                    // [128]      =   512 B
+  int64_t* sh_meta =
+      reinterpret_cast<int64_t*>(ws + ROWS);  // [2]        =    16 B
+
+  const int local0 = 2 * int(blockIdx.x);
+  const int column0 = local0 * 32;
+  if (column0 >= n_out || T <= 0) return;
+  const bool has_half1 = (column0 + 32) < n_out;
+  const int64_t n_base0 = kv_sharded
+                              ? (int64_t(column0) * nshard + shard)
+                              : ((int64_t(local0) * nshard + shard) * 32);
+  const int64_t n_base1 = (int64_t(local0 + 1) * nshard + shard) * 32;
+
+  // Scan positions[0..T-1] across 256 threads to find max_end and first causal
+  // t
+  int64_t local_max_end = 0;
+  int local_first_t = T;
+  for (int t = threadIdx.x; t < T; t += 256) {
+    const int64_t end_t = (positions[t] + 1) / ratio;
+    if (end_t > local_max_end) local_max_end = end_t;
+    if (end_t > n_base0 && t < local_first_t) local_first_t = t;
+  }
+  if (threadIdx.x == 0) {
+    sh_meta[0] = 0;
+    sh_meta[1] = T;
+  }
+  __syncthreads();
+  atomicMax(reinterpret_cast<unsigned long long*>(&sh_meta[0]),
+            (unsigned long long)local_max_end);
+  atomicMin(reinterpret_cast<int*>(&sh_meta[1]), local_first_t);
+  __syncthreads();
+
+  const int64_t max_end = sh_meta[0];
+  const int first_t = int(reinterpret_cast<int*>(&sh_meta[1])[0]);
+  if (n_base0 >= max_end || first_t >= T) return;
+
+  // Load up to 64 keys into ks[64][136] ONCE for the entire query loop!
+  for (int i = threadIdx.x; i < 64 * (D / 8); i += 256) {
+    const int j = i / (D / 8), c = (i % (D / 8)) * 8;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (j < 32 || has_half1) {
+      const int64_t lk =
+          kv_sharded ? int64_t(column0 + j)
+                     : ((j < 32) ? (n_base0 + j) : (n_base1 + (j - 32)));
+      const int64_t n = kv_sharded ? (lk * nshard + shard) : lk;
+      if (n < max_end) {
+        const int page = table[lk / keys_per_page];
+        if (page >= 0) {
+          v = __ldg(reinterpret_cast<const uint4*>(
+              cache + int64_t(page) * page_stride + (lk % keys_per_page) * D +
+              c));
+        }
+      }
+    }
+    *reinterpret_cast<uint4*>(ks + j * KLD + c) = v;
+  }
+  __syncthreads();
+
+  const int warp =
+      threadIdx.x >> 5;  // 0..7, each warp owns mt = warp (16 rows)
+  const int ntiles = has_half1 ? 4 : 2;
+
+  for (int t0 = first_t; t0 < T; t0 += BT) {
+    const int count = (t0 + BT <= T) ? BT : (T - t0);
+    const int rows = count * H;
+
+    // Stage 4 tokens x 32 heads = 128 query rows (32 KB, L2 cache hit across
+    // SMs)
+    for (int i = threadIdx.x; i < ROWS * (D / 8); i += 256) {
+      const int row = i / (D / 8), c = (i % (D / 8)) * 8;
+      uint4 v = make_uint4(0, 0, 0, 0);
+      if (row < rows) {
+        v = __ldg(
+            reinterpret_cast<const uint4*>(q + (size_t(t0) * H + row) * D + c));
+      }
+      *reinterpret_cast<uint4*>(qs + row * QLD + c) = v;
+    }
+    if (threadIdx.x < ROWS) {
+      ws[threadIdx.x] = (threadIdx.x < rows)
+                            ? __half2float(w[size_t(t0) * H + threadIdx.x])
+                            : 0.f;
+    }
+    __syncthreads();
+
+    if (warp * 16 < rows) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major>
+          a_frag[8];
+#pragma unroll
+      for (int kd = 0; kd < 8; ++kd) {
+        wmma::load_matrix_sync(a_frag[kd], qs + warp * 16 * QLD + kd * 16, QLD);
+      }
+      for (int nt = 0; nt < ntiles; ++nt) {
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.f);
+#pragma unroll
+        for (int kd = 0; kd < 8; ++kd) {
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major>
+              b_frag;
+          wmma::load_matrix_sync(b_frag, ks + nt * 16 * KLD + kd * 16, KLD);
+          wmma::mma_sync(acc, a_frag[kd], b_frag, acc);
+        }
+        wmma::store_matrix_sync(sc + warp * 16 * SLD + nt * 16, acc, SLD,
+                                wmma::mem_row_major);
+      }
+    }
+    __syncthreads();
+
+    // 256 threads map 1-to-1 onto (t in 0..3, j in 0..63)!
+    const int t = threadIdx.x >> 6;
+    const int j = threadIdx.x & 63;
+    if (t < count && (j < 32 || has_half1)) {
+      const int64_t end_t = (positions[t0 + t] + 1) / ratio;
+      const int64_t n = kv_sharded
+                            ? (int64_t(column0 + j) * nshard + shard)
+                            : ((j < 32) ? (n_base0 + j) : (n_base1 + (j - 32)));
+      if (n < end_t) {
+        float total = 0.f;
+#pragma unroll 8
+        for (int h = 0; h < H; ++h) {
+          float v = __half2float(__float2half(sc[(t * H + h) * SLD + j]));
+          v = fmaxf(v, 0.f);
+          total += __half2float(__float2half(v * ws[t * H + h]));
+        }
+        out[size_t(t0 + t) * n_out + column0 + j] = __float2half(total);
+      }
+    }
+    __syncthreads();
+  }
+}
+
+void index_scores_prefill_shard(torch::Tensor out, torch::Tensor q,
+                                torch::Tensor w, torch::Tensor cache,
+                                torch::Tensor table, torch::Tensor positions,
+                                int64_t ratio, int64_t shard, int64_t nshard,
+                                bool kv_sharded) {
+  TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kFloat16 &&
+              q.is_contiguous() && q.dim() == 3 && q.size(1) == 32 &&
+              q.size(2) == 128);
+  TORCH_CHECK(w.scalar_type() == torch::kFloat16 && w.is_contiguous() &&
+              w.size(0) == q.size(0) && w.size(1) == 32);
+  TORCH_CHECK(cache.scalar_type() == torch::kFloat16 && cache.dim() == 3 &&
+              cache.size(2) == 128 && cache.stride(1) == 128 &&
+              cache.stride(2) == 1);
+  TORCH_CHECK(table.scalar_type() == torch::kInt32 && table.stride(-1) == 1);
+  TORCH_CHECK(positions.scalar_type() == torch::kInt64 &&
+              positions.is_contiguous() && positions.numel() == q.size(0));
+  TORCH_CHECK(out.scalar_type() == torch::kFloat16 && out.is_contiguous() &&
+              out.size(0) == q.size(0) && out.size(1) % 32 == 0);
+  TORCH_CHECK(0 <= shard && shard < nshard);
+  const int T = int(q.size(0)), n_out = int(out.size(1));
+  if (T <= 0 || n_out <= 0) return;
+  const at::cuda::OptionalCUDAGuard guard(device_of(q));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  constexpr int SMEM = 17408 + 34816 + 34816 + 512 + 32;  // 87584 B <= 96 KB
+  static bool smem_set = false;
+  if (!smem_set) {
+    cudaFuncSetAttribute(index_scores_prefill_shard_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    smem_set = true;
+  }
+  const int blocks = (n_out / 32 + 1) / 2;
+  index_scores_prefill_shard_kernel<<<blocks, 256, SMEM, stream>>>(
+      reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(w.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(cache.data_ptr<at::Half>()),
+      table.data_ptr<int>(), positions.data_ptr<int64_t>(), T, n_out,
+      cache.stride(0), int(cache.size(1)), int(ratio), int(shard), int(nshard),
+      kv_sharded);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // ---- Router top-k + slot plan for many tokens (VLLM_V41_BATCH) --------------
@@ -3918,6 +6900,148 @@ __global__ void __launch_bounds__(256)
   }
 }
 
+template <int EPL>
+__global__ void __launch_bounds__(256)
+    route_topk_parallel_kernel(const float* __restrict__ logits,
+                               const float* __restrict__ bias,
+                               float* __restrict__ probs, int* __restrict__ ids,
+                               int T, int K, float scale) {
+  constexpr int E = EPL * 32;
+  __shared__ float sh_score[8][E];
+  __shared__ unsigned sh_key[8][E];
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int t = blockIdx.x * 8 + warp;
+  if (t >= T) return;
+  const unsigned full = 0xffffffffu;
+  float* sc = sh_score[warp];
+  unsigned* ky = sh_key[warp];
+#pragma unroll
+  for (int i = 0; i < EPL; ++i) {
+    const int e = lane + 32 * i;
+    sc[e] = logits[(size_t)t * E + e];
+    ky[e] = __float_as_uint(bias[e]);
+  }
+#pragma unroll 1
+  for (int i = 0; i < EPL; ++i) {
+    const int e = lane + 32 * i;
+    const float score = route_score(sc[e]);
+    sc[e] = score;
+    unsigned key = __float_as_uint(score + __uint_as_float(ky[e]));
+    ky[e] = (key & 0x80000000u) ? ~key : (key | 0x80000000u);
+  }
+  __syncwarp();
+  float my_v = 0.0f;
+  int my_e = 0;
+#pragma unroll 1
+  for (int j = 0; j < K; ++j) {
+    unsigned long long best = 0ull;
+#pragma unroll 4
+    for (int i = 0; i < EPL; ++i) {
+      const unsigned u = ky[lane + 32 * i];
+      const unsigned long long packed =
+          ((unsigned long long)u << 32) | (0xffffffffu - (lane + 32 * i));
+      best = packed > best ? packed : best;
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) {
+      const unsigned long long other = __shfl_xor_sync(full, best, o);
+      best = other > best ? other : best;
+    }
+    const int best_e = (int)(0xffffffffu - (unsigned int)(best & 0xffffffffu));
+    if (lane == j) {
+      my_v = sc[best_e];
+      my_e = best_e;
+    }
+    if (lane == (best_e & 31)) ky[best_e] = 0x007fffffu;
+    __syncwarp();
+  }
+  float total = my_v + __shfl_xor_sync(full, my_v, 4);
+  total += __shfl_xor_sync(full, total, 2);
+  total += __shfl_xor_sync(full, total, 1);
+  const float denom = __shfl_sync(full, total, 0) + 1e-20f;
+  if (lane < K) {
+    probs[t * K + lane] = rp_div(my_v, denom) * scale;
+    ids[t * K + lane] = my_e;
+  }
+}
+
+template <int EPL>
+__global__ void __launch_bounds__(256)
+    route_plan_scatter_kernel(const int* __restrict__ ids,
+                              int* __restrict__ perm, int* __restrict__ experts,
+                              int* __restrict__ offsets, int S) {
+  constexpr int E = EPL * 32;
+  __shared__ int slot_ids[RPW_MAX];
+  __shared__ int cnt[E], start[E], cur[E], gid[E];
+  __shared__ int groups_total;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5, lane = tid & 31;
+  const unsigned full = 0xffffffffu;
+  for (int e = tid; e < E; e += 256) cnt[e] = 0;
+  __syncthreads();
+  for (int s = tid; s < S; s += 256) {
+    const int e = ids[s];
+    slot_ids[s] = e;
+    atomicAdd(&cnt[e], 1);
+  }
+  __syncthreads();
+  if (warp == 0) {
+    int run = 0, grun = 0;
+    for (int base = 0; base < E; base += 32) {
+      const int c = cnt[base + lane];
+      int inc = c, ginc = c > 0;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const int a = __shfl_up_sync(full, inc, o),
+                  b = __shfl_up_sync(full, ginc, o);
+        if (lane >= o) {
+          inc += a;
+          ginc += b;
+        }
+      }
+      const int st = run + inc - c;
+      start[base + lane] = st;
+      cur[base + lane] = st;
+      gid[base + lane] = grun + ginc - (c > 0);
+      run += __shfl_sync(full, inc, 31);
+      grun += __shfl_sync(full, ginc, 31);
+    }
+    if (lane == 0) groups_total = grun;
+  }
+  __syncthreads();
+  // O(S) scatter into perm, then deterministic ascending sort per expert.
+  for (int s = tid; s < S; s += 256) {
+    const int e = slot_ids[s];
+    perm[atomicAdd(&cur[e], 1)] = s;
+  }
+  __syncthreads();
+  for (int e = tid; e < E; e += 256) {
+    const int c = cnt[e];
+    if (c > 1) {
+      int* p = perm + start[e];
+      for (int i = 1; i < c; ++i) {
+        const int key = p[i];
+        int j = i - 1;
+        while (j >= 0 && p[j] > key) {
+          p[j + 1] = p[j];
+          --j;
+        }
+        p[j + 1] = key;
+      }
+    }
+    if (c > 0) {
+      experts[gid[e]] = e;
+      offsets[gid[e]] = start[e];
+    }
+  }
+  const int groups = groups_total;
+  for (int j = tid; j <= S; j += 256) {
+    if (j >= groups && j < S) experts[j] = 0;
+    if (j >= groups) offsets[j] = S;
+  }
+}
+
 void route_plan_wide(torch::Tensor logits, torch::Tensor bias,
                      torch::Tensor probs, torch::Tensor ids, torch::Tensor perm,
                      torch::Tensor experts, torch::Tensor offsets,
@@ -3934,11 +7058,23 @@ void route_plan_wide(torch::Tensor logits, torch::Tensor bias,
               "route_plan_wide: T*K <= 640");
   const at::cuda::OptionalCUDAGuard guard(device_of(logits));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-#define V41SK_RPW(EPL)                                                    \
-  route_plan_wide_kernel<EPL><<<1, 256, 0, stream>>>(                     \
-      logits.data_ptr<float>(), bias.data_ptr<float>(),                   \
-      probs.data_ptr<float>(), ids.data_ptr<int>(), perm.data_ptr<int>(), \
-      experts.data_ptr<int>(), offsets.data_ptr<int>(), T, K, (float)scale)
+#define V41SK_RPW(EPL)                                                        \
+  do {                                                                        \
+    if (T >= 16) {                                                            \
+      route_topk_parallel_kernel<EPL><<<(T + 7) / 8, 256, 0, stream>>>(       \
+          logits.data_ptr<float>(), bias.data_ptr<float>(),                   \
+          probs.data_ptr<float>(), ids.data_ptr<int>(), T, K, (float)scale);  \
+      route_plan_scatter_kernel<EPL><<<1, 256, 0, stream>>>(                  \
+          ids.data_ptr<int>(), perm.data_ptr<int>(), experts.data_ptr<int>(), \
+          offsets.data_ptr<int>(), T * K);                                    \
+    } else {                                                                  \
+      route_plan_wide_kernel<EPL><<<1, 256, 0, stream>>>(                     \
+          logits.data_ptr<float>(), bias.data_ptr<float>(),                   \
+          probs.data_ptr<float>(), ids.data_ptr<int>(), perm.data_ptr<int>(), \
+          experts.data_ptr<int>(), offsets.data_ptr<int>(), T, K,             \
+          (float)scale);                                                      \
+    }                                                                         \
+  } while (0)
   if (E == 384)
     V41SK_RPW(12);
   else if (E == 256)
@@ -3950,6 +7086,1107 @@ void route_plan_wide(torch::Tensor logits, torch::Tensor bias,
 #undef V41SK_RPW
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+// ---- Phase 3B-1: Single-launch register-resident hc_expand_norm ----
+// Replaces _transition_parts3 + _transition_finish3 (MIX=False) with 1 launch
+// and zero cbuf/csq HBM traffic. 1 CTA per token, 256 threads x 5 float4 =
+// 5120.
+template <bool Y_FP16, bool W_FP16>
+__global__ void __launch_bounds__(256)
+    hc_expand_norm_kernel(half* __restrict__ out, float* __restrict__ residual,
+                          const void* __restrict__ y_ptr,
+                          const float* __restrict__ post,
+                          const float* __restrict__ comb,
+                          const float* __restrict__ cpre,
+                          const void* __restrict__ w_ptr,
+                          float* __restrict__ res_sq_out, float norm_eps) {
+  constexpr int H = 5120;
+  const int t = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+
+  __shared__ float s_comb[16];
+  __shared__ float s_post[4];
+  __shared__ float s_cpre[4];
+  __shared__ float s_sq[8];
+  __shared__ float s_rsq[8];
+
+  if (tid < 16)
+    s_comb[tid] = comb[t * 16 + tid];
+  else if (tid < 20)
+    s_post[tid - 16] = post[t * 4 + (tid - 16)];
+  else if (tid < 24)
+    s_cpre[tid - 20] = cpre[t * 4 + (tid - 20)];
+  __syncthreads();
+
+  const float p0 = s_post[0], p1 = s_post[1], p2 = s_post[2], p3 = s_post[3];
+  const float cp0 = s_cpre[0], cp1 = s_cpre[1], cp2 = s_cpre[2],
+              cp3 = s_cpre[3];
+  float c00 = s_comb[0], c01 = s_comb[4], c02 = s_comb[8], c03 = s_comb[12];
+  float c10 = s_comb[1], c11 = s_comb[5], c12 = s_comb[9], c13 = s_comb[13];
+  float c20 = s_comb[2], c21 = s_comb[6], c22 = s_comb[10], c23 = s_comb[14];
+  float c30 = s_comb[3], c31 = s_comb[7], c32 = s_comb[11], c33 = s_comb[15];
+
+  float* rb = residual + (size_t)t * 4 * H;
+  float4 cv[5];
+  float sq = 0.0f;
+  float rsq = 0.0f;
+
+#pragma unroll
+  for (int k = 0; k < 5; ++k) {
+    const int col = tid * 4 + k * 1024;
+    float4 yv;
+    if constexpr (Y_FP16) {
+      const uint2 yh = *reinterpret_cast<const uint2*>(
+          reinterpret_cast<const half*>(y_ptr) + (size_t)t * H + col);
+      const half2* h2 = reinterpret_cast<const half2*>(&yh);
+      const float2 f0 = __half22float2(h2[0]);
+      const float2 f1 = __half22float2(h2[1]);
+      yv = make_float4(f0.x, f0.y, f1.x, f1.y);
+    } else {
+      yv = *reinterpret_cast<const float4*>(
+          reinterpret_cast<const float*>(y_ptr) + (size_t)t * H + col);
+    }
+    const float4 r0 = *reinterpret_cast<const float4*>(rb + 0 * H + col);
+    const float4 r1 = *reinterpret_cast<const float4*>(rb + 1 * H + col);
+    const float4 r2 = *reinterpret_cast<const float4*>(rb + 2 * H + col);
+    const float4 r3 = *reinterpret_cast<const float4*>(rb + 3 * H + col);
+
+    float4 n0 = make_float4(
+        c00 * r0.x + c01 * r1.x + c02 * r2.x + c03 * r3.x + p0 * yv.x,
+        c00 * r0.y + c01 * r1.y + c02 * r2.y + c03 * r3.y + p0 * yv.y,
+        c00 * r0.z + c01 * r1.z + c02 * r2.z + c03 * r3.z + p0 * yv.z,
+        c00 * r0.w + c01 * r1.w + c02 * r2.w + c03 * r3.w + p0 * yv.w);
+    float4 n1 = make_float4(
+        c10 * r0.x + c11 * r1.x + c12 * r2.x + c13 * r3.x + p1 * yv.x,
+        c10 * r0.y + c11 * r1.y + c12 * r2.y + c13 * r3.y + p1 * yv.y,
+        c10 * r0.z + c11 * r1.z + c12 * r2.z + c13 * r3.z + p1 * yv.z,
+        c10 * r0.w + c11 * r1.w + c12 * r2.w + c13 * r3.w + p1 * yv.w);
+    float4 n2 = make_float4(
+        c20 * r0.x + c21 * r1.x + c22 * r2.x + c23 * r3.x + p2 * yv.x,
+        c20 * r0.y + c21 * r1.y + c22 * r2.y + c23 * r3.y + p2 * yv.y,
+        c20 * r0.z + c21 * r1.z + c22 * r2.z + c23 * r3.z + p2 * yv.z,
+        c20 * r0.w + c21 * r1.w + c22 * r2.w + c23 * r3.w + p2 * yv.w);
+    float4 n3 = make_float4(
+        c30 * r0.x + c31 * r1.x + c32 * r2.x + c33 * r3.x + p3 * yv.x,
+        c30 * r0.y + c31 * r1.y + c32 * r2.y + c33 * r3.y + p3 * yv.y,
+        c30 * r0.z + c31 * r1.z + c32 * r2.z + c33 * r3.z + p3 * yv.z,
+        c30 * r0.w + c31 * r1.w + c32 * r2.w + c33 * r3.w + p3 * yv.w);
+
+    *reinterpret_cast<float4*>(rb + 0 * H + col) = n0;
+    *reinterpret_cast<float4*>(rb + 1 * H + col) = n1;
+    *reinterpret_cast<float4*>(rb + 2 * H + col) = n2;
+    *reinterpret_cast<float4*>(rb + 3 * H + col) = n3;
+
+    cv[k] = make_float4(cp0 * n0.x + cp1 * n1.x + cp2 * n2.x + cp3 * n3.x,
+                        cp0 * n0.y + cp1 * n1.y + cp2 * n2.y + cp3 * n3.y,
+                        cp0 * n0.z + cp1 * n1.z + cp2 * n2.z + cp3 * n3.z,
+                        cp0 * n0.w + cp1 * n1.w + cp2 * n2.w + cp3 * n3.w);
+    sq += cv[k].x * cv[k].x + cv[k].y * cv[k].y + cv[k].z * cv[k].z +
+          cv[k].w * cv[k].w;
+    if (res_sq_out != nullptr) {
+      rsq += n0.x * n0.x + n0.y * n0.y + n0.z * n0.z + n0.w * n0.w +
+             n1.x * n1.x + n1.y * n1.y + n1.z * n1.z + n1.w * n1.w +
+             n2.x * n2.x + n2.y * n2.y + n2.z * n2.z + n2.w * n2.w +
+             n3.x * n3.x + n3.y * n3.y + n3.z * n3.z + n3.w * n3.w;
+    }
+  }
+
+  sq = warp_sum(sq);
+  if (lane == 0) s_sq[warp] = sq;
+  if (res_sq_out != nullptr) {
+    rsq = warp_sum(rsq);
+    if (lane == 0) s_rsq[warp] = rsq;
+  }
+  __syncthreads();
+  float tot = 0.0f;
+  if (warp == 0) {
+    tot = (lane < 8) ? s_sq[lane] : 0.0f;
+    tot += __shfl_xor_sync(0xffffffffu, tot, 4);
+    tot += __shfl_xor_sync(0xffffffffu, tot, 2);
+    tot += __shfl_xor_sync(0xffffffffu, tot, 1);
+    if (lane == 0) s_sq[0] = rsqrtf(tot / (float)H + norm_eps);
+    if (res_sq_out != nullptr) {
+      float rtot = (lane < 8) ? s_rsq[lane] : 0.0f;
+      rtot += __shfl_xor_sync(0xffffffffu, rtot, 4);
+      rtot += __shfl_xor_sync(0xffffffffu, rtot, 2);
+      rtot += __shfl_xor_sync(0xffffffffu, rtot, 1);
+      if (lane == 0) res_sq_out[t] = rtot;
+    }
+  }
+  __syncthreads();
+  const float rs = s_sq[0];
+
+  half* ob = out + (size_t)t * H;
+#pragma unroll
+  for (int k = 0; k < 5; ++k) {
+    const int col = tid * 4 + k * 1024;
+    float4 wv;
+    if constexpr (W_FP16) {
+      const uint2 wh = *reinterpret_cast<const uint2*>(
+          reinterpret_cast<const half*>(w_ptr) + col);
+      const half2* h2 = reinterpret_cast<const half2*>(&wh);
+      const float2 f0 = __half22float2(h2[0]);
+      const float2 f1 = __half22float2(h2[1]);
+      wv = make_float4(f0.x, f0.y, f1.x, f1.y);
+    } else {
+      wv = *reinterpret_cast<const float4*>(
+          reinterpret_cast<const float*>(w_ptr) + col);
+    }
+    half2 o0 = __floats2half2_rn(cv[k].x * rs * wv.x, cv[k].y * rs * wv.y);
+    half2 o1 = __floats2half2_rn(cv[k].z * rs * wv.z, cv[k].w * rs * wv.w);
+    uint2 uo;
+    uo.x = *reinterpret_cast<const unsigned*>(&o0);
+    uo.y = *reinterpret_cast<const unsigned*>(&o1);
+    *reinterpret_cast<uint2*>(ob + col) = uo;
+  }
+}
+
+void hc_expand_norm(torch::Tensor out, torch::Tensor residual, torch::Tensor y,
+                    torch::Tensor post, torch::Tensor comb, torch::Tensor cpre,
+                    torch::Tensor norm_weight, double norm_eps,
+                    std::optional<torch::Tensor> res_sq) {
+  const int T = residual.size(0);
+  TORCH_CHECK(T >= 1 && residual.size(1) == 4 && residual.size(2) == 5120);
+  TORCH_CHECK(residual.scalar_type() == torch::kFloat32 &&
+              residual.is_contiguous() && y.is_contiguous() &&
+              out.scalar_type() == torch::kFloat16 && out.is_contiguous() &&
+              norm_weight.is_contiguous());
+  const bool y_fp16 = y.scalar_type() == torch::kFloat16;
+  const bool w_fp16 = norm_weight.scalar_type() == torch::kFloat16;
+  TORCH_CHECK(y_fp16 || y.scalar_type() == torch::kFloat32);
+  TORCH_CHECK(w_fp16 || norm_weight.scalar_type() == torch::kFloat32);
+  const at::cuda::OptionalCUDAGuard guard(device_of(residual));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  half* op = reinterpret_cast<half*>(out.data_ptr<at::Half>());
+  float* rp = residual.data_ptr<float>();
+  const void* yp = y.data_ptr();
+  const void* wp = norm_weight.data_ptr();
+  float* rsqp = res_sq.has_value() ? res_sq->data_ptr<float>() : nullptr;
+  if (y_fp16 && w_fp16) {
+    hc_expand_norm_kernel<true, true><<<T, 256, 0, stream>>>(
+        op, rp, yp, post.data_ptr<float>(), comb.data_ptr<float>(),
+        cpre.data_ptr<float>(), wp, rsqp, (float)norm_eps);
+  } else if (y_fp16 && !w_fp16) {
+    hc_expand_norm_kernel<true, false><<<T, 256, 0, stream>>>(
+        op, rp, yp, post.data_ptr<float>(), comb.data_ptr<float>(),
+        cpre.data_ptr<float>(), wp, rsqp, (float)norm_eps);
+  } else if (!y_fp16 && w_fp16) {
+    hc_expand_norm_kernel<false, true><<<T, 256, 0, stream>>>(
+        op, rp, yp, post.data_ptr<float>(), comb.data_ptr<float>(),
+        cpre.data_ptr<float>(), wp, rsqp, (float)norm_eps);
+  } else {
+    hc_expand_norm_kernel<false, false><<<T, 256, 0, stream>>>(
+        op, rp, yp, post.data_ptr<float>(), comb.data_ptr<float>(),
+        cpre.data_ptr<float>(), wp, rsqp, (float)norm_eps);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---- Phase 3B-3: Fast 1-warp/token Sinkhorn from cuBLAS dots[T,24] +
+// res_sq[T] ----
+__global__ void __launch_bounds__(128) hc_sinkhorn_from_dots_kernel(
+    const float* __restrict__ dots, const float* __restrict__ res_sq,
+    const float* __restrict__ scale, const float* __restrict__ base,
+    float* __restrict__ pre_o, float* __restrict__ post_o,
+    float* __restrict__ comb_o, int T, float norm_eps, float hc_eps,
+    int iters) {
+  const int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= T) return;
+  const float* d = dots + (size_t)t * 24;
+  const float rs = rsqrtf(res_sq[t] / (4.0f * 5120) + norm_eps);
+  const float s0 = scale[0], s1 = scale[1], s2 = scale[2];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float p = d[i] * rs * s0 + base[i];
+    const float qv = d[4 + i] * rs * s1 + base[4 + i];
+    pre_o[t * 4 + i] = 1.f / (1.f + __expf(-p)) + hc_eps;
+    post_o[t * 4 + i] = 2.f * (1.f / (1.f + __expf(-qv)));
+  }
+  float m[4][4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    float mx = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      m[i][j] = d[8 + i * 4 + j] * rs * s2 + base[8 + i * 4 + j];
+      mx = fmaxf(mx, m[i][j]);
+    }
+    float rsum = 0.f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      m[i][j] = __expf(m[i][j] - mx);
+      rsum += m[i][j];
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) m[i][j] = m[i][j] / rsum + hc_eps;
+  }
+  for (int it = 0; it < iters; ++it) {
+    if (it > 0) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const float r = 1.f / (m[i][0] + m[i][1] + m[i][2] + m[i][3] + hc_eps);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) m[i][j] *= r;
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float c = 1.f / (m[0][j] + m[1][j] + m[2][j] + m[3][j] + hc_eps);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) m[i][j] *= c;
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) comb_o[t * 16 + i * 4 + j] = m[i][j];
+}
+
+void hc_sinkhorn_from_dots(torch::Tensor dots, torch::Tensor res_sq,
+                           torch::Tensor scale, torch::Tensor base,
+                           torch::Tensor pre_o, torch::Tensor post_o,
+                           torch::Tensor comb_o, double norm_eps, double hc_eps,
+                           int64_t iters) {
+  const int T = dots.size(0);
+  TORCH_CHECK(T >= 1 && dots.size(1) == 24 && dots.is_contiguous() &&
+              dots.scalar_type() == torch::kFloat32);
+  const at::cuda::OptionalCUDAGuard guard(device_of(dots));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  hc_sinkhorn_from_dots_kernel<<<(T + 127) / 128, 128, 0, stream>>>(
+      dots.data_ptr<float>(), res_sq.data_ptr<float>(), scale.data_ptr<float>(),
+      base.data_ptr<float>(), pre_o.data_ptr<float>(), post_o.data_ptr<float>(),
+      comb_o.data_ptr<float>(), T, (float)norm_eps, (float)hc_eps, (int)iters);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+namespace v41ll_mk {
+struct LLTilePeers {
+  char* p[4];
+};
+__device__ __forceinline__ uint4 ll_tile_load(const void* a) {
+  uint4 v;
+  asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(a));
+  return v;
+}
+__device__ __forceinline__ void ll_tile_store(void* a, uint4 v) {
+  asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::"l"(a),
+               "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+               : "memory");
+}
+template <bool HALF>
+__device__ __forceinline__ uint32_t ll_tile_escape(uint32_t w) {
+  return w == 0xFFFFFFFFu ? 0x7FC00000u : w;
+}
+template <bool HALF>
+__device__ __forceinline__ bool ll_tile_ready4(const uint4& v) {
+  return v.x != 0xFFFFFFFFu && v.y != 0xFFFFFFFFu && v.z != 0xFFFFFFFFu &&
+         v.w != 0xFFFFFFFFu;
+}
+}  // namespace v41ll_mk
+
+// ---- Phase 2B: Single-Launch 80-CTA 5-Step Sharded Markov CUDA Kernel -------
+// 80 CTAs (1 per V100 SM, <= 36 KiB SMEM, 100% co-resident) run all 5 Markov
+// draft steps in ONE launch with direct NVLink 16-byte exchange per step.
+
+__device__ __forceinline__ float bf16_u16_to_f32(uint16_t u) {
+  const uint32_t bits = (uint32_t)u << 16;
+  return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ int ld_vol_i32(const int* p) {
+  int v;
+  asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(v) : "l"(p));
+  return v;
+}
+
+__device__ __forceinline__ void st_vol_i32(int* p, int v) {
+  asm volatile("st.volatile.global.s32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+
+// Fast linear decode of 8 FP8 E4M3 bytes (uint2) -> 8 floats scaled by
+// row_scale. row_scale already includes the 256.0f factor (exact match to
+// fp8_qpn8).
+__device__ __forceinline__ void fp8x8_to_f32x8(uint2 q, float row_scale,
+                                               float out[8]) {
+  constexpr unsigned kSign = 0x80008000u;
+  constexpr unsigned kExpMant = 0x3f803f80u;
+  const unsigned p0 = __byte_perm(q.x, 0u, 0x4140);
+  const unsigned p1 = __byte_perm(q.x, 0u, 0x4342);
+  const unsigned p2 = __byte_perm(q.y, 0u, 0x4140);
+  const unsigned p3 = __byte_perm(q.y, 0u, 0x4342);
+  const unsigned u0 = ((p0 << 8) & kSign) | ((p0 << 7) & kExpMant);
+  const unsigned u1 = ((p1 << 8) & kSign) | ((p1 << 7) & kExpMant);
+  const unsigned u2 = ((p2 << 8) & kSign) | ((p2 << 7) & kExpMant);
+  const unsigned u3 = ((p3 << 8) & kSign) | ((p3 << 7) & kExpMant);
+  const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&u0));
+  const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&u1));
+  const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&u2));
+  const float2 f3 = __half22float2(*reinterpret_cast<const __half2*>(&u3));
+  out[0] = f0.x * row_scale;
+  out[1] = f0.y * row_scale;
+  out[2] = f1.x * row_scale;
+  out[3] = f1.y * row_scale;
+  out[4] = f2.x * row_scale;
+  out[5] = f2.y * row_scale;
+  out[6] = f3.x * row_scale;
+  out[7] = f3.y * row_scale;
+}
+
+constexpr int MK_CTAS = 80;
+constexpr int MK_MAX_R = 64;
+constexpr int MK_K = 256;
+
+__device__ __forceinline__ uint32_t mk_mix32(uint32_t x) {
+  x ^= x >> 16;
+  x *= 0x7FEB352Du;
+  x ^= x >> 15;
+  x *= 0x846CA68Bu;
+  return x ^ (x >> 16);
+}
+
+__device__ __forceinline__ uint32_t mk_row_seed(uint64_t key, uint64_t pos) {
+  const uint32_t hi = mk_mix32((uint32_t)(key >> 32) ^ 0x9E3779B9u);
+  const uint32_t s = mk_mix32((uint32_t)key ^ hi);
+  return mk_mix32(s ^ (uint32_t)pos);
+}
+
+__device__ __forceinline__ float mk_gumbel(uint32_t seed, uint32_t v) {
+  const uint32_t h = mk_mix32(mk_mix32(seed ^ v) ^ (seed + 0x6A09E667u));
+  const float u = ((float)(h >> 9) + 0.5f) * (1.0f / 8388608.0f);
+  return -logf(-logf(u));
+}
+
+template <bool FP8, bool EMB_FP16>
+__global__ void __launch_bounds__(256, 1) markov_shard_5step_kernel(
+    const void* __restrict__ weight, const half* __restrict__ w_scales,
+    const uint16_t* __restrict__ embed, const half* __restrict__ local_logits,
+    const int64_t* __restrict__ anchors, int64_t* __restrict__ out_tokens,
+    float* __restrict__ ws_val, int* __restrict__ ws_idx,
+    int* __restrict__ prev_tok, int* __restrict__ state_ctrl,
+    v41ll_mk::LLTilePeers peers, int rank, int64_t cap, int R, int V, int vocab,
+    int vocab_start, int steps, const int64_t* __restrict__ c_keys,
+    const int64_t* __restrict__ c_pos, const float* __restrict__ c_temps,
+    float draft_scale) {
+  // state_ctrl layout (4 int32s, initialized to 0 once at startup):
+  //   [0]: ticket (0..79, self-resetting)
+  //   [1]: step_done (monotonically increasing across launches, graph safe!)
+  //   [2]: ll_counter (parity counter for LL_MARKOV buffer)
+  __shared__ uint16_t s_emb[MK_MAX_R][MK_K];  // 32 KiB lossless BF16!
+  __shared__ float w_best_v[8][MK_MAX_R];     // 2 KiB
+  __shared__ int w_best_i[8][MK_MAX_R];       // 2 KiB
+  __shared__ bool is_last;
+
+  const int cta = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+
+  // Snapshot monotonic step_done baseline BEFORE step 0 (CUDA Graph safe!)
+  int base_done = ld_vol_i32(state_ctrl + 1);
+
+  // Initialize prev_tok from anchors on CTA 0? Better: every CTA reads anchors
+  // directly on step 0 so zero cross-CTA barrier is needed before step 0!
+  const int v0 = (cta * V) / MK_CTAS;
+  const int v1 = ((cta + 1) * V) / MK_CTAS;
+
+  for (int step = 0; step < steps; ++step) {
+    // 1. Load R embedding rows [R, 256] BF16 into SMEM
+    for (int idx = tid; idx < R * MK_K; idx += 256) {
+      const int r = idx >> 8;
+      const int k = idx & 255;
+      int64_t tok;
+      if (step == 0) {
+        tok = anchors[r];
+        if (tok < 0) tok = 0;
+        if (tok >= vocab) tok = vocab - 1;
+      } else {
+        tok = (int64_t)ld_vol_i32(prev_tok + r);
+      }
+      s_emb[r][k] = embed[tok * MK_K + k];
+    }
+    __syncthreads();
+
+    // 2. Score rows [v0, v1) against all R requests (zero local-memory spill!)
+    if (lane == 0) {
+      for (int r = 0; r < R; ++r) {
+        w_best_v[warp][r] = -INFINITY;
+        w_best_i[warp][r] = 2147483647;
+      }
+    }
+    __syncwarp();
+    float bv0 = -INFINITY;
+    int bi0 = 2147483647;
+
+    for (int v = v0 + warp; v < v1; v += 8) {
+      float w[8];
+      if constexpr (FP8) {
+        const uint2 q = __ldcs(reinterpret_cast<const uint2*>(
+            reinterpret_cast<const uint8_t*>(weight) + (size_t)v * MK_K +
+            lane * 8));
+        const float rsc = __half2float(__ldg(w_scales + v));
+        fp8x8_to_f32x8(q, rsc, w);
+      } else {
+        const uint4 raw = __ldcs(reinterpret_cast<const uint4*>(
+            reinterpret_cast<const uint16_t*>(weight) + (size_t)v * MK_K +
+            lane * 8));
+        const uint16_t* h = reinterpret_cast<const uint16_t*>(&raw);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) w[i] = bf16_u16_to_f32(h[i]);
+      }
+
+      if (R == 1) {
+        const uint4 eraw = *reinterpret_cast<const uint4*>(&s_emb[0][lane * 8]);
+        const uint16_t* eh = reinterpret_cast<const uint16_t*>(&eraw);
+        float dot = 0.f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          float ev = EMB_FP16
+                         ? __half2float(*reinterpret_cast<const half*>(&eh[i]))
+                         : bf16_u16_to_f32(eh[i]);
+          dot += w[i] * ev;
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+          dot += __shfl_xor_sync(0xffffffffu, dot, off);
+        if (lane == 0) {
+          const float lg = __half2float(local_logits[(size_t)step * V + v]);
+          float val = lg + dot;
+          if (c_temps != nullptr) {
+            const float t0 = c_temps[0];
+            if (t0 > 0.f) {
+              const uint32_t sd =
+                  mk_row_seed((uint64_t)c_keys[0], (uint64_t)(c_pos[0] + step));
+              val = val / (t0 * draft_scale) +
+                    mk_gumbel(sd, (uint32_t)(vocab_start + v));
+            }
+          }
+          if (val > bv0 || (val == bv0 && v < bi0)) {
+            bv0 = val;
+            bi0 = v;
+          }
+        }
+      } else {
+        for (int r = 0; r < R; ++r) {
+          const uint4 eraw =
+              *reinterpret_cast<const uint4*>(&s_emb[r][lane * 8]);
+          const uint16_t* eh = reinterpret_cast<const uint16_t*>(&eraw);
+          float dot = 0.f;
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            float ev =
+                EMB_FP16 ? __half2float(*reinterpret_cast<const half*>(&eh[i]))
+                         : bf16_u16_to_f32(eh[i]);
+            dot += w[i] * ev;
+          }
+#pragma unroll
+          for (int off = 16; off > 0; off >>= 1)
+            dot += __shfl_xor_sync(0xffffffffu, dot, off);
+          if (lane == 0) {
+            const float lg =
+                __half2float(local_logits[((size_t)r * steps + step) * V + v]);
+            float val = lg + dot;
+            if (c_temps != nullptr) {
+              const float tr = c_temps[r];
+              if (tr > 0.f) {
+                const uint32_t sd = mk_row_seed((uint64_t)c_keys[r],
+                                                (uint64_t)(c_pos[r] + step));
+                val = val / (tr * draft_scale) +
+                      mk_gumbel(sd, (uint32_t)(vocab_start + v));
+              }
+            }
+            if (val > w_best_v[warp][r] ||
+                (val == w_best_v[warp][r] && v < w_best_i[warp][r])) {
+              w_best_v[warp][r] = val;
+              w_best_i[warp][r] = v;
+            }
+          }
+        }
+      }
+    }
+
+    if (R == 1 && lane == 0) {
+      w_best_v[warp][0] = bv0;
+      w_best_i[warp][0] = bi0;
+    }
+    __syncthreads();
+
+    // Reduce 8 warps per request r -> ws_val[r * 80 + cta], ws_idx[r * 80 +
+    // cta]
+    for (int r = tid; r < R; r += 256) {
+      float bv = -INFINITY;
+      int bi = 2147483647;
+#pragma unroll
+      for (int w = 0; w < 8; ++w) {
+        const float v = w_best_v[w][r];
+        const int idx = w_best_i[w][r];
+        if (v > bv || (v == bv && idx < bi)) {
+          bv = v;
+          bi = idx;
+        }
+      }
+      ws_val[r * MK_CTAS + cta] = bv;
+      ws_idx[r * MK_CTAS + cta] = bi;
+    }
+
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) is_last = (atomicAdd(state_ctrl + 0, 1) == MK_CTAS - 1);
+    __syncthreads();
+
+    if (is_last) {
+      if (tid == 0) st_vol_i32(state_ctrl + 0, 0);
+      __threadfence();
+      const int64_t ll_base =
+          (int64_t)(ld_vol_i32(state_ctrl + 2) & 1) * 4 * cap;
+      // Reduce 80 CTAs per request r using 1 warp per request (up to 8 warps)
+      for (int r = warp; r < R; r += 8) {
+        float bv = -INFINITY;
+        int bi = 2147483647;
+        for (int c = lane; c < MK_CTAS; c += 32) {
+          const float v = __ldcg(ws_val + r * MK_CTAS + c);
+          const int idx = __ldcg(ws_idx + r * MK_CTAS + c);
+          if (v > bv || (v == bv && idx < bi)) {
+            bv = v;
+            bi = idx;
+          }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+          const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+          const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+          if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+          }
+        }
+        if (lane == 0) {
+          const bool real = bi < V;
+          const float out_v = real ? bv : nanf("");
+          const int out_gid = real ? (bi + vocab_start) : 2147483647;
+          if (peers.p[0] != nullptr) {
+            uint4 pkt = make_uint4(
+                v41ll_mk::ll_tile_escape<false>(__float_as_uint(out_v)),
+                v41ll_mk::ll_tile_escape<false>((uint32_t)out_gid), 0u, 0u);
+#pragma unroll
+            for (int pr = 1; pr < 4; ++pr) {
+              v41ll_mk::ll_tile_store(peers.p[(rank + pr) & 3] + ll_base +
+                                          (int64_t)rank * cap + (int64_t)r * 16,
+                                      pkt);
+            }
+            // Also stash own values in w_best_v/i[0][r] for Phase 2!
+            w_best_v[0][r] = out_v;
+            w_best_i[0][r] = out_gid;
+          } else {
+            const int64_t winner = real ? (int64_t)out_gid : 2147483647LL;
+            out_tokens[r * steps + step] = winner;
+            int clamped = (int)(winner < vocab ? winner : (vocab - 1));
+            if (clamped < 0) clamped = 0;
+            st_vol_i32(prev_tok + r, clamped);
+          }
+        }
+      }
+      __syncthreads();
+      if (peers.p[0] != nullptr) {
+        char* mine = peers.p[rank] + ll_base;
+        const uint4 empty = make_uint4(~0u, ~0u, ~0u, ~0u);
+        for (int r = tid; r < R; r += 256) {
+          float gv = -INFINITY;
+          int gi = 2147483647;
+          bool any_real = false;
+#pragma unroll
+          for (int pr = 0; pr < 4; ++pr) {
+            float rv;
+            int ri;
+            if (pr == rank) {
+              rv = w_best_v[0][r];
+              ri = w_best_i[0][r];
+            } else {
+              char* a = mine + (int64_t)pr * cap + (int64_t)r * 16;
+              uint4 pkt;
+              do {
+                pkt = v41ll_mk::ll_tile_load(a);
+              } while (!v41ll_mk::ll_tile_ready4<false>(pkt));
+              v41ll_mk::ll_tile_store(a, empty);
+              rv = __uint_as_float(pkt.x);
+              ri = (int)pkt.y;
+            }
+            if (!isnan(rv)) {
+              if (!any_real || rv > gv || (rv == gv && ri < gi)) {
+                gv = rv;
+                gi = ri;
+                any_real = true;
+              }
+            }
+          }
+          const int64_t winner = any_real ? (int64_t)gi : 2147483647LL;
+          out_tokens[r * steps + step] = winner;
+          int clamped = (int)(winner < vocab ? winner : (vocab - 1));
+          if (clamped < 0) clamped = 0;
+          st_vol_i32(prev_tok + r, clamped);
+        }
+        __syncthreads();
+        if (tid == 0)
+          st_vol_i32(state_ctrl + 2, ld_vol_i32(state_ctrl + 2) + 1);
+      }
+      __threadfence();
+      __syncthreads();
+      if (tid == 0) atomicAdd(state_ctrl + 1, 1);
+    }
+
+    // All 80 CTAs wait for step completion before starting step + 1
+    if (step + 1 < steps) {
+      const int target_done = base_done + step + 1;
+      if (tid == 0) {
+        while (ld_vol_i32(state_ctrl + 1) < target_done) {
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
+// ---- Phase 2C-1: SM70 WMMA 80-CTA cooperative 5-step sharded Markov (R=5..64)
+// ---- Uses Volta 16x16x16 FP16->FP32 Tensor Cores + coalesced 32-row
+// local_logits reads in 45 KiB static SMEM (1 CTA/SM, 80/80 co-resident,
+// CUDA-Graph safe).
+template <bool FP8, bool EMB_FP16>
+__global__ void __launch_bounds__(256, 1) markov_shard_5step_wmma_kernel(
+    const void* __restrict__ weight, const half* __restrict__ w_scales,
+    const uint16_t* __restrict__ embed, const half* __restrict__ local_logits,
+    const int64_t* __restrict__ anchors, int64_t* __restrict__ out_tokens,
+    float* __restrict__ ws_val, int* __restrict__ ws_idx,
+    int* __restrict__ prev_tok, int* __restrict__ state_ctrl,
+    v41ll_mk::LLTilePeers peers, int rank, int64_t cap, int R, int V, int vocab,
+    int vocab_start, int steps, const int64_t* __restrict__ c_keys,
+    const int64_t* __restrict__ c_pos, const float* __restrict__ c_temps,
+    float draft_scale) {
+  using namespace nvcuda;
+  __shared__ half s_emb[MK_MAX_R][MK_K + 8];  // 33.0 KiB, ld=264
+  __shared__ half s_w[32][40];                //  2.5 KiB, ld=40
+  __shared__ float s_c[MK_MAX_R][36];         //  9.0 KiB, ld=36
+  __shared__ float r_best_v[MK_MAX_R];        //  0.25 KiB
+  __shared__ int r_best_i[MK_MAX_R];          //  0.25 KiB
+  __shared__ bool is_last;
+
+  const int cta = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int wm = warp >> 1;  // 0..3 -> 16 requests each
+  const int wn = warp & 1;   // 0..1 -> 16 vocab rows each
+  const int m_pad = (R + 15) & ~15;
+  const bool active_wmma = (wm * 16 < R);
+
+  const int base_done = ld_vol_i32(state_ctrl + 1);
+  const int v0 = (cta * V) / MK_CTAS;
+  const int v1 = ((cta + 1) * V) / MK_CTAS;
+
+  for (int step = 0; step < steps; ++step) {
+    // 1. Load R embedding rows [R, 256] as FP16 into s_emb (+ zero-pad up to
+    // m_pad)
+    for (int idx = tid; idx < m_pad * MK_K; idx += 256) {
+      const int r = idx >> 8;
+      const int k = idx & 255;
+      if (r < R) {
+        int64_t tok;
+        if (step == 0) {
+          tok = anchors[r];
+          if (tok < 0) tok = 0;
+          if (tok >= vocab) tok = vocab - 1;
+        } else {
+          tok = (int64_t)ld_vol_i32(prev_tok + r);
+        }
+        const uint16_t raw = embed[tok * MK_K + k];
+        if constexpr (EMB_FP16) {
+          s_emb[r][k] = *reinterpret_cast<const half*>(&raw);
+        } else {
+          s_emb[r][k] = __float2half(bf16_u16_to_f32(raw));
+        }
+      } else {
+        s_emb[r][k] = __float2half(0.f);
+      }
+    }
+    if (tid < R) {
+      r_best_v[tid] = -INFINITY;
+      r_best_i[tid] = 2147483647;
+    }
+    __syncthreads();
+
+    // 2. Tile vocab [v0, v1) in chunks of 32 rows using Volta WMMA
+    const int w_row = tid >> 3;         // 0..31
+    const int w_col4 = (tid & 7) << 2;  // 0, 4, ..., 28
+    for (int vb = v0; vb < v1; vb += 32) {
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+      wmma::fill_fragment(acc, 0.f);
+      const int v_load = vb + w_row;
+      const bool v_load_ok = (v_load < v1);
+      float rsc = 0.f;
+      if constexpr (FP8) {
+        if (v_load_ok) rsc = __half2float(__ldg(w_scales + v_load));
+      }
+
+#pragma unroll
+      for (int kb = 0; kb < MK_K; kb += 32) {
+        half h4[4];
+        if (v_load_ok) {
+          if constexpr (FP8) {
+            const uint32_t q4 = __ldcs(reinterpret_cast<const uint32_t*>(
+                reinterpret_cast<const uint8_t*>(weight) +
+                (size_t)v_load * MK_K + kb + w_col4));
+            const uint2 qpair = make_uint2(q4, 0u);
+            float f8[8];
+            fp8x8_to_f32x8(qpair, rsc, f8);
+            h4[0] = __float2half(f8[0]);
+            h4[1] = __float2half(f8[1]);
+            h4[2] = __float2half(f8[2]);
+            h4[3] = __float2half(f8[3]);
+          } else {
+            const uint2 raw4 = __ldcs(reinterpret_cast<const uint2*>(
+                reinterpret_cast<const uint16_t*>(weight) +
+                (size_t)v_load * MK_K + kb + w_col4));
+            const uint16_t* u = reinterpret_cast<const uint16_t*>(&raw4);
+            h4[0] = __float2half(bf16_u16_to_f32(u[0]));
+            h4[1] = __float2half(bf16_u16_to_f32(u[1]));
+            h4[2] = __float2half(bf16_u16_to_f32(u[2]));
+            h4[3] = __float2half(bf16_u16_to_f32(u[3]));
+          }
+        } else {
+          h4[0] = h4[1] = h4[2] = h4[3] = __float2half(0.f);
+        }
+        *reinterpret_cast<uint2*>(&s_w[w_row][w_col4]) =
+            *reinterpret_cast<const uint2*>(h4);
+        __syncthreads();
+
+        if (active_wmma) {
+          wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a0,
+              a1;
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b0,
+              b1;
+          wmma::load_matrix_sync(a0, &s_emb[wm * 16][kb], MK_K + 8);
+          wmma::load_matrix_sync(b0, &s_w[wn * 16][0], 40);
+          wmma::mma_sync(acc, a0, b0, acc);
+          wmma::load_matrix_sync(a1, &s_emb[wm * 16][kb + 16], MK_K + 8);
+          wmma::load_matrix_sync(b1, &s_w[wn * 16][16], 40);
+          wmma::mma_sync(acc, a1, b1, acc);
+        }
+        __syncthreads();
+      }
+
+      if (active_wmma) {
+        wmma::store_matrix_sync(&s_c[wm * 16][wn * 16], acc, 36,
+                                wmma::mem_row_major);
+      }
+      __syncthreads();
+
+      // 3. Coalesced local_logits load + warp-level max-with-lowest-index
+      const int v_cur = vb + lane;
+      const bool v_ok = (v_cur < v1);
+      for (int r = warp; r < R; r += 8) {
+        float val = -INFINITY;
+        int idx = 2147483647;
+        if (v_ok) {
+          const float lg = __half2float(
+              local_logits[((size_t)r * steps + step) * V + v_cur]);
+          float cand = lg + s_c[r][lane];
+          if (c_temps != nullptr) {
+            const float tr = c_temps[r];
+            if (tr > 0.f) {
+              const uint32_t sd =
+                  mk_row_seed((uint64_t)c_keys[r], (uint64_t)(c_pos[r] + step));
+              cand = cand / (tr * draft_scale) +
+                     mk_gumbel(sd, (uint32_t)(vocab_start + v_cur));
+            }
+          }
+          if (!isnan(cand)) {
+            val = cand;
+            idx = v_cur;
+          }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+          const float ov = __shfl_xor_sync(0xffffffffu, val, off);
+          const int oi = __shfl_xor_sync(0xffffffffu, idx, off);
+          if (ov > val || (ov == val && oi < idx)) {
+            val = ov;
+            idx = oi;
+          }
+        }
+        if (lane == 0) {
+          const float bv = r_best_v[r];
+          const int bi = r_best_i[r];
+          if (val > bv || (val == bv && idx < bi)) {
+            r_best_v[r] = val;
+            r_best_i[r] = idx;
+          }
+        }
+      }
+      __syncthreads();
+    }
+
+    // 4. Write CTA best -> global ws and synchronize across 80 CTAs + 4 ranks
+    for (int r = tid; r < R; r += 256) {
+      ws_val[r * MK_CTAS + cta] = r_best_v[r];
+      ws_idx[r * MK_CTAS + cta] = r_best_i[r];
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) is_last = (atomicAdd(state_ctrl + 0, 1) == MK_CTAS - 1);
+    __syncthreads();
+
+    if (is_last) {
+      if (tid == 0) st_vol_i32(state_ctrl + 0, 0);
+      __threadfence();
+      const int64_t ll_base =
+          (int64_t)(ld_vol_i32(state_ctrl + 2) & 1) * 4 * cap;
+      for (int r = warp; r < R; r += 8) {
+        float bv = -INFINITY;
+        int bi = 2147483647;
+        for (int c = lane; c < MK_CTAS; c += 32) {
+          const float v = __ldcg(ws_val + r * MK_CTAS + c);
+          const int idx = __ldcg(ws_idx + r * MK_CTAS + c);
+          if (v > bv || (v == bv && idx < bi)) {
+            bv = v;
+            bi = idx;
+          }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+          const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+          const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+          if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+          }
+        }
+        if (lane == 0) {
+          const bool real = bi < V;
+          const float out_v = real ? bv : nanf("");
+          const int out_gid = real ? (bi + vocab_start) : 2147483647;
+          if (peers.p[0] != nullptr) {
+            uint4 pkt = make_uint4(
+                v41ll_mk::ll_tile_escape<false>(__float_as_uint(out_v)),
+                v41ll_mk::ll_tile_escape<false>((uint32_t)out_gid), 0u, 0u);
+#pragma unroll
+            for (int pr = 1; pr < 4; ++pr) {
+              v41ll_mk::ll_tile_store(peers.p[(rank + pr) & 3] + ll_base +
+                                          (int64_t)rank * cap + (int64_t)r * 16,
+                                      pkt);
+            }
+            r_best_v[r] = out_v;
+            r_best_i[r] = out_gid;
+          } else {
+            const int64_t winner = real ? (int64_t)out_gid : 2147483647LL;
+            out_tokens[r * steps + step] = winner;
+            int clamped = (int)(winner < vocab ? winner : (vocab - 1));
+            if (clamped < 0) clamped = 0;
+            st_vol_i32(prev_tok + r, clamped);
+          }
+        }
+      }
+      __syncthreads();
+      if (peers.p[0] != nullptr) {
+        char* mine = peers.p[rank] + ll_base;
+        const uint4 empty = make_uint4(~0u, ~0u, ~0u, ~0u);
+        for (int r = tid; r < R; r += 256) {
+          float gv = -INFINITY;
+          int gi = 2147483647;
+          bool any_real = false;
+#pragma unroll
+          for (int pr = 0; pr < 4; ++pr) {
+            float rv;
+            int ri;
+            if (pr == rank) {
+              rv = r_best_v[r];
+              ri = r_best_i[r];
+            } else {
+              char* a = mine + (int64_t)pr * cap + (int64_t)r * 16;
+              uint4 pkt;
+              do {
+                pkt = v41ll_mk::ll_tile_load(a);
+              } while (!v41ll_mk::ll_tile_ready4<false>(pkt));
+              v41ll_mk::ll_tile_store(a, empty);
+              rv = __uint_as_float(pkt.x);
+              ri = (int)pkt.y;
+            }
+            if (!isnan(rv)) {
+              if (!any_real || rv > gv || (rv == gv && ri < gi)) {
+                gv = rv;
+                gi = ri;
+                any_real = true;
+              }
+            }
+          }
+          const int64_t winner = any_real ? (int64_t)gi : 2147483647LL;
+          out_tokens[r * steps + step] = winner;
+          int clamped = (int)(winner < vocab ? winner : (vocab - 1));
+          if (clamped < 0) clamped = 0;
+          st_vol_i32(prev_tok + r, clamped);
+        }
+        __syncthreads();
+        if (tid == 0)
+          st_vol_i32(state_ctrl + 2, ld_vol_i32(state_ctrl + 2) + 1);
+      }
+      __threadfence();
+      __syncthreads();
+      if (tid == 0) atomicAdd(state_ctrl + 1, 1);
+    }
+
+    if (step + 1 < steps) {
+      const int target_done = base_done + step + 1;
+      if (tid == 0) {
+        while (ld_vol_i32(state_ctrl + 1) < target_done) {
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
+void markov_shard_5step(
+    torch::Tensor out_tokens, torch::Tensor weight,
+    std::optional<torch::Tensor> w_scales, torch::Tensor embed,
+    torch::Tensor local_logits, torch::Tensor anchors, torch::Tensor ws_val,
+    torch::Tensor ws_idx, torch::Tensor prev_tok, torch::Tensor state_ctrl,
+    int64_t p0, int64_t p1, int64_t p2, int64_t p3, int64_t rank, int64_t cap,
+    int64_t vocab_start, int64_t steps, std::optional<torch::Tensor> c_keys,
+    std::optional<torch::Tensor> c_pos, std::optional<torch::Tensor> c_temps,
+    double draft_scale) {
+  const bool fp8 = w_scales.has_value();
+  const int R = anchors.numel();
+  const int V = weight.size(0);
+  const int vocab = embed.size(0);
+  TORCH_CHECK(R >= 1 && R <= MK_MAX_R && weight.size(1) == MK_K &&
+              embed.size(1) == MK_K);
+  TORCH_CHECK(local_logits.scalar_type() == torch::kFloat16 &&
+              local_logits.is_contiguous() &&
+              local_logits.size(0) == R * steps && local_logits.size(1) == V);
+  TORCH_CHECK(out_tokens.scalar_type() == torch::kInt64 &&
+              out_tokens.is_contiguous() && out_tokens.numel() == R * steps);
+  TORCH_CHECK((embed.scalar_type() == torch::kFloat16 ||
+               embed.scalar_type() == torch::kBFloat16) &&
+              embed.is_contiguous());
+  TORCH_CHECK(ws_val.numel() >= R * MK_CTAS && ws_idx.numel() >= R * MK_CTAS &&
+              prev_tok.numel() >= R && state_ctrl.numel() >= 4);
+  if (fp8) {
+    TORCH_CHECK(weight.scalar_type() == torch::kUInt8 &&
+                weight.is_contiguous());
+    TORCH_CHECK(w_scales->scalar_type() == torch::kFloat16 &&
+                w_scales->numel() == V && w_scales->is_contiguous());
+  } else {
+    TORCH_CHECK((weight.scalar_type() == torch::kBFloat16 ||
+                 weight.scalar_type() == torch::kInt16) &&
+                weight.is_contiguous());
+  }
+  const at::cuda::OptionalCUDAGuard guard(device_of(local_logits));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  v41ll_mk::LLTilePeers peers{
+      {reinterpret_cast<char*>(p0), reinterpret_cast<char*>(p1),
+       reinterpret_cast<char*>(p2), reinterpret_cast<char*>(p3)}};
+  const half* sc_ptr =
+      fp8 ? reinterpret_cast<const half*>(w_scales->data_ptr<at::Half>())
+          : nullptr;
+  const auto* emb_ptr = reinterpret_cast<const uint16_t*>(embed.data_ptr());
+  const auto* lg_ptr =
+      reinterpret_cast<const half*>(local_logits.data_ptr<at::Half>());
+  const bool emb_fp16 = (embed.scalar_type() == torch::kFloat16);
+  TORCH_CHECK(emb_fp16 || embed.scalar_type() == torch::kBFloat16,
+              "markov_shard_5step: embed must be fp16 or bf16");
+  const int64_t* ck_ptr =
+      (c_keys.has_value() && c_pos.has_value() && c_temps.has_value())
+          ? c_keys->data_ptr<int64_t>()
+          : nullptr;
+  const int64_t* cp_ptr = ck_ptr ? c_pos->data_ptr<int64_t>() : nullptr;
+  const float* ct_ptr = ck_ptr ? c_temps->data_ptr<float>() : nullptr;
+  const float d_sc = (float)draft_scale;
+  if (R >= 2) {
+    if (fp8) {
+      if (emb_fp16) {
+        markov_shard_5step_wmma_kernel<true, true><<<MK_CTAS, 256, 0, stream>>>(
+            weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr,
+            anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+            ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+            prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+            (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps, ck_ptr,
+            cp_ptr, ct_ptr, d_sc);
+      } else {
+        markov_shard_5step_wmma_kernel<true, false>
+            <<<MK_CTAS, 256, 0, stream>>>(
+                weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr,
+                anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+                ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+                prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+                (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps,
+                ck_ptr, cp_ptr, ct_ptr, d_sc);
+      }
+    } else {
+      if (emb_fp16) {
+        markov_shard_5step_wmma_kernel<false, true>
+            <<<MK_CTAS, 256, 0, stream>>>(
+                weight.data_ptr(), nullptr, emb_ptr, lg_ptr,
+                anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+                ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+                prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+                (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps,
+                ck_ptr, cp_ptr, ct_ptr, d_sc);
+      } else {
+        markov_shard_5step_wmma_kernel<false, false>
+            <<<MK_CTAS, 256, 0, stream>>>(
+                weight.data_ptr(), nullptr, emb_ptr, lg_ptr,
+                anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+                ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+                prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+                (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps,
+                ck_ptr, cp_ptr, ct_ptr, d_sc);
+      }
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+  if (fp8) {
+    if (emb_fp16) {
+      markov_shard_5step_kernel<true, true><<<MK_CTAS, 256, 0, stream>>>(
+          weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr,
+          anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+          ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+          prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+          (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps, ck_ptr,
+          cp_ptr, ct_ptr, d_sc);
+    } else {
+      markov_shard_5step_kernel<true, false><<<MK_CTAS, 256, 0, stream>>>(
+          weight.data_ptr(), sc_ptr, emb_ptr, lg_ptr,
+          anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+          ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+          prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+          (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps, ck_ptr,
+          cp_ptr, ct_ptr, d_sc);
+    }
+  } else {
+    if (emb_fp16) {
+      markov_shard_5step_kernel<false, true><<<MK_CTAS, 256, 0, stream>>>(
+          weight.data_ptr(), nullptr, emb_ptr, lg_ptr,
+          anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+          ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+          prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+          (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps, ck_ptr,
+          cp_ptr, ct_ptr, d_sc);
+    } else {
+      markov_shard_5step_kernel<false, false><<<MK_CTAS, 256, 0, stream>>>(
+          weight.data_ptr(), nullptr, emb_ptr, lg_ptr,
+          anchors.data_ptr<int64_t>(), out_tokens.data_ptr<int64_t>(),
+          ws_val.data_ptr<float>(), ws_idx.data_ptr<int>(),
+          prev_tok.data_ptr<int>(), state_ctrl.data_ptr<int>(), peers,
+          (int)rank, cap, R, V, vocab, (int)vocab_start, (int)steps, ck_ptr,
+          cp_ptr, ct_ptr, d_sc);
+    }
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// ---- Phase 3A: Parallel Multi-CTA route_plan_wide_v2 (bitwise identical) ----
 
 }  // namespace v41sk
 
@@ -4046,6 +8283,39 @@ TORCH_LIBRARY(v41sk, m) {
       "p3, "
       "int rank, int cap, Tensor(b!) counter) -> ()");
   m.def(
+      "ll_alltoall(Tensor(a!) out, Tensor inp, int p0, int p1, int p2, int "
+      "p3, "
+      "int rank, int cap, Tensor(b!) counter) -> ()");
+  m.def(
+      "dcp_compact_topk(Tensor(a!) local_topk, Tensor(b!) local_cnt, "
+      "Tensor topk, Tensor positions, Tensor valid, int ratio, int shard) -> "
+      "()");
+  m.def(
+      "attn_dcp_comp(Tensor(a!) oml_send, Tensor q_all, Tensor cache, "
+      "Tensor table, Tensor rows, Tensor positions, Tensor valid, "
+      "Tensor local_topk, Tensor local_cnt, float scale, int block, "
+      "int ratio) -> ()");
+  m.def(
+      "attn_dcp_win_combine(Tensor(a!) out, Tensor q_local, Tensor values, "
+      "Tensor wcache, Tensor wtable, Tensor rows, Tensor bases, "
+      "Tensor positions, Tensor valid, Tensor oml_recv, Tensor sink, "
+      "float scale, int wblock, int window, bool paged_fused, "
+      "Tensor? rope) -> ()");
+  m.def("dcp_fused_warmup(Tensor sample_half) -> ()");
+  m.def(
+      "attn_prep_dcp(Tensor(a!) q_out, Tensor(b!) window, Tensor q, "
+      "Tensor kv, Tensor kv_weight, Tensor positions, Tensor rope, "
+      "float eps, int p0, int p1, int p2, int p3, int rank, int slot_cap, "
+      "Tensor? dcp_cnt=None) -> ()");
+  m.def(
+      "attn_dcp_fused(Tensor(a!) out, Tensor q_local, Tensor values, "
+      "Tensor(b!) wcache, Tensor wtable, Tensor ccache, Tensor ctable, "
+      "Tensor rows, Tensor bases, Tensor positions, Tensor valid, "
+      "Tensor local_topk, Tensor local_cnt, Tensor sink, float scale, "
+      "int wblock, int cblock, int ratio, int window, bool paged_fused, "
+      "Tensor? rope, int p0, int p1, int p2, int p3, int rank, int slot_cap, "
+      "Tensor(c!) dcp_cnt) -> ()");
+  m.def(
       "hc_mix(Tensor residual, Tensor fn, Tensor scale, Tensor base, "
       "Tensor(a!) pre_o, "
       "Tensor(b!) post_o, Tensor(c!) comb_o, Tensor(d!) ws, Tensor(e!) ticket, "
@@ -4064,7 +8334,26 @@ TORCH_LIBRARY(v41sk, m) {
       "Tensor table, "
       "Tensor positions, Tensor qsl, int num_reqs, int ratio, int ctas, int "
       "shard, "
-      "int nshard) -> ()");
+      "int nshard, bool kv_sharded=False) -> ()");
+  m.def(
+      "index_scores_prefill_shard(Tensor(a!) out, Tensor q, Tensor w, "
+      "Tensor cache, Tensor table, Tensor positions, int ratio, int shard, "
+      "int nshard, bool kv_sharded=False) -> ()");
+  m.def(
+      "hc_expand_norm(Tensor(a!) out, Tensor(b!) residual, Tensor y, "
+      "Tensor post, Tensor comb, Tensor cpre, Tensor norm_weight, "
+      "float norm_eps, Tensor(c!)? res_sq=None) -> ()");
+  m.def(
+      "hc_sinkhorn_from_dots(Tensor dots, Tensor res_sq, Tensor scale, "
+      "Tensor base, Tensor(a!) pre_o, Tensor(b!) post_o, Tensor(c!) comb_o, "
+      "float norm_eps, float hc_eps, int iters) -> ()");
+  m.def(
+      "markov_shard_5step(Tensor(a!) out_tokens, Tensor weight, Tensor? "
+      "w_scales, Tensor embed, Tensor local_logits, Tensor anchors, "
+      "Tensor(b!) ws_val, Tensor(c!) ws_idx, Tensor(d!) prev_tok, "
+      "Tensor(e!) state_ctrl, int p0, int p1, int p2, int p3, int rank, "
+      "int cap, int vocab_start, int steps, Tensor? c_keys=None, "
+      "Tensor? c_pos=None, Tensor? c_temps=None, float draft_scale=0.5) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(v41sk, CUDA, m) {
@@ -4086,10 +8375,21 @@ TORCH_LIBRARY_IMPL(v41sk, CUDA, m) {
   m.impl("moe_w2_route", &v41sk::moe_w2_route);
   m.impl("moe_w13_units", &v41sk::moe_w13_units);
   m.impl("ll_allgather", &v41sk::ll_allgather);
+  m.impl("ll_alltoall", &v41sk::ll_alltoall);
+  m.impl("dcp_compact_topk", &v41sk::dcp_compact_topk);
+  m.impl("attn_dcp_comp", &v41sk::attn_dcp_comp);
+  m.impl("attn_dcp_win_combine", &v41sk::attn_dcp_win_combine);
+  m.impl("dcp_fused_warmup", &v41sk::dcp_fused_warmup);
+  m.impl("attn_prep_dcp", &v41sk::attn_prep_dcp);
+  m.impl("attn_dcp_fused", &v41sk::attn_dcp_fused);
   m.impl("hc_mix", &v41sk::hc_mix);
   m.impl("index_scores", &v41sk::index_scores);
   m.impl("index_scores_shard", &v41sk::index_scores_shard);
+  m.impl("index_scores_prefill_shard", &v41sk::index_scores_prefill_shard);
   m.impl("route_plan_wide", &v41sk::route_plan_wide);
+  m.impl("hc_expand_norm", &v41sk::hc_expand_norm);
+  m.impl("hc_sinkhorn_from_dots", &v41sk::hc_sinkhorn_from_dots);
+  m.impl("markov_shard_5step", &v41sk::markov_shard_5step);
 }
 
 TORCH_LIBRARY_IMPL(v41sk, CompositeExplicitAutograd, m) {

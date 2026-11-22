@@ -217,6 +217,14 @@ def _warmup_cycle(
 
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = finished
+    if getattr(kv_cache_config, "needs_kv_cache_zeroing", False):
+        touched_end = min(next_block_id, kv_cache_config.num_blocks)
+        state_end = min(state_blocks, 1 + next_state_id) if next_state_id > 0 else 1
+        dirty_ids = list(range(1, state_end)) + list(
+            range(max(1, state_blocks), touched_end)
+        )
+        if dirty_ids:
+            cleanup_output.new_block_ids_to_zero = dirty_ids
     worker_execute_model(cleanup_output)
 
 
@@ -249,8 +257,21 @@ def warmup_kernels(
             model_runner.scheduler_config.max_num_batched_tokens,
             model_runner.max_model_len - 1 - num_spec_steps,
         )
-        if full_chunk > default_prompt_len:
-            prompt_lengths = tuple(sorted({*prompt_lengths, full_chunk}))
+        extra_lengths = [full_chunk]
+        if (
+            num_spec_steps > 0
+            and default_prompt_len < 16
+            and model_runner.max_model_len - 1 - num_spec_steps >= 16
+        ):
+            extra_lengths.append(16)
+        prompt_lengths = tuple(
+            sorted(
+                {
+                    *prompt_lengths,
+                    *(n for n in extra_lengths if n > default_prompt_len),
+                }
+            )
+        )
 
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     block_count = _warmup_block_counter(model_runner)
@@ -326,7 +347,7 @@ def warmup_kernels(
                         f"c{count}{'m' if mixed else 'd'}",
                         count,
                         default_prompt_len,
-                        sampling_params,
+                        profile_sampling_params,
                         pooling_params,
                         block_count,
                         kv_cache_specs,
@@ -336,3 +357,5 @@ def warmup_kernels(
     finally:
         model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()
+    if torch.accelerator.is_available():
+        torch.accelerator.empty_cache()

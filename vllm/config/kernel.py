@@ -914,8 +914,10 @@ class KernelConfig:
 
     hc_ll_shard: bool = True
     """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
-    hc_weight_storage: Literal["replicated", "sharded"] = "replicated"
+    hc_weight_storage: Literal["replicated", "sharded"] | None = None
     """Keep only losslessly packed TP4 HC shards; large M uses gathered GEMM."""
+    hc_weight_storage_auto: bool = Field(default=False, init=False)
+    """Whether sharded HC storage was selected automatically."""
     sm70_router_weight_storage: Literal["dual", "row_major"] = "dual"
     """Read the FP16 checkpoint router directly or retain its packed duplicate."""
 
@@ -1100,9 +1102,13 @@ class KernelConfig:
     """Share FP16 indexer keys across M2..8 queries of one request on SM70."""
     qsa_host_kv: bool = False
     """Keep QSA attention history in pinned host storage on SM70."""
-    qsa_host_kv_dtype: Literal["fp8_e4m3", "float16"] = "fp8_e4m3"
+    qsa_host_kv_dtype: Literal["int8_per_token_head", "int8", "fp8_e4m3", "float16"] = (
+        "int8_per_token_head"
+    )
     """Authoritative target history format; FP16 isolates placement error."""
-    qsa_host_kv_draft_dtype: Literal["fp8_e4m3", "float16"] = "float16"
+    qsa_host_kv_draft_dtype: Literal[
+        "int8_per_token_head", "int8", "fp8_e4m3", "float16"
+    ] = "float16"
     """Preserve speculative cache precision independently of target storage."""
     qsa_host_kv_device_reference: bool = False
     """Keep identical encoded history on device for controlled placement A/B."""
@@ -1112,9 +1118,11 @@ class KernelConfig:
     device and the remainder directly from mapped host history."""
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
-    qsa_host_kv_hot_dtype: Literal["float16", "fp8_e4m3"] = "float16"
-    """Target hot storage; encoded E4M3 requires E4M3 authoritative history.
-    Encoded hot reads round to the same FP16 operands as the decoded cache."""
+    qsa_host_kv_hot_dtype: Literal[
+        "auto", "float16", "fp8_e4m3", "int8_per_token_head", "int8"
+    ] = "auto"
+    """Target hot storage; 'auto' follows qsa_host_kv_dtype so encoded 8-bit
+    history keeps matching 8-bit hot pages and 3 CTAs/SM native occupancy."""
     qsa_host_kv_draft_hot_tokens: int | None = Field(default=None, gt=0, multiple_of=16)
     """Optional independent draft hot capacity; None preserves target capacity."""
     qsa_host_kv_staging_rows: int = Field(default=32, gt=0, le=32)
@@ -1135,7 +1143,7 @@ class KernelConfig:
     """Shared prefix staging buffers. One slot reuses the current layer's
     buffer after its attention completion event; prefetch still overlaps the
     following non-QSA computation. Two preserves the alternating layout."""
-    qsa_host_kv_trim_warmup_cache: bool = False
+    qsa_host_kv_trim_warmup_cache: bool | None = None
     """Return unused allocator pages once after host-QSA kernel/graph warmup.
     Active tensors and captured private pools remain owned; inference does
     not trim pages. This initialization resource policy does not change
@@ -1154,6 +1162,14 @@ class KernelConfig:
 
     Zero retains the shared capacity. A nonzero pool retains active states and
     bounded prefix checkpoints while history IDs use a separate range.
+    """
+    qsa_host_kv_history_blocks: int = Field(default=0, ge=0)
+    """Target history-block capacity when qsa_host_kv_state_blocks is nonzero.
+
+    Zero retains the single-window default. A positive value expands the
+    decoupled history pool up to this block count (capped by available GPU
+    memory), multiplying total KV token capacity without inflating device
+    recurrent-state storage.
     """
     qsa_host_kv_active: bool = Field(default=False, init=False)
     """Whether the host QSA cache geometry has been admitted."""
@@ -1185,7 +1201,7 @@ class KernelConfig:
     """Serve eligible CPU PLE requests from a native owner thread."""
     ple_draft_prefetch: bool = True
     """Read PLE table pages of drafted tokens into page cache while drafting."""
-    ple_prefill_early_request: bool = False
+    ple_prefill_early_request: bool | None = None
     """Send prompt-only PLE batches from host token copies at scheduling time and
     release mapped results right after their consumer copy, so the CPU worker
     gathers the next prefill chunk while the GPU still runs the current one."""
@@ -1283,6 +1299,8 @@ class KernelConfig:
 
         prefer = self.prefer_speculative_runner(cfg)
         qwen4_sm70 = self._prefer_qwen4_sm70(cfg)
+        if self.ple_prefill_early_request is None:
+            self.ple_prefill_early_request = qwen4_sm70
         if self.sm70_qsa_prep is None:
             self.sm70_qsa_prep = qwen4_sm70
         if self.sm70_hcx is None:
@@ -1293,6 +1311,27 @@ class KernelConfig:
             )
         if self.sm70_hcx_local_schedule is None:
             self.sm70_hcx_local_schedule = bool(self.sm70_hcx)
+        if self.hc_weight_storage is None:
+            model = getattr(cfg, "model_config", None)
+            text = getattr(model, "hf_text_config", None)
+            parallel = getattr(cfg, "parallel_config", None)
+            tp_size = int(getattr(parallel, "tensor_parallel_size", 1) or 1)
+            if (
+                qwen4_sm70
+                and self.hc_ll_shard
+                and tp_size == 4
+                and getattr(cfg, "lora_config", None) is None
+                and (
+                    getattr(text, "hc_count", None),
+                    getattr(text, "hidden_size", None),
+                    getattr(text, "hc_lowrank", None),
+                )
+                == (4, 2560, 320)
+            ):
+                self.hc_weight_storage = "sharded"
+                self.hc_weight_storage_auto = True
+            else:
+                self.hc_weight_storage = "replicated"
         if self.sm70_top1x is None:
             self.sm70_top1x = qwen4_sm70
         if self.sm70_greedy_verify is None:
@@ -1352,7 +1391,10 @@ class KernelConfig:
     def resolve_attention_history(self, cfg) -> bool:
         from vllm.models.qwen4_exp.common.kv_policy import resolve_qsa_host_kv
 
-        return resolve_qsa_host_kv(cfg)
+        active = resolve_qsa_host_kv(cfg)
+        if self.qsa_host_kv_trim_warmup_cache is None:
+            self.qsa_host_kv_trim_warmup_cache = bool(active)
+        return active
 
     @property
     def capture_all_draft_steps(self) -> bool:
@@ -1454,6 +1496,7 @@ class KernelConfig:
             "linear_kernel_selections",
             "collective_kernel_selections",
             "sm70_hcx_local_schedule",  # Native dispatch inside the opaque HC op.
+            "hc_weight_storage_auto",  # Diagnostic origin only.
             "moe_kernel_selections",
             "sm70_skinny_moe_applicable",
             "fused_fp16_aux_gemv_applicable",
@@ -1679,3 +1722,56 @@ def capture_sm70_fp8_linear_config() -> Sm70Fp8Config:
     policy = engine.kernel_config.sm70_fp8 if engine else Sm70Fp8Config()
     policy.resolve()
     return policy
+
+
+def is_adaptive_mtp_enabled(
+    speculative_config: Any,
+    num_spec_tokens: int,
+) -> bool:
+    """Return whether async adaptive MTP depth (EntMTP) is enabled."""
+    if (
+        speculative_config is None
+        or getattr(speculative_config, "method", None) != "mtp"
+        or num_spec_tokens < 3
+    ):
+        return False
+    from vllm.config.speculative_sampling import resolve_sampling_policy
+
+    policy = resolve_sampling_policy(speculative_config)
+    raw = (
+        str(policy.adaptive_mtp if policy.adaptive_mtp is not None else "auto")
+        .strip()
+        .lower()
+    )
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw == "auto":
+        from vllm.platforms import current_platform
+
+        return bool(
+            num_spec_tokens >= 5
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+        )
+    return False
+
+
+def adaptive_mtp_min_k(
+    num_spec_tokens: int,
+    speculative_config: Any = None,
+) -> int:
+    """Return the minimum adaptive MTP draft depth clamped to [2, k_max]."""
+    from vllm.config.speculative_sampling import resolve_sampling_policy
+
+    policy = resolve_sampling_policy(speculative_config)
+    try:
+        val = (
+            int(policy.adaptive_mtp_min_k)
+            if policy.adaptive_mtp_min_k is not None
+            else 2
+        )
+    except (TypeError, ValueError):
+        val = 2
+    return max(2, min(val, num_spec_tokens))

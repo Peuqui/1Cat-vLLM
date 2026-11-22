@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import hashlib
 import io
 import json
 import time
@@ -9,7 +10,7 @@ from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import numpy as np
 import pybase64 as base64
@@ -52,10 +53,10 @@ from vllm.entrypoints.openai.engine.protocol import (
     DeltaToolCall,
     ErrorResponse,
     FunctionCall,
-    PromptTokenUsageInfo,
     RequestResponseMetadata,
     ToolCall,
     UsageInfo,
+    populate_prompt_cache_usage,
 )
 from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
@@ -121,7 +122,7 @@ class _PrefixCacheBoundaries:
     """
 
     def __init__(self, max_entries: int = 256) -> None:
-        self._generation: dict[str, tuple[int, ...] | None] = {}
+        self._generation: OrderedDict[str, tuple[int, ...] | None] = OrderedDict()
         self._system: OrderedDict[str, tuple[int, ...] | None] = OrderedDict()
         self._max_entries = max_entries
 
@@ -137,10 +138,36 @@ class _PrefixCacheBoundaries:
     )
 
     @staticmethod
-    def _render(tokenizer, messages, chat_template, kwargs, tools, generation):
-        kwargs = {
+    def _normalize_kwargs(tokenizer, chat_template: str | None, kwargs: dict[str, Any]):
+        cleaned = {
             k: v for k, v in kwargs.items() if k not in _PrefixCacheBoundaries._OWN_ARGS
         }
+        tmpl = chat_template or getattr(tokenizer, "chat_template", "") or ""
+        if "reasoning_effort" in cleaned and "Supported types are xhigh" in str(tmpl):
+            effort = cleaned.get("reasoning_effort")
+            if effort == "max":
+                cleaned["reasoning_effort"] = "xhigh"
+            elif effort == "minimal":
+                cleaned["reasoning_effort"] = "low"
+            elif effort == "none":
+                cleaned.pop("reasoning_effort", None)
+                cleaned.setdefault("enable_thinking", False)
+        return cleaned
+
+    def _put_generation(
+        self, key: str, value: tuple[int, ...] | None
+    ) -> tuple[int, ...] | None:
+        self._generation[key] = value
+        self._generation.move_to_end(key)
+        while len(self._generation) > self._max_entries:
+            self._generation.popitem(last=False)
+        return value
+
+    @staticmethod
+    def _render(tokenizer, messages, chat_template, kwargs, tools, generation):
+        kwargs = _PrefixCacheBoundaries._normalize_kwargs(
+            tokenizer, chat_template, kwargs
+        )
         try:
             return _token_list(
                 tokenizer.apply_chat_template(
@@ -157,63 +184,108 @@ class _PrefixCacheBoundaries:
 
     def _generation_prompt(self, tokenizer, chat_template, kwargs):
         key = json.dumps([chat_template, kwargs], sort_keys=True, default=str)
-        if key not in self._generation:
-            probe = [{"role": "user", "content": "x"}]
-            with_prompt = self._render(
-                tokenizer, probe, chat_template, kwargs, None, True
-            )
-            without = self._render(tokenizer, probe, chat_template, kwargs, None, False)
-            suffix = None
-            if (
-                with_prompt is not None
-                and without is not None
-                and len(with_prompt) > len(without)
-                and with_prompt[: len(without)] == without
-            ):
-                suffix = tuple(with_prompt[len(without) :])
-            self._generation[key] = suffix
-        return self._generation[key]
+        if key in self._generation:
+            self._generation.move_to_end(key)
+            return self._generation[key]
+        probe = [{"role": "user", "content": "x"}]
+        with_prompt = self._render(tokenizer, probe, chat_template, kwargs, None, True)
+        without = self._render(tokenizer, probe, chat_template, kwargs, None, False)
+        suffix = None
+        if (
+            with_prompt is not None
+            and without is not None
+            and len(with_prompt) > len(without)
+            and with_prompt[: len(without)] == without
+        ):
+            suffix = tuple(with_prompt[len(without) :])
+        return self._put_generation(key, suffix)
 
-    def _last_user_turn_suffix(self, tokenizer, last_content, chat_template, kwargs):
-        base_key = json.dumps(
-            ["__turn_base__", chat_template, kwargs], sort_keys=True, default=str
+    @staticmethod
+    def _has_non_text_parts(messages: GenericSequence[dict[str, Any]]) -> bool:
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list) and any(
+                isinstance(p, dict) and p.get("type") != "text" for p in content
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _digest_obj(obj: Any) -> str:
+        payload = json.dumps(
+            obj, sort_keys=True, separators=(",", ":"), default=str
+        ).encode("utf-8")
+        return hashlib.blake2b(payload, digest_size=16).hexdigest()
+
+    def _trailing_turn_suffix(
+        self,
+        tokenizer,
+        trailing_messages: list[dict[str, Any]],
+        chat_template,
+        kwargs,
+    ):
+        if self._has_non_text_parts(trailing_messages):
+            return None
+        turn_key = "__turn_sfx__:" + self._digest_obj(
+            [trailing_messages, chat_template, kwargs]
         )
+        if turn_key in self._generation:
+            self._generation.move_to_end(turn_key)
+            return self._generation[turn_key]
+        base_key = "__turn_base__:" + self._digest_obj([chat_template, kwargs])
         base_msgs = [
             {"role": "user", "content": "a"},
             {"role": "assistant", "content": "b"},
         ]
-        if base_key not in self._generation:
+        if base_key in self._generation:
+            self._generation.move_to_end(base_key)
+            base = self._generation[base_key]
+        else:
             base_tokens = self._render(
                 tokenizer, base_msgs, chat_template, kwargs, None, False
             )
-            self._generation[base_key] = tuple(base_tokens) if base_tokens else None
-        base = self._generation[base_key]
+            base = self._put_generation(
+                base_key, tuple(base_tokens) if base_tokens else None
+            )
         if not base:
-            return None
+            return self._put_generation(turn_key, None)
         probed = self._render(
             tokenizer,
-            base_msgs + [{"role": "user", "content": last_content}],
+            base_msgs + trailing_messages,
             chat_template,
             kwargs,
             None,
             True,
         )
+        suffix = None
         if (
             probed is not None
             and len(probed) > len(base)
             and tuple(probed[: len(base)]) == base
         ):
-            return tuple(probed[len(base) :])
-        return None
+            suffix = tuple(probed[len(base) :])
+        return self._put_generation(turn_key, suffix)
 
-    def _system_prompt(self, tokenizer, message, chat_template, kwargs, tools):
-        key = json.dumps(
-            [message, tools, chat_template, kwargs], sort_keys=True, default=str
+    def _system_prompt(
+        self,
+        tokenizer,
+        sys_messages,
+        chat_template,
+        kwargs,
+        tools,
+        *,
+        tools_digest: str | None = None,
+    ):
+        td = (
+            tools_digest
+            if tools_digest is not None
+            else (self._digest_obj(tools) if tools else "")
         )
+        key = self._digest_obj([sys_messages, td, chat_template, kwargs])
         if key in self._system:
             self._system.move_to_end(key)
             return self._system[key]
-        prefix_msgs = [message] if message is not None else []
+        prefix_msgs = list(sys_messages) if sys_messages else []
         tokens = (
             self._render(tokenizer, prefix_msgs, chat_template, kwargs, tools, False)
             if prefix_msgs
@@ -249,13 +321,24 @@ class _PrefixCacheBoundaries:
             self._system.popitem(last=False)
         return value
 
+    @staticmethod
+    def _common_prefix_len(a: GenericSequence[int], b: GenericSequence[int]) -> int:
+        limit = min(len(a), len(b))
+        idx = 0
+        while idx < limit and a[idx] == b[idx]:
+            idx += 1
+        return idx
+
     def __call__(
         self,
         tokenizer,
-        request: ChatCompletionRequest,
+        request: Any,
         prompt_token_ids: list[int] | None,
         chat_template: str | None,
         kwargs: dict[str, Any],
+        *,
+        messages: GenericSequence[Any] | None = None,
+        tools: GenericSequence[Any] | None = None,
     ) -> list[int]:
         if not prompt_token_ids or not hasattr(tokenizer, "apply_chat_template"):
             return []
@@ -268,31 +351,47 @@ class _PrefixCacheBoundaries:
             and tuple(prompt_token_ids[-len(suffix) :]) == suffix
         ):
             boundaries.append(n - len(suffix))
-        messages = request.messages
-        first = messages[0] if messages else None
-        has_sys = (
-            len(messages) > 1
-            and isinstance(first, dict)
-            and first.get("role") in ("system", "developer")
-            and isinstance(first.get("content"), str)
+        resolved_messages = (
+            messages
+            if messages is not None
+            else (getattr(request, "messages", None) or [])
         )
-        if has_sys or (messages and request.tools):
-            tools = (
-                [tool.model_dump(exclude_none=True) for tool in request.tools]
-                if request.tools
-                else None
+        sys_msgs: list[dict[str, Any]] = []
+        for msg in resolved_messages:
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") in ("system", "developer")
+                and isinstance(msg.get("content"), str | list)
+            ):
+                sys_msgs.append({"role": msg["role"], "content": msg["content"]})
+            else:
+                break
+        has_non_sys = len(resolved_messages) > len(sys_msgs)
+        req_tools = tools if tools is not None else getattr(request, "tools", None)
+        if (sys_msgs and has_non_sys) or (resolved_messages and req_tools):
+            cached_dumped = (
+                getattr(request, "_cached_tool_dicts", None) if tools is None else None
             )
-            sys_msg = (
-                {"role": first["role"], "content": first["content"]}
-                if has_sys and isinstance(first, dict)
-                else None
+            dumped_tools = (
+                cached_dumped
+                if cached_dumped is not None
+                else (
+                    [
+                        tool.model_dump() if hasattr(tool, "model_dump") else tool
+                        for tool in req_tools
+                    ]
+                    if req_tools
+                    else None
+                )
             )
+            tools_digest = self._digest_obj(dumped_tools) if dumped_tools else ""
             system = self._system_prompt(
                 tokenizer,
-                sys_msg,
+                sys_msgs if has_non_sys else None,
                 chat_template,
                 kwargs,
-                tools,
+                dumped_tools,
+                tools_digest=tools_digest,
             )
             if (
                 system
@@ -300,22 +399,496 @@ class _PrefixCacheBoundaries:
                 and tuple(prompt_token_ids[: len(system)]) == system
             ):
                 boundaries.append(len(system))
-        last = messages[-1] if messages and len(messages) >= 3 else None
-        if (
-            isinstance(last, dict)
-            and last.get("role") == "user"
-            and isinstance(last.get("content"), str)
-        ):
-            turn_suffix = self._last_user_turn_suffix(
-                tokenizer, last["content"], chat_template, kwargs
-            )
+            if dumped_tools and sys_msgs:
+                tools_only = self._system_prompt(
+                    tokenizer,
+                    None,
+                    chat_template,
+                    kwargs,
+                    dumped_tools,
+                    tools_digest=tools_digest,
+                )
+                if tools_only:
+                    common = self._common_prefix_len(prompt_token_ids, tools_only)
+                    if 128 <= common < n:
+                        boundaries.append(common)
             if (
-                turn_suffix
-                and len(turn_suffix) < n
-                and tuple(prompt_token_ids[-len(turn_suffix) :]) == turn_suffix
+                len(sys_msgs) == 1
+                and isinstance(sys_msgs[0].get("content"), list)
+                and len(sys_msgs[0]["content"]) > 1
             ):
-                boundaries.append(n - len(turn_suffix))
+                parts = sys_msgs[0]["content"]
+                for idx_part in range(len(parts) - 1):
+                    part = parts[idx_part]
+                    if isinstance(part, dict) and part.get("cache_control"):
+                        sub_sys = [
+                            {
+                                "role": sys_msgs[0]["role"],
+                                "content": parts[: idx_part + 1],
+                            }
+                        ]
+                        sub_tokens = self._system_prompt(
+                            tokenizer,
+                            sub_sys,
+                            chat_template,
+                            kwargs,
+                            dumped_tools,
+                            tools_digest=tools_digest,
+                        )
+                        if sub_tokens:
+                            common = self._common_prefix_len(
+                                prompt_token_ids, sub_tokens
+                            )
+                            if 64 <= common < n:
+                                boundaries.append(common)
+            sys_cache_prefixes = getattr(request, "_system_cache_prefixes", None)
+            if sys_msgs and sys_cache_prefixes:
+                for pfx in sys_cache_prefixes:
+                    sub_tokens = self._system_prompt(
+                        tokenizer,
+                        [{"role": sys_msgs[0]["role"], "content": pfx}],
+                        chat_template,
+                        kwargs,
+                        dumped_tools,
+                        tools_digest=tools_digest,
+                    )
+                    if sub_tokens:
+                        common = self._common_prefix_len(prompt_token_ids, sub_tokens)
+                        if 64 <= common < n:
+                            boundaries.append(common)
+
+        if len(resolved_messages) >= 3:
+            last = resolved_messages[-1]
+            if isinstance(last, dict):
+                last_role = last.get("role")
+                if last_role == "user" and isinstance(last.get("content"), str | list):
+                    turn_suffix = self._trailing_turn_suffix(
+                        tokenizer,
+                        [{"role": "user", "content": last["content"]}],
+                        chat_template,
+                        kwargs,
+                    )
+                    if (
+                        turn_suffix
+                        and len(turn_suffix) < n
+                        and tuple(prompt_token_ids[-len(turn_suffix) :]) == turn_suffix
+                    ):
+                        boundaries.append(n - len(turn_suffix))
+                elif last_role == "tool":
+                    tool_start = len(resolved_messages) - 1
+                    while (
+                        tool_start > 0
+                        and isinstance(resolved_messages[tool_start - 1], dict)
+                        and resolved_messages[tool_start - 1].get("role") == "tool"
+                    ):
+                        tool_start -= 1
+                    if tool_start >= 2:
+                        trailing_tools = [
+                            {
+                                "role": "tool",
+                                "tool_call_id": m.get("tool_call_id", ""),
+                                "content": m.get("content", ""),
+                            }
+                            for m in resolved_messages[tool_start:]
+                            if isinstance(m, dict)
+                        ]
+                        tool_suffix = self._trailing_turn_suffix(
+                            tokenizer, trailing_tools, chat_template, kwargs
+                        )
+                        if (
+                            tool_suffix
+                            and len(tool_suffix) < n
+                            and tuple(prompt_token_ids[-len(tool_suffix) :])
+                            == tool_suffix
+                        ):
+                            boundaries.append(n - len(tool_suffix))
         return sorted(set(boundaries))
+
+
+class _AssistantReasoningCache:
+    """Restore omitted assistant ``reasoning_content`` across multi-turn chats.
+
+    Many OpenAI-compatible SDKs and agent loops append only ``content`` and
+    ``tool_calls`` to conversation history. For templates that retain
+    ``reasoning_content`` on prior assistant turns, omitting it changes the
+    rendered tokens right after ``<think>\\n`` and invalidates the KV/recurrent
+    prefix generated during decode.
+    """
+
+    def __init__(self, max_entries: int = 2048) -> None:
+        self._entries: OrderedDict[tuple[Any, ...], str] = OrderedDict()
+        self._token_spans: OrderedDict[
+            tuple[Any, ...], tuple[str, int, bytes, tuple[int, ...]]
+        ] = OrderedDict()
+        self._max_entries = max_entries
+
+    @staticmethod
+    def _token_digest(tokens: GenericSequence[int]) -> bytes:
+        arr = np.asarray(tokens, dtype=np.int32)
+        return hashlib.blake2b(arr.tobytes(), digest_size=16).digest()
+
+    @staticmethod
+    def _canonical_json(raw: Any) -> str:
+        if isinstance(raw, dict | list):
+            return json.dumps(
+                raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+        if not isinstance(raw, str):
+            return str(raw or "")
+        text = raw.strip()
+        if not text:
+            return ""
+        try:
+            parsed = json.loads(text)
+            return json.dumps(
+                parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+        except Exception:
+            return text
+
+    @classmethod
+    def _canonical_tool_calls(cls, tool_calls: Any) -> tuple[tuple[str, str], ...]:
+        if not tool_calls:
+            return ()
+        items: list[tuple[str, str]] = []
+        for tc in tool_calls:
+            if isinstance(tc, tuple) and len(tc) == 2:
+                name, args = tc
+            elif isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                name = fn.get("name", "") if isinstance(fn, dict) else ""
+                args = fn.get("arguments", "") if isinstance(fn, dict) else ""
+            else:
+                fn = getattr(tc, "function", None)
+                name = getattr(fn, "name", "") if fn is not None else ""
+                args = getattr(fn, "arguments", "") if fn is not None else ""
+            items.append((str(name or ""), cls._canonical_json(args)))
+        return tuple(items)
+
+    @staticmethod
+    def _extract_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        return ""
+
+    @staticmethod
+    def _extract_media_sig(content: Any) -> tuple[tuple[str, str], ...]:
+        if not isinstance(content, list):
+            return ()
+        sigs: list[tuple[str, str]] = []
+        for p in content:
+            if not isinstance(p, dict):
+                continue
+            ptype = str(p.get("type") or "")
+            if ptype == "text":
+                continue
+            raw_val: Any = None
+            for k in (
+                "image_url",
+                "input_image",
+                "image",
+                "video_url",
+                "video",
+                "audio_url",
+                "input_audio",
+                "audio",
+            ):
+                if k in p and p[k] is not None:
+                    v = p[k]
+                    raw_val = v.get("url", v) if isinstance(v, dict) else v
+                    break
+            if raw_val is None:
+                raw_str = json.dumps(p, sort_keys=True, default=str)
+            elif isinstance(raw_val, str):
+                raw_str = raw_val
+            else:
+                raw_str = str(raw_val)
+            part_hash = hashlib.blake2b(
+                raw_str.encode("utf-8", errors="replace"), digest_size=12
+            ).hexdigest()
+            sigs.append((ptype, part_hash))
+        return tuple(sigs)
+
+    @classmethod
+    def _message_digest(cls, m: Any) -> bytes:
+        if isinstance(m, dict):
+            role = m.get("role", "")
+            tool_call_id = m.get("tool_call_id", "")
+            raw_content = m.get("content")
+            tcs = cls._canonical_tool_calls(m.get("tool_calls"))
+        else:
+            role = getattr(m, "role", "")
+            tool_call_id = getattr(m, "tool_call_id", "")
+            raw_content = getattr(m, "content", None)
+            tcs = cls._canonical_tool_calls(getattr(m, "tool_calls", None))
+        content = cls._extract_text(raw_content).strip()
+        media = cls._extract_media_sig(raw_content)
+        h = hashlib.blake2b(digest_size=16)
+        h.update(str(role or "").encode("utf-8"))
+        h.update(b"\x00")
+        h.update(str(tool_call_id or "").encode("utf-8"))
+        h.update(b"\x00")
+        h.update(content.encode("utf-8"))
+        h.update(b"\x00")
+        if media:
+            for ptype, phash in media:
+                h.update(ptype.encode("utf-8"))
+                h.update(b":")
+                h.update(phash.encode("ascii"))
+                h.update(b";")
+        h.update(b"\x00")
+        if tcs:
+            for name, args in tcs:
+                h.update(name.encode("utf-8"))
+                h.update(b"=")
+                h.update(args.encode("utf-8"))
+                h.update(b"\x01")
+        return h.digest()
+
+    @classmethod
+    def _context_digest(cls, prior_messages: GenericSequence[Any]) -> str:
+        if not prior_messages:
+            return ""
+        h = hashlib.blake2b(digest_size=16)
+        for m in prior_messages:
+            h.update(cls._message_digest(m))
+        return h.hexdigest()
+
+    @classmethod
+    def prefix_digests(cls, messages: GenericSequence[Any]) -> list[str]:
+        """Compute ``_context_digest(messages[:idx])`` for all ``idx`` in O(L)."""
+        n = len(messages)
+        if n == 0:
+            return []
+        out = [""]
+        if n == 1:
+            return out
+        h = hashlib.blake2b(digest_size=16)
+        for idx in range(n - 1):
+            h.update(cls._message_digest(messages[idx]))
+            out.append(h.hexdigest())
+        return out
+
+    def _put(self, key: tuple[Any, ...], reasoning: str) -> None:
+        self._entries[key] = reasoning
+        self._entries.move_to_end(key)
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+    def _put_token_span(
+        self,
+        key: tuple[Any, ...],
+        value: tuple[str, int, bytes, tuple[int, ...]],
+    ) -> None:
+        self._token_spans[key] = value
+        self._token_spans.move_to_end(key)
+        while len(self._token_spans) > self._max_entries:
+            self._token_spans.popitem(last=False)
+
+    def record(
+        self,
+        prior_messages: GenericSequence[Any],
+        content: Any,
+        tool_calls: Any,
+        reasoning: str | None,
+        *,
+        cache_salt: str | None = None,
+        reasoning_ended: bool = True,
+        prompt_token_ids: GenericSequence[int] | None = None,
+        output_token_ids: GenericSequence[int] | None = None,
+        gen_suffix: tuple[int, ...] | None = None,
+        im_end_id: int | None = None,
+        nl_ids: tuple[int, ...] | None = None,
+    ) -> None:
+        content_norm = self._extract_text(content).strip()
+        tc_norm = self._canonical_tool_calls(tool_calls)
+        if not content_norm and not tc_norm:
+            return
+        ctx = self._context_digest(prior_messages)
+        salt_norm = cache_salt or ""
+        ctx_key = ("ctx", salt_norm, ctx, content_norm, tc_norm)
+        if reasoning and reasoning_ended:
+            self._put(ctx_key, reasoning)
+        if (
+            reasoning_ended
+            and prompt_token_ids
+            and output_token_ids
+            and gen_suffix
+            and im_end_id is not None
+            and nl_ids
+            and len(prompt_token_ids) > len(gen_suffix)
+            and len(output_token_ids) <= 32768
+            and output_token_ids[-1] == im_end_id
+            and tuple(prompt_token_ids[-len(gen_suffix) :]) == gen_suffix
+        ):
+            prefix_len = len(prompt_token_ids) - len(gen_suffix)
+            prefix_digest = self._token_digest(prompt_token_ids[:prefix_len])
+            assistant_span = tuple(gen_suffix) + tuple(output_token_ids) + tuple(nl_ids)
+            self._put_token_span(
+                ctx_key,
+                ((reasoning or "").strip(), prefix_len, prefix_digest, assistant_span),
+            )
+
+    def lookup(
+        self,
+        prior_messages: GenericSequence[Any],
+        content: Any,
+        tool_calls: Any,
+        *,
+        cache_salt: str | None = None,
+        ctx_digest: str | None = None,
+    ) -> str | None:
+        content_norm = self._extract_text(content).strip()
+        tc_norm = self._canonical_tool_calls(tool_calls)
+        if not content_norm and not tc_norm:
+            return None
+        ctx = (
+            ctx_digest
+            if ctx_digest is not None
+            else self._context_digest(prior_messages)
+        )
+        salt_norm = cache_salt or ""
+        ctx_key = ("ctx", salt_norm, ctx, content_norm, tc_norm)
+        if ctx_key in self._entries:
+            self._entries.move_to_end(ctx_key)
+            return self._entries[ctx_key]
+        return None
+
+    def lookup_token_span(
+        self,
+        prior_messages: GenericSequence[Any],
+        content: Any,
+        tool_calls: Any,
+        *,
+        cache_salt: str | None = None,
+        ctx_digest: str | None = None,
+    ) -> tuple[str, int, bytes, tuple[int, ...]] | None:
+        content_norm = self._extract_text(content).strip()
+        tc_norm = self._canonical_tool_calls(tool_calls)
+        if not content_norm and not tc_norm:
+            return None
+        ctx = (
+            ctx_digest
+            if ctx_digest is not None
+            else self._context_digest(prior_messages)
+        )
+        salt_norm = cache_salt or ""
+        ctx_key = ("ctx", salt_norm, ctx, content_norm, tc_norm)
+        if ctx_key in self._token_spans:
+            self._token_spans.move_to_end(ctx_key)
+            return self._token_spans[ctx_key]
+        return None
+
+    def splice_prompt_tokens(
+        self,
+        messages: GenericSequence[Any],
+        prompt_token_ids: list[int],
+        tokenizer: Any,
+        *,
+        cache_salt: str | None = None,
+        max_model_len: int | None = None,
+        mm_placeholders: Any = None,
+    ) -> list[int]:
+        """Replace re-rendered historical assistant spans with exact decoded IDs.
+
+        Chat templates that run ``reasoning_content|trim`` or reformat XML/JSON
+        tool arguments can shift token IDs by 1-2 tokens after ``<think>\\n``,
+        missing ``PartialPrefixCache`` decode checkpoints on Turn 2+. Splicing
+        the exact decoded span when the prefix digest and ``<|im_start|>`` /
+        ``<|im_end|>\\n`` boundaries match preserves 100% decode cache fidelity.
+        """
+        if not self._token_spans or len(messages) < 2 or not prompt_token_ids:
+            return prompt_token_ids
+        try:
+            vocab = tokenizer.get_vocab()
+            im_start_id = vocab.get("<|im_start|>")
+            im_end_id = vocab.get("<|im_end|>")
+            think_id = vocab.get("<think>")
+            nl_ids = tuple(
+                _token_list(tokenizer.encode("\n", add_special_tokens=False))
+            )
+        except Exception:
+            return prompt_token_ids
+        if im_start_id is None or im_end_id is None or not nl_ids:
+            return prompt_token_ids
+        nl_list = list(nl_ids)
+        nl_len = len(nl_list)
+        tokens = list(prompt_token_ids)
+        ctx_digests = self.prefix_digests(messages)
+        for idx in range(len(messages) - 1):
+            msg = messages[idx]
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            span_entry = self.lookup_token_span(
+                (),
+                msg.get("content"),
+                msg.get("tool_calls"),
+                cache_salt=cache_salt,
+                ctx_digest=ctx_digests[idx],
+            )
+            if span_entry is None:
+                continue
+            cached_reasoning_norm, prefix_len, prefix_digest, assistant_span = (
+                span_entry
+            )
+            explicit_r = msg.get("reasoning")
+            if explicit_r is None:
+                explicit_r = msg.get("reasoning_content")
+            if (
+                isinstance(explicit_r, str)
+                and explicit_r.strip()
+                and explicit_r.strip() != cached_reasoning_norm
+            ):
+                continue
+            if prefix_len >= len(tokens) or tokens[prefix_len] != im_start_id:
+                continue
+            if self._token_digest(tokens[:prefix_len]) != prefix_digest:
+                continue
+            try:
+                end_pos = tokens.index(im_end_id, prefix_len + 1)
+            except ValueError:
+                continue
+            after_msg = end_pos + 1 + nl_len
+            if after_msg > len(tokens) or tokens[end_pos + 1 : after_msg] != nl_list:
+                continue
+            if think_id is not None and (think_id in assistant_span) != (
+                think_id in tokens[prefix_len:after_msg]
+            ):
+                continue
+            delta = len(assistant_span) - (after_msg - prefix_len)
+            new_len = len(tokens) + delta
+            if max_model_len is not None and new_len >= max_model_len:
+                continue
+            if delta != 0 and isinstance(mm_placeholders, dict) and mm_placeholders:
+                overlaps = any(
+                    r.offset < after_msg and r.offset + r.length > prefix_len
+                    for ranges in mm_placeholders.values()
+                    for r in ranges
+                )
+                if overlaps:
+                    continue
+            span_list = list(assistant_span)
+            if tokens[prefix_len:after_msg] != span_list:
+                tokens = tokens[:prefix_len] + span_list + tokens[after_msg:]
+                if delta != 0 and isinstance(mm_placeholders, dict) and mm_placeholders:
+                    for mod_key, ranges in list(mm_placeholders.items()):
+                        mm_placeholders[mod_key] = [
+                            type(r)(
+                                offset=r.offset + delta,
+                                length=r.length,
+                                is_embed=r.is_embed,
+                            )
+                            if r.offset >= after_msg
+                            else r
+                            for r in ranges
+                        ]
+        return tokens
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -352,6 +925,7 @@ class OpenAIServingChat(OpenAIServing):
         self.response_role = response_role
         self.chat_template = chat_template
         self._prefix_cache_boundaries = _PrefixCacheBoundaries()
+        self._assistant_reasoning_cache = _AssistantReasoningCache()
         self.chat_template_content_format: Final = chat_template_content_format
         self.trust_request_chat_template = trust_request_chat_template
         self.default_chat_template_kwargs = default_chat_template_kwargs or {}
@@ -435,6 +1009,63 @@ class OpenAIServingChat(OpenAIServing):
             .chat_template_kwargs
         )
 
+    def _effective_sampling_params(
+        self,
+        request: ChatCompletionRequest,
+        chat_template_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        effort = request.reasoning_effort or chat_template_kwargs.get(
+            "reasoning_effort"
+        )
+        enable_thinking = chat_template_kwargs.get("enable_thinking")
+        thinking_enabled = (enable_thinking is not False) and (effort != "none")
+        return self.model_config.get_effective_sampling_param(
+            thinking_enabled=thinking_enabled,
+            base_defaults=self.default_sampling_params,
+        )
+
+    def _restore_historical_assistant_reasoning(
+        self, request: ChatCompletionRequest
+    ) -> ChatCompletionRequest:
+        messages = request.messages
+        if len(messages) < 2:
+            return request
+        updated: list[Any] | None = None
+        ctx_digests: list[str] | None = None
+        for idx in range(len(messages) - 1):
+            msg = messages[idx]
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            existing = msg.get("reasoning")
+            if existing is None:
+                existing = msg.get("reasoning_content")
+            if existing is not None:
+                if msg.get("reasoning_content") is None:
+                    if updated is None:
+                        updated = list(messages)
+                    updated[idx] = {**msg, "reasoning_content": existing}
+                continue
+            if ctx_digests is None:
+                ctx_digests = self._assistant_reasoning_cache.prefix_digests(messages)
+            restored = self._assistant_reasoning_cache.lookup(
+                (),
+                msg.get("content"),
+                msg.get("tool_calls"),
+                cache_salt=request.cache_salt,
+                ctx_digest=ctx_digests[idx],
+            )
+            if restored is not None:
+                if updated is None:
+                    updated = list(messages)
+                updated[idx] = {
+                    **msg,
+                    "reasoning": restored,
+                    "reasoning_content": restored,
+                }
+        if updated is None:
+            return request
+        return request.model_copy(update={"messages": updated})
+
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
@@ -487,12 +1118,22 @@ class OpenAIServingChat(OpenAIServing):
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
+        parser_chat_kwargs = (
+            {**chat_template_kwargs, "reasoning_effort": request.reasoning_effort}
+            if request.reasoning_effort
+            and "reasoning_effort" not in chat_template_kwargs
+            else chat_template_kwargs
+        )
+        effective_sampling_params = self._effective_sampling_params(
+            request, chat_template_kwargs
+        )
         reasoning_parser: ReasoningParser | None = None
         if self.reasoning_parser_cls:
             reasoning_parser = self.reasoning_parser_cls(
                 tokenizer,
-                chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
+                chat_template_kwargs=parser_chat_kwargs,  # type: ignore[call-arg]
             )
+            request = self._restore_historical_assistant_reasoning(request)
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
@@ -516,9 +1157,43 @@ class OpenAIServingChat(OpenAIServing):
 
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
+        effective_chat_template = (
+            request.chat_template
+            if (request.chat_template and self.trust_request_chat_template)
+            else self.chat_template
+        )
+        gen_suffix = self._prefix_cache_boundaries._generation_prompt(
+            tokenizer, effective_chat_template, chat_template_kwargs
+        )
+        im_end_id: int | None = None
+        nl_ids: tuple[int, ...] | None = None
+        try:
+            im_end_id = tokenizer.get_vocab().get("<|im_end|>")
+            nl_ids = tuple(
+                _token_list(tokenizer.encode("\n", add_special_tokens=False))
+            )
+        except Exception:
+            pass
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         for i, engine_input in enumerate(engine_inputs):
             prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
+            if (
+                prompt_token_ids
+                and isinstance(engine_input, dict)
+                and "prompt_token_ids" in engine_input
+                and not engine_input.get("prompt_embeds")
+            ):
+                spliced = self._assistant_reasoning_cache.splice_prompt_tokens(
+                    request.messages,
+                    list(prompt_token_ids),
+                    tokenizer,
+                    cache_salt=request.cache_salt,
+                    max_model_len=max_model_len,
+                    mm_placeholders=engine_input.get("mm_placeholders"),
+                )
+                if spliced != list(prompt_token_ids):
+                    cast(dict[str, Any], engine_input)["prompt_token_ids"] = spliced
+                    prompt_token_ids = spliced
 
             # If we are creating sub requests for multiple prompts, ensure that they
             # have unique request ids.
@@ -532,7 +1207,7 @@ class OpenAIServingChat(OpenAIServing):
                 if request.max_completion_tokens is not None
                 else request.max_tokens,
                 self._extract_prompt_len(engine_input),
-                self.default_sampling_params,
+                effective_sampling_params,
                 self.override_max_tokens,
                 truncate_prompt_tokens=request.truncate_prompt_tokens,
             )
@@ -540,20 +1215,18 @@ class OpenAIServingChat(OpenAIServing):
             sampling_params: SamplingParams | BeamSearchParams
             if request.use_beam_search:
                 sampling_params = request.to_beam_search_params(
-                    max_tokens, self.default_sampling_params
+                    max_tokens, effective_sampling_params
                 )
             else:
                 sampling_params = request.to_sampling_params(
                     max_tokens,
-                    self.default_sampling_params,
+                    effective_sampling_params,
                 )
                 boundaries = self._prefix_cache_boundaries(
                     tokenizer,
                     request,
                     list(prompt_token_ids) if prompt_token_ids else None,
-                    request.chat_template
-                    if (request.chat_template and self.trust_request_chat_template)
-                    else self.chat_template,
+                    effective_chat_template,
                     chat_template_kwargs,
                 )
                 if boundaries:
@@ -584,9 +1257,7 @@ class OpenAIServingChat(OpenAIServing):
                     trace_headers=trace_headers,
                 )
             else:
-                if not request.include_reasoning:
-                    reasoning_ended = True
-                elif request._grammar_from_tool_parser:
+                if request._grammar_from_tool_parser:
                     # The Mistral grammar already includes an optional
                     # `think?` rule that handles both reasoning and
                     # non-reasoning outputs.
@@ -609,7 +1280,7 @@ class OpenAIServingChat(OpenAIServing):
                     data_parallel_rank=data_parallel_rank,
                     reasoning_ended=reasoning_ended,
                     reasoning_parser_kwargs={
-                        "chat_template_kwargs": chat_template_kwargs,
+                        "chat_template_kwargs": parser_chat_kwargs,
                     }
                     if reasoning_parser
                     else None,
@@ -630,7 +1301,10 @@ class OpenAIServingChat(OpenAIServing):
                 tokenizer,
                 request_metadata,
                 reasoning_parser,
-                chat_template_kwargs=chat_template_kwargs,
+                chat_template_kwargs=parser_chat_kwargs,
+                gen_suffix=gen_suffix,
+                im_end_id=im_end_id,
+                nl_ids=nl_ids,
             )
 
         return await self.chat_completion_full_generator(
@@ -642,6 +1316,9 @@ class OpenAIServingChat(OpenAIServing):
             tokenizer,
             request_metadata,
             reasoning_parser,
+            gen_suffix=gen_suffix,
+            im_end_id=im_end_id,
+            nl_ids=nl_ids,
         )
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
@@ -660,6 +1337,9 @@ class OpenAIServingChat(OpenAIServing):
         request_metadata: RequestResponseMetadata,
         reasoning_parser: ReasoningParser | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        gen_suffix: tuple[int, ...] | None = None,
+        im_end_id: int | None = None,
+        nl_ids: tuple[int, ...] | None = None,
     ) -> AsyncGenerator[str, None]:
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
@@ -669,9 +1349,7 @@ class OpenAIServingChat(OpenAIServing):
         num_choices = 1 if request.n is None else request.n
         previous_num_tokens = [0] * num_choices
         finish_reason_sent = [False] * num_choices
-        generated_ids_per_choice: list[list[int]] | None = (
-            [[] for _ in range(num_choices)] if reasoning_parser is not None else None
-        )
+        generated_ids_per_choice: list[list[int]] = [[] for _ in range(num_choices)]
         sent_tool_calls: list[dict[int, StreamedToolCall]] = [
             {} for _ in range(num_choices)
         ]
@@ -757,12 +1435,77 @@ class OpenAIServingChat(OpenAIServing):
         # The stats object is attached to every output, but only the finished
         # one holds a complete set of timestamps.
         last_metrics = None
+        last_prompt_token_ids: list[int] | None = None
+        stream_cache_recorded = False
+
+        def _record_stream_cache() -> None:
+            nonlocal stream_cache_recorded
+            if stream_cache_recorded or not previous_texts:
+                return
+            stream_cache_recorded = True
+            for i, full_raw_text in enumerate(previous_texts):
+                if not full_raw_text:
+                    continue
+                if reasoning_parser is not None:
+                    raw_reasoning, raw_content = reasoning_parser.extract_reasoning(
+                        full_raw_text, request=request
+                    )
+                else:
+                    raw_reasoning, raw_content = None, full_raw_text
+                streamed_tcs = [
+                    (tc.name, "".join(tc.arguments))
+                    for _, tc in sorted(sent_tool_calls[i].items())
+                    if tc.name
+                ]
+                visible_content = raw_content or ""
+                choice_parser = parsers[i] if i < len(parsers) else None
+                choice_tool_parser = (
+                    choice_parser.tool_parser if choice_parser is not None else None
+                )
+                if streamed_tcs and (
+                    tool_choice_function_name or request.tool_choice == "required"
+                ):
+                    visible_content = ""
+                elif (
+                    streamed_tcs and visible_content and choice_tool_parser is not None
+                ):
+                    extracted = choice_tool_parser.extract_tool_calls(
+                        visible_content, request=request
+                    )
+                    if extracted.tools_called:
+                        visible_content = extracted.content or ""
+                reasoning_done = (
+                    True
+                    if reasoning_parser is None
+                    else (bool(raw_content) or bool(streamed_tcs))
+                )
+                rcache = getattr(self, "_assistant_reasoning_cache", None)
+                if rcache is not None:
+                    rcache.record(
+                        request.messages,
+                        visible_content,
+                        streamed_tcs,
+                        raw_reasoning,
+                        cache_salt=request.cache_salt,
+                        reasoning_ended=reasoning_done,
+                        prompt_token_ids=last_prompt_token_ids,
+                        output_token_ids=(
+                            generated_ids_per_choice[i]
+                            if i < len(generated_ids_per_choice)
+                            else None
+                        ),
+                        gen_suffix=gen_suffix,
+                        im_end_id=im_end_id,
+                        nl_ids=nl_ids,
+                    )
+
         try:
             async for res in result_generator:
                 if getattr(res, "metrics", None) is not None:
                     last_metrics = res.metrics
 
                 if res.prompt_token_ids is not None:
+                    last_prompt_token_ids = as_list(res.prompt_token_ids)
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
                         num_prompt_tokens += len(res.encoder_prompt_token_ids)
@@ -1023,6 +1766,23 @@ class OpenAIServingChat(OpenAIServing):
                     if generated_ids_per_choice is not None:
                         generated_ids_per_choice[i].extend(output.token_ids)
 
+                    if (
+                        delta_message is not None
+                        and not request.include_reasoning
+                        and (
+                            delta_message.reasoning is not None
+                            or delta_message.reasoning_content is not None
+                        )
+                    ):
+                        delta_message.reasoning = None
+                        delta_message.reasoning_content = None
+                        if (
+                            delta_message.content is None
+                            and not delta_message.tool_calls
+                            and delta_message.role is None
+                        ):
+                            delta_message = None
+
                     # if the message delta is None (e.g. because it was a
                     # "control token" for tool calls or the parser otherwise
                     # wasn't ready to send a token, then
@@ -1220,7 +1980,7 @@ class OpenAIServingChat(OpenAIServing):
                         # A call cut off by max_tokens keeps "length", so the
                         # client can tell its arguments are incomplete.
                         if output.finish_reason == "stop" and (
-                            auto_tools_called
+                            (auto_tools_called and not tool_choice_function_name)
                             or (tools_streamed[i] and not tool_choice_function_name)
                             or (self.use_harmony and harmony_tools_streamed[i])
                         ):
@@ -1278,8 +2038,11 @@ class OpenAIServingChat(OpenAIServing):
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
 
+            _record_stream_cache()
+
             reasoning_tokens = _count_reasoning_tokens(
-                reasoning_parser, generated_ids_per_choice
+                reasoning_parser,
+                generated_ids_per_choice if reasoning_parser is not None else None,
             )
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
@@ -1296,8 +2059,8 @@ class OpenAIServingChat(OpenAIServing):
                     total_tokens=num_prompt_tokens + completion_tokens,
                 )
                 if self.enable_prompt_tokens_details and num_cached_tokens is not None:
-                    final_usage.prompt_tokens_details = PromptTokenUsageInfo(
-                        cached_tokens=num_cached_tokens
+                    populate_prompt_cache_usage(
+                        final_usage, num_prompt_tokens, num_cached_tokens
                     )
                 # Engine-authoritative per-request timings. Omitted when the
                 # engine collected no stats for this request.
@@ -1355,6 +2118,8 @@ class OpenAIServingChat(OpenAIServing):
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        finally:
+            _record_stream_cache()
         # Send the final done message after all response.n are finished
         yield "data: [DONE]\n\n"
 
@@ -1368,6 +2133,9 @@ class OpenAIServingChat(OpenAIServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         reasoning_parser: ReasoningParser | None = None,
+        gen_suffix: tuple[int, ...] | None = None,
+        im_end_id: int | None = None,
+        nl_ids: tuple[int, ...] | None = None,
     ) -> ErrorResponse | ChatCompletionResponse:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
@@ -1480,12 +2248,14 @@ class OpenAIServingChat(OpenAIServing):
                 choices.append(choice_data)
                 continue
 
+            raw_reasoning: str | None = None
             if reasoning_parser:
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
                 reasoning, content = reasoning_parser.extract_reasoning(
                     output.text, request=request
                 )
+                raw_reasoning = reasoning
                 if not request.include_reasoning:
                     reasoning = None
             else:
@@ -1493,15 +2263,32 @@ class OpenAIServingChat(OpenAIServing):
                 content = output.text
 
             auto_tools_called = False
+            # Do not auto-close truncated half-written XML tool calls when
+            # generation hit max_tokens (finish_reason == "length").
+            parse_content = content
+            if (
+                output.finish_reason == "length"
+                and parse_content
+                and "<tool_call>" in parse_content
+            ):
+                last_open = parse_content.rfind("<tool_call>")
+                last_close = parse_content.rfind("</tool_call>")
+                if (
+                    last_open > last_close
+                    and "</function>" not in parse_content[last_open:]
+                ):
+                    parse_content = parse_content[:last_open]
             # if auto tools are not enabled, and a named tool choice using
             #   outlines is not being used
-            tool_calls, content = self._parse_tool_calls_from_content(
+            tool_calls, parsed_text = self._parse_tool_calls_from_content(
                 request=request,
                 tokenizer=tokenizer,
-                content=content,
+                content=parse_content,
                 enable_auto_tools=self.enable_auto_tools,
                 tool_parser_cls=self.tool_parser,
             )
+            if parse_content == content or tool_calls:
+                content = parsed_text
             if is_mistral_tokenizer(tokenizer):
                 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 
@@ -1565,7 +2352,7 @@ class OpenAIServingChat(OpenAIServing):
                 message = ChatMessage(
                     role=role,
                     reasoning=reasoning,
-                    content="",
+                    content="" if tool_call_class_items else content,
                     tool_calls=tool_call_class_items,
                 )
 
@@ -1599,7 +2386,7 @@ class OpenAIServingChat(OpenAIServing):
                     history_tool_call_cnt += 1
                 message = ChatMessage(
                     role=role,
-                    content="",
+                    content="" if tool_call_class_items else content,
                     tool_calls=tool_call_class_items,
                     reasoning=reasoning,
                 )
@@ -1675,6 +2462,30 @@ class OpenAIServingChat(OpenAIServing):
                     "completion."
                 )
                 message = ChatMessage(role=role, reasoning=reasoning, content=content)
+            reasoning_done = (
+                True
+                if reasoning_parser is None
+                else (bool(message.content) or bool(message.tool_calls))
+            )
+            rcache = getattr(self, "_assistant_reasoning_cache", None)
+            if rcache is not None:
+                rcache.record(
+                    request.messages,
+                    message.content,
+                    message.tool_calls,
+                    raw_reasoning,
+                    cache_salt=request.cache_salt,
+                    reasoning_ended=reasoning_done,
+                    prompt_token_ids=(
+                        as_list(final_res.prompt_token_ids)
+                        if final_res.prompt_token_ids is not None
+                        else None
+                    ),
+                    output_token_ids=as_list(output.token_ids),
+                    gen_suffix=gen_suffix,
+                    im_end_id=im_end_id,
+                    nl_ids=nl_ids,
+                )
             # In OpenAI's API, when a tool is called, the finish_reason is:
             # "tool_calls" for "auto" or "required" tool calls,
             # and "stop" for named tool calls.
@@ -1742,8 +2553,8 @@ class OpenAIServingChat(OpenAIServing):
             self.enable_prompt_tokens_details
             and final_res.num_cached_tokens is not None
         ):
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=final_res.num_cached_tokens
+            populate_prompt_cache_usage(
+                usage, num_prompt_tokens, final_res.num_cached_tokens
             )
         # Engine-authoritative per-request timings. Without this a
         # non-streaming caller has no prefill/decode split at all, and any

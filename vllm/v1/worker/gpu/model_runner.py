@@ -320,6 +320,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_speculative_tokens=self.num_speculative_steps + 1,
                 use_fp64_gumbel=self.model_config.use_fp64_gumbel,
             )
+            if self.speculator is not None and hasattr(
+                self.speculator, "set_penalties_state"
+            ):
+                self.speculator.set_penalties_state(self.sampler.penalties_state)
             if self.speculative_config is not None:
                 self.rejection_sampler = RejectionSampler(
                     self.sampler,
@@ -880,6 +884,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        self.profile_torch_peak = 0
+        self.language_profile_peak_increase = None
         if self.supports_mm_inputs and self.is_first_pp_rank:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and not mm_config.skip_mm_profiling:
@@ -896,6 +902,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dummy_mm_inputs, mm_budget
                 )
 
+        pre_lm_stats = torch.accelerator.memory_stats(self.device)
+        pre_lm_peak = pre_lm_stats.get("allocated_bytes.all.peak", 0)
+        pre_lm_alloc = pre_lm_stats.get("allocated_bytes.all.current", 0)
+        torch.accelerator.reset_peak_memory_stats(self.device)
+
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
@@ -909,6 +920,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._dummy_pooler_run(hidden_states)
 
         torch.accelerator.synchronize()
+        lm_peak = torch.accelerator.memory_stats(self.device).get(
+            "allocated_bytes.all.peak", 0
+        )
+        self.language_profile_peak_increase = max(0, lm_peak - pre_lm_alloc)
+        self.profile_torch_peak = max(pre_lm_peak, lm_peak)
         del hidden_states, sample_hidden_states
         self.reset_encoder_cache()
         gc.collect()
@@ -1050,6 +1066,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.encoder_cache.remove_request(req_id)
         if self.prompt_logprobs_worker is not None:
             self.prompt_logprobs_worker.remove_request(req_id)
+        self.draft_tokens_handler.remove_request(req_id)
         self.lora_state.remove_request(req_id)
         return True
 
@@ -1370,6 +1387,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
+        input_batch._block_tables_cpu = self.block_tables.gather_block_tables_cpu(  # type: ignore[attr-defined]
+            input_batch.idx_mapping_np,
+            num_reqs_padded=input_batch.num_reqs_after_padding,
+        )
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.
         slot_mappings = self.block_tables.compute_slot_mappings(
@@ -1568,6 +1589,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
+            if scheduler_output.decode_ckpt_mounts:
+                for req_id, even_ids, odd_ids in scheduler_output.decode_ckpt_mounts:
+                    req_idx = self.req_states.req_id_to_index.get(req_id)
+                    if req_idx is not None:
+                        self.model_state.mount_decode_ckpt_blocks(
+                            req_idx, even_ids, odd_ids
+                        )
+            self.model_state.flush_decode_ckpt_blocks()
             self.block_tables.apply_staged_writes()
             # Finish offload stores whose source blocks this step reuses before
             # zeroing them below; see ActiveKVConnector.handle_preemptions.
@@ -1853,6 +1882,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids=finished_req_ids,
         )
         self._sm70_v2_mtp_profile_pending = mtp_profile_ctx
+        self._next_spec_steps = getattr(scheduler_output, "next_spec_steps", None)
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
@@ -1915,6 +1945,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.execute_model_state = None
         mtp_profile_ctx = self._sm70_v2_mtp_profile_pending
         self._sm70_v2_mtp_profile_pending = None
+        next_spec_steps = getattr(self, "_next_spec_steps", None)
+        self._next_spec_steps = None
 
         if not self.is_last_pp_rank:
             assert self.pp_handler is not None
@@ -2036,6 +2068,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.req_states.num_computed_tokens.gpu,
                     self.model_state.ngram_eos_token_id,
                 )
+            propose_extra_kwargs: dict[str, Any] = {}
+            if next_spec_steps is not None and hasattr(
+                self.speculator, "multi_step_decode"
+            ):
+                propose_extra_kwargs["active_spec_steps"] = next_spec_steps
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
@@ -2067,6 +2104,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if requires_host_token_state
                     else None
                 ),
+                **propose_extra_kwargs,
             )
             self._step_profiler.finish_context(
                 mtp_profile_ctx, "draft_total", mtp_draft_start

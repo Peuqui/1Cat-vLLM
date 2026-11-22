@@ -36,14 +36,29 @@ def test_flash_launcher_uses_adjacent_cli_and_preserves_overrides(tmp_path):
     assert args[:2] == ["serve", "/model with spaces"]
     assert args[-len(overrides) :] == overrides
     assert args[args.index("--tensor-parallel-size") + 1] == "4"
+    assert args[args.index("--decode-context-parallel-size") + 1] == "2"
+    assert args[args.index("--mamba-cache-mode") + 1] == "align"
     assert args[args.index("--kv-cache-dtype") + 1] == "float16"
     assert args[args.index("--max-model-len") + 1] == "262144"
     assert args[args.index("--max-num-seqs") + 1] == "8"
-    assert args[args.index("--prefix-cache-retention-interval") + 1] == "8192"
-    assert json.loads(args[args.index("--kernel-config") + 1])["qsa_host_kv"] is True
+    assert "--language-model-only" not in args
+    assert json.loads(args[args.index("--limit-mm-per-prompt") + 1]) == {
+        "video": 0,
+        "audio": 0,
+    }
+    kc = json.loads(args[args.index("--kernel-config") + 1])
+    assert kc["qsa_host_kv"] is True
+    assert kc["qsa_host_kv_dtype"] == "int8_per_token_head"
+    assert kc["qsa_host_kv_draft_dtype"] == "int8_per_token_head"
+    assert kc["qsa_host_kv_hot_dtype"] == "int8_per_token_head"
+    assert kc["hc_weight_storage"] == "sharded"
+    assert kc["qsa_host_kv_hot_tokens"] == 262144
+    assert kc["qsa_host_kv_state_blocks"] == 176
+    assert kc["qsa_host_kv_history_blocks"] == 768
+    assert kc["qsa_host_kv_trim_warmup_cache"] is True
     assert json.loads(args[args.index("--speculative-config") + 1]) == {
         "method": "mtp",
-        "num_speculative_tokens": 4,
+        "num_speculative_tokens": 5,
         "draft_sample_method": "greedy",
     }
 

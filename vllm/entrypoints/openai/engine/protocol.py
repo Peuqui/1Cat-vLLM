@@ -114,8 +114,39 @@ class UsageInfo(OpenAIBaseModel):
     total_tokens: int = 0
     completion_tokens: int | None = 0
     prompt_tokens_details: PromptTokenUsageInfo | None = None
+    prompt_cache_hit_tokens: int | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    prompt_cache_miss_tokens: int | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    prefix_cache_hit_rate: float | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     timings: dict[str, float] | None = Field(
         default=None, exclude_if=lambda value: value is None
+    )
+
+
+def populate_prompt_cache_usage(
+    usage: UsageInfo,
+    prompt_tokens: int,
+    num_cached_tokens: int | None,
+) -> None:
+    if num_cached_tokens is None:
+        return
+    cached = (
+        max(0, min(int(num_cached_tokens), int(prompt_tokens)))
+        if prompt_tokens > 0
+        else int(num_cached_tokens)
+    )
+    usage.prompt_tokens_details = PromptTokenUsageInfo(
+        cached_tokens=int(num_cached_tokens)
+    )
+    usage.prompt_cache_hit_tokens = cached
+    usage.prompt_cache_miss_tokens = max(int(prompt_tokens) - cached, 0)
+    usage.prefix_cache_hit_rate = (
+        round(cached / prompt_tokens, 4) if prompt_tokens > 0 else 0.0
     )
 
 
@@ -278,13 +309,26 @@ class DeltaMessage(OpenAIBaseModel):
     role: str | None = None
     content: str | None = None
     reasoning: str | None = None
+    reasoning_content: str | None = None
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _sync_reasoning_alias(self) -> "DeltaMessage":
+        if self.reasoning is not None and self.reasoning_content is None:
+            self.reasoning_content = self.reasoning
+        elif self.reasoning_content is not None and self.reasoning is None:
+            self.reasoning = self.reasoning_content
+        return self
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if not data.get("tool_calls"):
             data.pop("tool_calls", None)
+        if self.reasoning is None:
+            data.pop("reasoning_content", None)
+        elif data.get("reasoning") is not None and "reasoning_content" not in data:
+            data["reasoning_content"] = data["reasoning"]
         return data
 
 

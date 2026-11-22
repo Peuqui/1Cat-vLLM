@@ -18,6 +18,7 @@ from vllm.model_executor.models.shared_weights import (
 )
 from vllm.platforms import current_platform
 from vllm.runtime_resources import share_runtime_resources
+from vllm.utils.torch_utils import is_quantized_kv_cache
 
 logger = init_logger(__name__)
 
@@ -51,7 +52,7 @@ def get_parallel_draft_model(vllm_config: VllmConfig, model_tag: str) -> nn.Modu
     draft_cache_dtype = speculative_config.kv_cache_dtype
     if (
         draft_cache_dtype is None
-        and str(vllm_config.cache_config.cache_dtype).startswith("fp8")
+        and is_quantized_kv_cache(str(vllm_config.cache_config.cache_dtype))
         and current_platform.is_cuda()
         and current_platform.is_device_capability(70)
     ):

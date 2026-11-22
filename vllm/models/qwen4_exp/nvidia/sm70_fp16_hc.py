@@ -110,7 +110,7 @@ def _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch=False) -> bool
     admitted = (
         layer_policy().batch_fastpath and not reduced and 2 <= x.shape[0] <= 16
         if concurrent_batch
-        else layer_policy().hc_mtp_batch and reduced and x.shape[0] in (5, 10)
+        else layer_policy().hc_mtp_batch and reduced and 2 <= x.shape[0] <= 16
     )
 
     return bool(
@@ -996,12 +996,18 @@ sharded_hc_project = torch.ops.vllm.qwen38_sharded_hc_project
 
 
 def _sharded_hc_project_sequence_rows(
-    x: torch.Tensor, down: torch.Tensor, up: torch.Tensor
+    x: torch.Tensor,
+    down: torch.Tensor,
+    up: torch.Tensor,
+    defer_min_m: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Project row-owned residuals using transient copies of existing shards."""
     from vllm.distributed.parallel_state import get_tp_group
+    from vllm.runtime_resources import current_runtime_resources
 
     from .ops.hc import hc_gate_mix_gathered, hc_packet_silu
+
+    defer_pull = defer_min_m > 0 and (x.shape[0] * 4) >= defer_min_m
 
     group = get_tp_group()
     communicator = getattr(group.device_communicator, "hc_ll_comm", None)
@@ -1012,6 +1018,19 @@ def _sharded_hc_project_sequence_rows(
     ):
         raise ValueError("HC sequence rows require qualified TP4 sharded transport")
     order = tuple(communicator.order)
+    resources = current_runtime_resources()
+    peer_owner = resources.get("hc_prefill_peer") if resources is not None else None
+    if (
+        peer_owner is not None
+        and peer_owner.group is group
+        and peer_owner.can_project(x, down, up)
+    ):
+        logger.info_once(
+            "SM70 HC prefill uses lockless 4-GPU NVLink P2P weight/row projection."
+        )
+        return peer_owner.project_sequence_rows(
+            x, down, up, order, defer_pull=defer_pull
+        )
     local_down, local_up = _unpack_hc_storage(down, up)
     full_down = group.all_gather(local_down, dim=0)
     del local_down
@@ -1031,8 +1050,12 @@ def _sharded_hc_project_sequence_rows(
 
 
 def _sharded_hc_project_sequence_rows_fake(
-    x: torch.Tensor, down: torch.Tensor, up: torch.Tensor
+    x: torch.Tensor,
+    down: torch.Tensor,
+    up: torch.Tensor,
+    defer_min_m: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    del down, up, defer_min_m
     return x.new_empty((4 * x.shape[0], 2560)), x.new_empty((x.shape[0], 4))
 
 
@@ -1062,9 +1085,33 @@ def prepare_sharded_hc_storage(model, vllm_config) -> None:
             if communicator is None
             else communicator.status["reason"]
         )
-        raise ValueError(
-            f"Sharded HC storage requires qualified TP4 transport: {reason}"
+        if not getattr(vllm_config.kernel_config, "hc_weight_storage_auto", False):
+            raise ValueError(
+                f"Sharded HC storage requires qualified TP4 transport: {reason}"
+            )
+        target_dev = getattr(group.device_communicator, "device", None)
+        if target_dev is not None:
+            for module in model.modules():
+                if not isinstance(module, GatedResidual):
+                    continue
+                down_layer = (
+                    module.input_mix_weight_down_block_inject
+                    if module.use_combine
+                    else module.input_mix_weight_down
+                )
+                for layer in (down_layer, module.input_mix_weight_up):
+                    if getattr(layer, "_hc_cpu_staging", False):
+                        layer.weight = nn.Parameter(
+                            layer.weight.detach().to(target_dev), requires_grad=False
+                        )
+                        layer._hc_cpu_staging = False
+                        _prepare_hc_batch_weight(layer)
+        vllm_config.kernel_config.hc_weight_storage = "replicated"
+        logger.info_once(
+            "Retaining replicated HC weights (%s); TP4 LL transport unavailable.",
+            reason,
         )
+        return
     if vllm_config.lora_config is not None:
         raise ValueError("Sharded HC storage does not support LoRA adapters")
     count = 0
@@ -1093,17 +1140,24 @@ def prepare_sharded_hc_storage(model, vllm_config) -> None:
         if not module.use_combine:
             down = torch.nn.functional.pad(down, (0, 0, 0, 16))
         rank = communicator.logical_rank
+        use_hcx_bank = (
+            hasattr(module, "_hcx_down")
+            and getattr(
+                getattr(vllm_config, "scheduler_config", None), "max_num_seqs", 8
+            )
+            <= 1
+        )
         module.register_buffer(
             "hc_shard_down",
-            getattr(module, "_hcx_down", None)
-            if hasattr(module, "_hcx_down")
+            module._hcx_down
+            if use_hcx_bank
             else _pack_hc_batch_weight(down, "down", rank).to(communicator.device),
             persistent=False,
         )
         module.register_buffer(
             "hc_shard_up",
-            getattr(module, "_hcx_up", None)
-            if hasattr(module, "_hcx_up")
+            module._hcx_up
+            if use_hcx_bank
             else _pack_hc_batch_weight(up, "up", rank).to(communicator.device),
             persistent=False,
         )
