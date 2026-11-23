@@ -3,7 +3,7 @@
 import contextlib
 import math
 from collections.abc import Callable
-from dataclasses import asdict, fields
+from dataclasses import asdict, dataclass, fields
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from pydantic import Field, field_validator, model_validator
@@ -752,6 +752,63 @@ class HostReduceConfig:
 
 
 @config
+class AdaptiveVerifyConfig:
+    """Per-round verification length of the async scheduler for DFlash drafters.
+
+    The drafter keeps its full block (num_speculative_tokens = k_max); the
+    scheduler picks how many of those drafts the target verifies each round.
+    MTP keeps its own bands (speculative sampling policy adaptive_mtp)."""
+
+    enabled: bool = False
+    """Let the scheduler choose the verification length per round."""
+
+    min_tokens: int = Field(default=1, ge=1)
+    """Shortest verification length n (draft tokens per round)."""
+
+    max_tokens: int | None = Field(default=None, ge=1)
+    """Longest verification length; None means num_speculative_tokens."""
+
+    initial_tokens: int | None = Field(default=None, ge=1)
+    """Length of a request's first decode round, before any feedback; None
+    means max_tokens."""
+
+    forced_tokens: int | None = Field(default=None, ge=1)
+    """Calibration: verify exactly this many draft tokens every round."""
+
+    ema_alpha: float = Field(default=0.28, gt=0, le=1)
+    """Weight of the newest round in the per-position acceptance estimate."""
+
+    prior_conditional_acceptance: float = Field(default=0.7, gt=0, lt=1)
+    """Conditional acceptance assumed for a draft position before it has been
+    observed."""
+
+    prior_weight: float = Field(default=2.0, gt=0)
+    """Observations the prior counts for; it decays with the EMA."""
+
+    verify_cost_ratio: float = Field(default=0.108, gt=0)
+    """Round cost per verified draft token relative to the fixed round cost
+    (rho = c / t0 of the target verify round)."""
+
+    switch_margin: float = Field(default=0.02, ge=0)
+    """Relative throughput gain a new length needs before it replaces the
+    current one."""
+
+
+AdaptiveVerifyRule = Literal["mtp_bands", "throughput", "forced"]
+
+
+@dataclass(frozen=True)
+class AdaptiveVerifyPlan:
+    """Resolved, validated verification-length policy of one engine."""
+
+    rule: AdaptiveVerifyRule
+    min_tokens: int
+    max_tokens: int
+    initial_tokens: int
+    settings: AdaptiveVerifyConfig
+
+
+@config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
@@ -768,6 +825,10 @@ class KernelConfig:
 
     sm70_runtime: Sm70RuntimeConfig = Field(default_factory=Sm70RuntimeConfig)
     """Per-engine auxiliary warmup policy, outside compiled computation."""
+
+    adaptive_verify: AdaptiveVerifyConfig = Field(default_factory=AdaptiveVerifyConfig)
+    """Scheduler-side verification length of DFlash drafters, outside compiled
+    computation."""
 
     sm70_mxfp4: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
     """Native MXFP4 linear policy, captured only when its weights are prepared."""
@@ -1490,6 +1551,7 @@ class KernelConfig:
             "sm70_marlin",  # Hash only when the provider is prepared.
             "sm70_gdn_verify",  # Compatibility input is represented by gdn policy.
             "sm70_runtime",  # Warmup does not alter compiled model computation.
+            "adaptive_verify",  # Scheduler decision; graphs are captured per shape.
             "sm70_sparse_target_sampling",  # Sampler dispatch outside compiled forward.
             "sm70_sparse_target_reference_check",  # Sampler dispatch outside forward.
             "ir_op_priority",  # handled separately below
@@ -1724,16 +1786,16 @@ def capture_sm70_fp8_linear_config() -> Sm70Fp8Config:
     return policy
 
 
-def is_adaptive_mtp_enabled(
+ADAPTIVE_MTP_FLOOR_K = 2
+"""Smallest MTP draft depth the adaptive controller ever selects."""
+
+
+def _is_adaptive_mtp_enabled(
     speculative_config: Any,
     num_spec_tokens: int,
 ) -> bool:
     """Return whether async adaptive MTP depth (EntMTP) is enabled."""
-    if (
-        speculative_config is None
-        or getattr(speculative_config, "method", None) != "mtp"
-        or num_spec_tokens < 3
-    ):
+    if num_spec_tokens < 3:
         return False
     from vllm.config.speculative_sampling import resolve_sampling_policy
 
@@ -1758,9 +1820,9 @@ def is_adaptive_mtp_enabled(
     return False
 
 
-def adaptive_mtp_min_k(
+def _adaptive_mtp_min_k(
     num_spec_tokens: int,
-    speculative_config: Any = None,
+    speculative_config: Any,
 ) -> int:
     """Return the minimum adaptive MTP draft depth clamped to [2, k_max]."""
     from vllm.config.speculative_sampling import resolve_sampling_policy
@@ -1770,8 +1832,84 @@ def adaptive_mtp_min_k(
         val = (
             int(policy.adaptive_mtp_min_k)
             if policy.adaptive_mtp_min_k is not None
-            else 2
+            else ADAPTIVE_MTP_FLOOR_K
         )
     except (TypeError, ValueError):
-        val = 2
-    return max(2, min(val, num_spec_tokens))
+        val = ADAPTIVE_MTP_FLOOR_K
+    return max(ADAPTIVE_MTP_FLOOR_K, min(val, num_spec_tokens))
+
+
+def _resolve_dflash_verify(
+    settings: AdaptiveVerifyConfig, num_spec_tokens: int
+) -> AdaptiveVerifyPlan:
+    max_tokens = num_spec_tokens if settings.max_tokens is None else settings.max_tokens
+    if max_tokens > num_spec_tokens:
+        raise ValueError(
+            f"adaptive_verify.max_tokens ({max_tokens}) exceeds "
+            f"num_speculative_tokens ({num_spec_tokens})"
+        )
+    if settings.min_tokens > max_tokens:
+        raise ValueError(
+            f"adaptive_verify.min_tokens ({settings.min_tokens}) exceeds "
+            f"max_tokens ({max_tokens})"
+        )
+    initial = max_tokens if settings.initial_tokens is None else settings.initial_tokens
+    for name, value in (
+        ("initial_tokens", initial),
+        ("forced_tokens", settings.forced_tokens),
+    ):
+        if value is not None and not settings.min_tokens <= value <= max_tokens:
+            raise ValueError(
+                f"adaptive_verify.{name} ({value}) is outside "
+                f"[{settings.min_tokens}, {max_tokens}]"
+            )
+    if settings.forced_tokens is not None:
+        return AdaptiveVerifyPlan(
+            "forced",
+            settings.min_tokens,
+            max_tokens,
+            settings.forced_tokens,
+            settings,
+        )
+    return AdaptiveVerifyPlan(
+        "throughput", settings.min_tokens, max_tokens, initial, settings
+    )
+
+
+def resolve_adaptive_verify(
+    speculative_config: Any,
+    kernel_config: "KernelConfig",
+    num_spec_tokens: int,
+) -> AdaptiveVerifyPlan | None:
+    """Return the verification-length policy, or None for a fixed length.
+
+    The single source for the scheduler and the CUDA graph manager. MTP keeps
+    1Cat's speculative-sampling policy; DFlash is driven by
+    kernel_config.adaptive_verify. Enabling it for any other setup is an error,
+    not a silent no-op.
+    """
+    settings = kernel_config.adaptive_verify
+    method = getattr(speculative_config, "method", None)
+    if method == "mtp":
+        if settings.enabled:
+            raise ValueError(
+                "adaptive_verify.enabled does not apply to MTP; MTP depth is "
+                "controlled by the speculative sampling policy adaptive_mtp"
+            )
+        if not _is_adaptive_mtp_enabled(speculative_config, num_spec_tokens):
+            return None
+        return AdaptiveVerifyPlan(
+            "mtp_bands",
+            _adaptive_mtp_min_k(num_spec_tokens, speculative_config),
+            num_spec_tokens,
+            num_spec_tokens,
+            settings,
+        )
+    if not settings.enabled:
+        return None
+    if method != "dflash":
+        raise ValueError(
+            f"adaptive_verify.enabled requires speculative method 'dflash', "
+            f"got {method!r}"
+        )
+    return _resolve_dflash_verify(settings, num_spec_tokens)
