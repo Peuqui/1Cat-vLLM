@@ -394,6 +394,10 @@ __global__ void __launch_bounds__(
 #pragma unroll
       for (int i = 0; i < kDecodeRing; i++)
         if (g0 + i < gend) load_group(i, g0 + i);
+      // Two ring turns per loop iteration share their address arithmetic: the
+      // ring alone left the loop issue-bound (ncu 2026-11-23: issue 72 %,
+      // 36 % more instructions than the unrolled loop it replaced).
+#pragma unroll 2
       for (int gc = g0; gc < gend; gc += kDecodeRing) {
 #pragma unroll
         for (int i = 0; i < kDecodeRing; i++) {
