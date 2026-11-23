@@ -337,8 +337,7 @@ def _glm53_warmup_runner(num_spec: int, num_blocks: int) -> SimpleNamespace:
     )
 
 
-# Pool sizes of the GLM-5.3-Flash PP stages from the boot journals (k = 3 is
-# the smallest pool the k <= 4 layouts reached).
+# Pool sizes of GLM-5.3-Flash PP boots, from the boot journals.
 @pytest.mark.parametrize(
     ("num_spec", "num_blocks"), [(3, 130), (4, 130), (5, 130), (7, 126)]
 )
