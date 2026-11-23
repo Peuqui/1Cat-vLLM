@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import diag_expert_count
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -282,6 +283,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_tokens=self.max_num_tokens,
             device=self.device,
         )
+        diag_expert_count.set_query_start_loc(self.input_buffers.query_start_loc)
         if self.use_pp:
             self.pp_handler = PPHandler(
                 max_num_reqs=self.max_num_reqs,
@@ -1043,6 +1045,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.release_outputs()
 
+        # Counts from warmup and capture runs are meaningless.
+        diag_expert_count.reset()
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
         elapsed_time = end_time - start_time
@@ -1883,6 +1887,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self._sm70_v2_mtp_profile_pending = mtp_profile_ctx
         self._next_spec_steps = getattr(scheduler_output, "next_spec_steps", None)
+        if not dummy_run:
+            diag_expert_count.on_step(get_pp_group().rank_in_group)
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
@@ -2203,6 +2209,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
+        diag_expert_count.write(get_pp_group().rank_in_group)
         # CUDA graph managers own graph pools, captured outputs, and persistent
         # attention metadata. Drop both target and draft managers first.
         self.cudagraph_manager = None

@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm import _prefill_custom_ops as prefill_ops
+from vllm import diag_expert_count
 from vllm.config.diagnostic_dump import parse_int_filter
 from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.diagnostics import (
@@ -357,6 +358,9 @@ class MoERunner(MoERunnerInterface):
             if parameter is not None and parameter.device.type == "cuda":
                 attach_route_recorder(self.router, layer_name, parameter.device)
 
+        self._expert_count_histogram = diag_expert_count.register_layer(
+            layer_name, moe_config.num_experts
+        )
         self._forward_entry = self._select_forward()
 
     def _select_forward(self) -> Callable:
@@ -654,6 +658,7 @@ class MoERunner(MoERunnerInterface):
                 "moe_topk_ids",
                 self.layer_name,
             )
+            diag_expert_count.record(self._expert_count_histogram, topk_ids)
 
             # Passing shared_experts_input in case SharedExpertsOrder is
             # MK_INTERNAL_OVERLAPPED.
