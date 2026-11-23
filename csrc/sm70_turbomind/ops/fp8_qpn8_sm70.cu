@@ -314,6 +314,25 @@ __global__ void fp8_qpn8_sm70_kernel(
       channel_scales
           ? __ldg(group_scales + tile * 32 + qpn8_col_from_lane(lane))
           : __float2half(0.0f);
+  // RowGroupScales: the scale of the next 32-K group is loaded when the current
+  // one becomes active, so its latency hides behind two code groups instead of
+  // sitting between the switch and the first multiply. Same values, same math.
+  [[maybe_unused]] half next_scale = __float2half(0.0f);
+  [[maybe_unused]] const int last_scale_group =
+      (group_begin + groups_per_warp - 1) >> 1;
+  [[maybe_unused]] const half* scale_col_ptr =
+      group_scales + tile * 32 + qpn8_col_from_lane(lane);
+  if constexpr (RowGroupScales) {
+    if (groups_per_warp > 0) {
+      loaded_scale_group = group_begin >> 1;
+      loaded_scale =
+          __ldg(scale_col_ptr + static_cast<size_t>(loaded_scale_group) * n);
+      if (loaded_scale_group < last_scale_group) {
+        next_scale = __ldg(scale_col_ptr +
+                           static_cast<size_t>(loaded_scale_group + 1) * n);
+      }
+    }
+  }
   uint4 prefetched = make_uint4(0, 0, 0, 0);
   if constexpr (PrefetchCodes) {
     prefetched = __ldcs(code_ptr + static_cast<size_t>(group_begin) * 32);
@@ -330,10 +349,12 @@ __global__ void fp8_qpn8_sm70_kernel(
       // One scale per column and 32 K, i.e. per two 16-wide code groups.
       const int scale_group = group >> 1;
       if (scale_group != loaded_scale_group) {
-        loaded_scale =
-            __ldg(group_scales + static_cast<size_t>(scale_group) * n +
-                  tile * 32 + qpn8_col_from_lane(lane));
+        loaded_scale = next_scale;
         loaded_scale_group = scale_group;
+        if (scale_group < last_scale_group) {
+          next_scale =
+              __ldg(scale_col_ptr + static_cast<size_t>(scale_group + 1) * n);
+        }
       }
     } else {
       const int scale_group = group >> 3;
