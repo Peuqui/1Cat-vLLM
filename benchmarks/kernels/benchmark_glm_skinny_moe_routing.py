@@ -24,8 +24,9 @@ Production path used (nothing rebuilt by hand except where stated):
 - prepack: ``qpn_prepack`` (skinny_sm70_moe.py), csf scales decoded by the
   reference ``decode_csf32`` (csf32_scales.py; the production loader runs the
   GPU expander ``csf32_expand`` for the same bytes), then the production
-  decision of ``_csf_to_s5``: ``scale_spread`` <= ``S5_MAX_SPREAD`` -> five-bit
-  planes (``encode_s5``, raster dropped), else the raster is served as is.
+  decision of ``_csf_to_packed``: the smallest width ``scale_bits_for`` gives
+  for the projection's ``scale_spread`` -> five- or six-bit planes
+  (``encode_scales``, raster dropped), else the raster is served as is.
   Not measured here: the per-call ``csf32_expand`` of csf projections.
 
 Run on a GPU that nothing else uses (the weights of seven layers take about
@@ -66,9 +67,9 @@ from vllm.model_executor.layers.fused_moe.sm70.reduction import _mtp_weighted_re
 from vllm.model_executor.layers.fused_moe.sm70.routing import group_routing
 from vllm.model_executor.layers.quantization.utils.csf32_scales import decode_csf32
 from vllm.model_executor.layers.quantization.utils.s5_scales import (
-    S5_MAX_SPREAD,
-    S5Scales,
-    encode_s5,
+    PackedScales,
+    encode_scales,
+    scale_bits_for,
     scale_spread,
 )
 
@@ -236,23 +237,25 @@ class Layer:
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor  # static input of the graphs
     output: torch.Tensor
-    s5: tuple[S5Scales | None, S5Scales | None]
+    packed: tuple[PackedScales | None, PackedScales | None]
     scales: _ScaleCaches
 
     def projection_bytes(self) -> tuple[int, int]:
         """Bytes one expert streams for W13 and W2 (codes plus scale planes)."""
         experts = self.w1.size(0)
         result = []
-        for w, s5, raster in (
-            (self.w1, self.s5[0], self.scales.w1_scales_u8),
-            (self.w2, self.s5[1], self.scales.w2_scales_u8),
+        for w, packed, raster in (
+            (self.w1, self.packed[0], self.scales.w1_scales_u8),
+            (self.w2, self.packed[1], self.scales.w2_scales_u8),
         ):
             codes = w[0].numel()
-            if s5 is None:
+            if packed is None:
                 scale_bytes = raster[0].numel()
             else:
                 scale_bytes = (
-                    s5.base[0].numel() + s5.nib[0].numel() + 4 * s5.hi[0].numel()
+                    packed.base[0].numel()
+                    + packed.nib[0].numel()
+                    + 4 * packed.hi[0].numel()
                 )
             result.append(codes + scale_bytes)
             assert w.size(0) == experts
@@ -270,7 +273,7 @@ class _Harness(Nvfp4SkinnySm70Experts):
         self,
         order: QpnFragmentOrder,
         scales: _ScaleCaches,
-        s5: tuple[S5Scales | None, S5Scales | None],
+        packed: tuple[PackedScales | None, PackedScales | None],
         swiglu_limit: float,
     ):
         self._fragment_order = order
@@ -279,7 +282,7 @@ class _Harness(Nvfp4SkinnySm70Experts):
         self._scale_caches = scales
         self._csf_planes = None
         self._csf_scale_entries = None
-        self._s5 = s5
+        self._packed_scales = packed
         # TritonExperts.activation reads the clamp limit from here.
         self.quant_config = SimpleNamespace(gemm1_clamp_limit=swiglu_limit)  # type: ignore[assignment]
 
@@ -331,12 +334,14 @@ def build_layer(
     if reason is not None:
         raise RuntimeError(f"layer {layer}: {reason}")
     placeholder = s13.new_empty(0)
-    s5s: list[S5Scales | None] = []
+    packed_sets: list[PackedScales | None] = []
     rasters = []
     for raster, groups in ((s13, hidden // 16), (s2, inter // 16)):
-        fits = scale_spread(raster, groups) <= S5_MAX_SPREAD and not force_raster
-        s5s.append(encode_s5(raster, groups) if fits else None)
-        rasters.append(placeholder if fits else raster)
+        bits = None if force_raster else scale_bits_for(scale_spread(raster, groups))
+        packed_sets.append(
+            None if bits is None else encode_scales(raster, groups, bits)
+        )
+        rasters.append(raster if bits is None else placeholder)
     scales = _ScaleCaches(
         g1=[],
         g2=[],
@@ -345,8 +350,8 @@ def build_layer(
         w1_scales_u8=rasters[0],
         w2_scales_u8=rasters[1],
     )
-    s5 = (s5s[0], s5s[1])
-    harness = _Harness(order, scales, s5, float(text["swiglu_limit"]))
+    packed = (packed_sets[0], packed_sets[1])
+    harness = _Harness(order, scales, packed, float(text["swiglu_limit"]))
     x = (torch.randn(ROWS, hidden, generator=generator, dtype=torch.float32) * 0.25).to(
         device=device, dtype=torch.float16
     )
@@ -361,7 +366,7 @@ def build_layer(
         topk_weights=weights,
         topk_ids=torch.zeros(ROWS, TOP_K, dtype=torch.int32, device=device),
         output=torch.empty(ROWS, hidden, dtype=torch.float16, device=device),
-        s5=s5,
+        packed=packed,
         scales=scales,
     )
 
@@ -427,7 +432,7 @@ class SplitLayer:
             self.y13,
             False,
             ROWS,
-            layer.s5[0],
+            layer.packed[0],
         )
 
     def act(self) -> None:
@@ -448,7 +453,7 @@ class SplitLayer:
             self.y2,
             True,
             ROWS,
-            layer.s5[1],
+            layer.packed[1],
         )
 
     def reduce(self) -> None:
@@ -814,7 +819,7 @@ def main() -> None:
         layers.append(
             build_layer(ckpt, index, device, order, args.force_raster, generator)
         )
-        kinds = ["S5" if s is not None else "raster" for s in layers[-1].s5]
+        kinds = ["raster" if s is None else f"S{s.bits}" for s in layers[-1].packed]
         w13, w2 = layers[-1].projection_bytes()
         print(
             f"layer {index}: W13 {kinds[0]} {w13 / 1e6:.3f} MB/expert, W2 {kinds[1]} "

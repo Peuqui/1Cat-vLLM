@@ -38,7 +38,7 @@ from vllm.model_executor.layers.quantization.utils.csf32_scales import encode_cs
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     break_fp4_bytes,
 )
-from vllm.model_executor.layers.quantization.utils.s5_scales import encode_s5
+from vllm.model_executor.layers.quantization.utils.s5_scales import encode_scales
 from vllm.platforms import current_platform
 
 
@@ -557,19 +557,43 @@ def test_moe_qpn_multi_pass_groups_cover_every_row(device, order, counts):
     torch.testing.assert_close(out.float().cpu(), reference, rtol=2e-2, atol=2e-2)
 
 
+def _wide_scales(generator, rows, cols, spread):
+    """fp8-e4m3 scale bytes (finite, positive) whose rows span exactly `spread`.
+
+    The rows start in the subnormals so that even a span of 63 ends near 2.0
+    (byte 0x41): the kernels fold the global scale times 2^14 into an fp16 scale,
+    which larger scales overflow, and a NaN reference equals nothing.
+    """
+    low = 1 + torch.randint(0, 2, (rows, 1), generator=generator)
+    delta = torch.randint(0, spread + 1, (rows, cols // 16), generator=generator)
+    delta[:, 0] = 0
+    delta[:, 1] = spread
+    return (low + delta).to(torch.uint8)
+
+
+@pytest.mark.parametrize(
+    ("scale_bits", "spread"),
+    [(5, None), (6, 40), (6, 63)],
+    ids=["five_bits", "six_bits_span_40", "six_bits_span_63"],
+)
 @pytest.mark.parametrize(
     "counts", [[1, 2, 1, 0], [5, 0, 0, 3], [300, 1, 33, 9], [32, 32, 32, 32]], ids=str
 )
-def test_moe_qpn_five_bit_scales_give_the_raster_result(device, order, counts):
-    # Decode shapes read the five-bit planes in place (m16n8k8), every other launch
-    # first writes the raster from them: both must equal the run on the raster the
-    # planes were encoded from, bit for bit.
+def test_moe_qpn_packed_scales_give_the_raster_result(
+    device, order, counts, scale_bits, spread
+):
+    # The kernels read the five- or six-bit planes in place, decode and prefill
+    # instances on both fragment orders: each must equal the run on the raster the
+    # planes were encoded from, bit for bit. A six-bit span above 31 puts bit five
+    # of the scale bytes into play, which a five-bit decode would drop.
     generator = torch.Generator().manual_seed(3)
     experts, rows, cols = len(counts), 128, 256
     tokens = sum(counts)
     codes, scales = [], []
     for _ in range(experts):
         c, sc = _nvfp4_expert(generator, rows, cols)
+        if spread is not None:
+            sc = _wide_scales(generator, rows, cols, spread)
         codes.append(c)
         scales.append(sc)
     w = torch.stack(codes).to(device)
@@ -580,7 +604,7 @@ def test_moe_qpn_five_bit_scales_give_the_raster_result(device, order, counts):
         qc, qs = qpn_prepack(w[e], scales[e].to(device), 16, order)
         w[e].view(-1).copy_(qc)
         raster[e].copy_(qs.reshape(-1))
-    planes = encode_s5(raster, cols // 16)
+    planes = encode_scales(raster, cols // 16, scale_bits)
     gscales = (torch.rand(experts, generator=generator) * 0.2 + 0.05).to(device)
     hidden = torch.randn(tokens, cols, generator=generator).to(torch.float16)
 
@@ -615,8 +639,120 @@ def test_moe_qpn_five_bit_scales_give_the_raster_result(device, order, counts):
         return out
 
     expected = run(raster, False)
+    assert torch.isfinite(expected).all()
     scratch = torch.zeros_like(raster)  # the op writes the routed experts' rows
     assert torch.equal(run(scratch, True), expected)
+
+
+@pytest.mark.parametrize(
+    ("scale_mode", "scale_bits"),
+    [(0, 0), (1, 0), (0, 5), (0, 6)],
+    ids=["nvfp4_raster", "mxfp4_raster", "five_bit_planes", "six_bit_planes"],
+)
+@pytest.mark.parametrize(
+    ("cols", "splitk"),
+    [(128, None), (256, None), (384, None), (640, None), (320, None), (768, 16)],
+    ids=str,
+)
+def test_moe_qpn_decode_load_ring_equals_the_prefill_path(
+    device, order, cols, splitk, scale_mode, scale_bits
+):
+    # Decode (at most 8 rows per expert) reads the codes, scales and activation
+    # rows through a load ring (kDecodeRing groups ahead); prefill (more than 8 rows
+    # per expert on average) takes the staged path without it. Both sum every
+    # row over the same groups in the same order, so each decode row must equal
+    # the same row of the prefill run bit for bit. The widths give warp slices
+    # of 1 (K = 128), 2 (256, and 320 on 10 warps), 3 (384, and 768 on 16
+    # warps) and 5 (640) groups: a slice shorter than, or not a multiple of,
+    # the ring depth must neither drop a group nor read one past its end. The
+    # float references at 2e-2 elsewhere would hide a dropped group in the
+    # packed variants, and their widths all give even slices.
+    if splitk is not None and order != QpnFragmentOrder.M8N8K4:
+        pytest.skip("only the m8n8k4 kernel runs 16 warps")
+    if scale_mode == 1 and scale_bits:
+        pytest.skip("packed planes carry NVFP4 scales")
+    generator = torch.Generator().manual_seed(11)
+    decode_counts = [8, 1, 0, 5, 3]
+    experts, rows = len(decode_counts), 128
+    prefill_count = 12  # per expert, empty or not: 12 > 8 rows on average
+    group_size = 32 if scale_mode == 1 else 16
+    codes = torch.randint(0, 256, (experts, rows, cols // 2), generator=generator)
+    codes = codes.to(torch.uint8)
+    if scale_mode == 1:
+        scales = (
+            torch.randint(0, 8, (experts, rows, cols // 32), generator=generator) + 112
+        ).to(torch.uint8)
+        global_scale = rebase_e8m0_for_fp16(scales).to(device)
+    else:
+        scales = torch.stack(
+            [
+                _wide_scales(generator, rows, cols, 40)
+                if scale_bits == 6
+                else _nvfp4_expert(generator, rows, cols)[1]
+                for _ in range(experts)
+            ]
+        )
+        global_scale = (torch.rand(experts, generator=generator) * 0.2 + 0.05).to(
+            device
+        )
+    w = codes.to(device)
+    raster = torch.empty(
+        experts,
+        rows // 32 * (cols // group_size) * 32,
+        dtype=torch.uint8,
+        device=device,
+    )
+    for e in range(experts):
+        qc, qs = qpn_prepack(w[e], scales[e].to(device), group_size, order)
+        w[e].view(-1).copy_(qc)
+        raster[e].copy_(qs.reshape(-1))
+    extra = ()
+    if scale_bits:
+        planes = encode_scales(raster, cols // 16, scale_bits)
+        extra = (planes.base, planes.nib, planes.hi)
+
+    prefill_tokens = prefill_count * experts
+    hidden = torch.randn(prefill_tokens, cols, generator=generator).to(torch.float16)
+    # Expert e's first rows are its decode rows; the prefill run keeps the rest
+    # of its block as filler.
+    decode_rows = [
+        e * prefill_count + i
+        for e, count in enumerate(decode_counts)
+        for i in range(count)
+    ]
+
+    def run(x, counts):
+        tokens = x.shape[0]
+        gids = torch.zeros(tokens, dtype=torch.int32)
+        goff = torch.full((tokens + 1,), tokens, dtype=torch.int32)
+        group, start = 0, 0
+        for e, count in enumerate(counts):
+            if count:
+                gids[group], goff[group] = e, start
+                group, start = group + 1, start + count
+        out = torch.empty((tokens, rows), dtype=torch.float16, device=device)
+        torch.ops._C.skinny_moe_qpn_sm70(
+            x.to(device),
+            w,
+            raster,
+            global_scale,
+            torch.arange(tokens, dtype=torch.int32, device=device),
+            gids.to(device),
+            goff.to(device),
+            1,
+            out,
+            False,
+            tokens,
+            splitk or grouped_splitk(cols, order),
+            scale_mode,
+            order,
+            *extra,
+        )
+        return out.cpu()
+
+    decode = run(hidden[decode_rows], decode_counts)
+    prefill = run(hidden, [prefill_count] * experts)
+    assert torch.equal(decode, prefill[decode_rows])
 
 
 def _nvfp4_moe(generator, num_experts, hidden_size, intermediate):
@@ -659,7 +795,7 @@ def _skinny_experts(device, order, w13, s13, w2, s2, g1, g2):
     experts._w1_block_scales = s13
     experts._w2_block_scales = s2
     experts._csf_planes = None
-    experts._s5 = None
+    experts._packed_scales = None
     experts._scale_caches = _ScaleCaches(
         g1=g1.tolist(),
         g2=g2.tolist(),
@@ -854,14 +990,19 @@ def _spread_scales(rng, rows, groups, spread):
     return scale.astype(np.uint8)
 
 
-@pytest.mark.parametrize("w2_spread", [26, 40], ids=["both_fit", "w2_too_wide"])
+@pytest.mark.parametrize(
+    ("w2_spread", "expected_bits"),
+    [(26, 5), (40, 6), (63, 6), (64, None)],
+    ids=["both_five_bits", "w2_six_bits", "w2_widest_six_bits", "w2_too_wide"],
+)
 @pytest.mark.parametrize("num_tokens", [1, 6, 40])
 def test_csf_experts_give_the_same_output_as_five_bit_planes(
-    device, order, w2_spread, num_tokens
+    device, order, w2_spread, expected_bits, num_tokens
 ):
-    # A layer whose scale rows fit five bits is served from planes, the same layer
-    # kept on csf planes expands per call; a projection that does not fit stays on
-    # csf next to a packed one. All three must produce the same bytes.
+    # A layer whose scale rows fit five or six bits is served from planes (the
+    # smallest width that carries each projection), the same layer kept on csf
+    # planes expands per call; a projection that fits neither stays on csf next
+    # to a packed one. All of them must produce the same bytes.
     rng = np.random.default_rng(5)
     generator = torch.Generator().manual_seed(6)
     experts, hidden, inter, top_k = 8, 256, 128, 3
@@ -906,7 +1047,7 @@ def test_csf_experts_give_the_same_output_as_five_bit_planes(
         served._csf_planes = (planes13, planes2)
         served._csf_scale_entries = qpn_scale_entries(order, device)
         if convert:
-            served._s5 = served._csf_to_s5()
+            served._packed_scales = served._csf_to_packed()
         output = torch.empty(num_tokens, hidden, dtype=torch.float16, device=device)
         served._apply_grouped(
             output=output,
@@ -925,8 +1066,13 @@ def test_csf_experts_give_the_same_output_as_five_bit_planes(
     assert torch.isfinite(expected).all()
     got, served = serve(convert=True)
     assert torch.equal(got, expected)
-    fits = w2_spread <= 31
-    assert (served._s5[0] is not None) and (served._s5[1] is not None) == fits
+    fits = expected_bits is not None
+    packed = served._packed_scales
+    assert packed[0] is not None
+    assert (packed[1] is not None) == fits
+    assert packed[0].bits == 5
+    if fits:
+        assert packed[1].bits == expected_bits
     assert (served._csf_planes is None) == fits
     # Packed projections let go of their raster, the others keep it.
     assert served.scale_rasters_released() == (True, fits)
