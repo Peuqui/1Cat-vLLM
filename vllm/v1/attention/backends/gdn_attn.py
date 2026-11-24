@@ -2115,7 +2115,7 @@ def prepare_dflash2_gdn_group_metadata(
 
     if not input_tables:
         return None
-    spec_token_size = common_gdn_metadata.spec_token_indx.numel()
+    spec_token_size = common_gdn_metadata.spec_token_size
     if (
         spec_token_size > common_buffers.spec_token_indx.numel()
         or num_actual_tokens > common_buffers.spec_sequence_masks.numel()

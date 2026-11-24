@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -417,8 +418,21 @@ class CommonGDNSpecMetadata:
     non_spec_query_start_loc_cpu: torch.Tensor | None
     spec_sequence_masks_cpu: torch.Tensor
     spec_sequence_masks: torch.Tensor
-    spec_token_indx: torch.Tensor
+    spec_token_size: int
     non_spec_token_indx: torch.Tensor
+    # Index values of a mixed batch; None for a pure speculative decode, whose
+    # index is arange(spec_token_size) and is built only when read.
+    spec_token_indx_values: torch.Tensor | None = None
+
+    @cached_property
+    def spec_token_indx(self) -> torch.Tensor:
+        if self.spec_token_indx_values is not None:
+            return self.spec_token_indx_values
+        return torch.arange(
+            self.spec_token_size,
+            dtype=torch.int32,
+            device=self.non_spec_token_indx.device,
+        )
 
 
 def compute_common_gdn_attn_metadata(
@@ -444,13 +458,13 @@ def compute_common_gdn_attn_metadata(
     if num_decode_draft_tokens_cpu.numel() != num_reqs:
         raise ValueError("num_decode_draft_tokens_cpu must align with query_start_loc")
 
+    # Host tensors: numpy views avoid a torch dispatch per scalar.
     spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
-    num_spec_decodes = int(spec_sequence_masks_cpu.sum().item())
+    spec_mask_np = spec_sequence_masks_cpu.numpy()
+    num_spec_decodes = int(spec_mask_np.sum())
     if num_spec_decodes == 0:
         return None
-    num_spec_draft_tokens = int(
-        num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item()
-    )
+    num_spec_draft_tokens = int(num_decode_draft_tokens_cpu.numpy()[spec_mask_np].sum())
     if num_spec_draft_tokens == 0:
         return None
 
@@ -483,35 +497,32 @@ def prepare_gdn_token_metadata(
     legacy_mixed_decode_routing: bool,
 ) -> CommonGDNSpecMetadata:
     """Shared token ordering/ranges; state-index ownership stays with each group."""
-    non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
-    num_zero_len = int((non_spec_query_lens_cpu == 0).sum().item())
+    # Host tensors: the counts below are plain numpy, not torch dispatches.
+    query_lens_np = query_lens_cpu.numpy()
+    non_spec_query_lens_np = query_lens_np[~spec_sequence_masks_cpu.numpy()]
+    num_zero_len = int((non_spec_query_lens_np == 0).sum())
 
     if legacy_mixed_decode_routing:
-        num_decodes = int((non_spec_query_lens_cpu == 1).sum().item())
-        num_prefills = non_spec_query_lens_cpu.numel() - num_decodes - num_zero_len
+        num_decodes = int((non_spec_query_lens_np == 1).sum())
+        num_prefills = non_spec_query_lens_np.size - num_decodes - num_zero_len
         num_decode_tokens = num_decodes
-        num_prefill_tokens = (
-            int(non_spec_query_lens_cpu.sum().item()) - num_decode_tokens
-        )
+        num_prefill_tokens = int(non_spec_query_lens_np.sum()) - num_decode_tokens
     else:
         num_decodes = 0
-        num_prefills = non_spec_query_lens_cpu.numel() - num_zero_len
+        num_prefills = non_spec_query_lens_np.size - num_zero_len
         num_decode_tokens = 0
-        num_prefill_tokens = int(non_spec_query_lens_cpu.sum().item())
+        num_prefill_tokens = int(non_spec_query_lens_np.sum())
 
     num_spec_decode_tokens = (
-        int(query_lens_cpu.sum().item()) - num_prefill_tokens - num_decode_tokens
+        int(query_lens_np.sum()) - num_prefill_tokens - num_decode_tokens
     )
+    total_query_tokens = int(query_start_loc_cpu.numpy()[-1])
     if num_prefills == 0 and num_decodes == 0:
         spec_token_size = min(
             num_spec_decodes * (num_spec_state_tokens + 1),
-            int(query_start_loc_cpu[-1].item()),
+            total_query_tokens,
         )
-        spec_token_indx = torch.arange(
-            spec_token_size,
-            dtype=torch.int32,
-            device=query_start_loc.device,
-        )
+        spec_token_indx = None
         non_spec_token_indx = torch.empty(
             0,
             dtype=torch.int32,
@@ -526,12 +537,13 @@ def prepare_gdn_token_metadata(
         spec_token_masks = torch.repeat_interleave(
             spec_sequence_masks,
             query_lens,
-            output_size=int(query_start_loc_cpu[-1].item()),
+            output_size=total_query_tokens,
         )
         index = torch.argsort(spec_token_masks, stable=True)
         num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
         non_spec_token_indx = index[:num_non_spec_tokens]
         spec_token_indx = index[num_non_spec_tokens:]
+        spec_token_size = spec_token_indx.numel()
 
         spec_query_start_loc = torch.zeros(
             num_spec_decodes + 1,
@@ -576,6 +588,7 @@ def prepare_gdn_token_metadata(
         non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
         spec_sequence_masks_cpu=spec_sequence_masks_cpu,
         spec_sequence_masks=spec_sequence_masks,
-        spec_token_indx=spec_token_indx,
+        spec_token_size=spec_token_size,
         non_spec_token_indx=non_spec_token_indx,
+        spec_token_indx_values=spec_token_indx,
     )
