@@ -212,6 +212,7 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     # The replicated draft's slot map depends on logical positions as well
     # as the block table; FlashAttention's update hook only receives a table.
     supports_update_block_table: bool = False
+    requires_block_table_cpu: ClassVar[bool] = True
     # QSA's DCP attention localizes its own selections and never reads the
     # per-rank context lengths, which cost a dozen small kernels per build.
     builds_dcp_context_lens: ClassVar[bool] = False

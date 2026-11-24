@@ -39,6 +39,35 @@ def async_copy_to_gpu(
     return out.copy_(x, non_blocking=True)
 
 
+# Triton specializes pointer arguments on 16-byte divisibility. A fresh device
+# allocation is always 16-byte aligned, so every packed view must be too, or the
+# kernels reading it would compile a second variant.
+_PACKED_ALIGNMENT_ELEMS = 16 // np.dtype(np.int32).itemsize
+
+
+def async_copy_to_gpu_packed(
+    arrays: Sequence[np.ndarray], device: torch.device
+) -> tuple[torch.Tensor, ...]:
+    """Copy several small int32 host arrays with ONE host-to-device copy.
+
+    Returns one device tensor per array, each a 16-byte aligned view into a
+    fresh allocation, so the values and lifetime match separate copies.
+    """
+    offsets: list[int] = []
+    total = 0
+    for array in arrays:
+        assert array.dtype == np.int32 and array.ndim == 1
+        offsets.append(total)
+        total += -(-len(array) // _PACKED_ALIGNMENT_ELEMS) * _PACKED_ALIGNMENT_ELEMS
+    staging = np.zeros(total, dtype=np.int32)
+    for offset, array in zip(offsets, arrays):
+        staging[offset : offset + len(array)] = array
+    packed = async_copy_to_gpu(staging, device=device)
+    return tuple(
+        packed[offset : offset + len(array)] for offset, array in zip(offsets, arrays)
+    )
+
+
 class UvaBuffer:
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
         if not is_uva_available():

@@ -588,6 +588,9 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
     # metadata
     supports_update_block_table: bool = False
     requires_block_table_width: ClassVar[bool] = False
+    # Whether this builder reads the host copy of the block table
+    # (CommonAttentionMetadata._block_table_cpu); the runner builds it only then.
+    requires_block_table_cpu: ClassVar[bool] = False
     # Whether this builder consumes scheduler-level physical block IDs rather
     # than the cache group's virtual kernel-block IDs. Compressed-cache builders
     # that set this retain the original logical/storage block geometry.

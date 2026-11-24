@@ -90,6 +90,7 @@ from vllm.v1.worker.gpu.attn_utils import (
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import (
     async_copy_to_gpu,
+    async_copy_to_gpu_packed,
     set_default_max_concurrency,
 )
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -642,6 +643,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ),
         )
         self._kernel_block_sizes = kernel_block_sizes
+        self._needs_block_table_cpu = any(
+            group.get_metadata_builder(0).requires_block_table_cpu
+            for groups in self.attn_groups
+            for group in groups
+        )
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
             max_num_reqs=self.max_num_reqs,
@@ -1216,7 +1222,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         idx_mapping_iter = map(self.req_states.req_id_to_index.get, req_ids)
         idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.int32, count=num_reqs)
-        idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
 
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -1226,13 +1231,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_draft_tokens = 0
             total_num_logits = num_reqs
             cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
-            cu_num_logits = torch.arange(
-                num_reqs + 1, device=self.device, dtype=torch.int32
+            # All per-request index arrays are host-known: one copy for all.
+            idx_mapping, cu_num_logits, expanded_local_pos = async_copy_to_gpu_packed(
+                [idx_mapping_np, cu_num_logits_np, np.zeros(num_reqs, dtype=np.int32)],
+                self.device,
             )
             expanded_idx_mapping = idx_mapping
-            expanded_local_pos = torch.zeros(
-                num_reqs, dtype=torch.int32, device=self.device
-            )
         else:
             num_draft_tokens_per_req = np.fromiter(
                 (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
@@ -1246,7 +1250,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
-            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+            idx_mapping, cu_num_logits = async_copy_to_gpu_packed(
+                [idx_mapping_np, cu_num_logits_np], self.device
+            )
 
             max_expand_len = self.num_speculative_steps + 1
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
@@ -1410,10 +1416,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
-        input_batch._block_tables_cpu = self.block_tables.gather_block_tables_cpu(  # type: ignore[attr-defined]
-            input_batch.idx_mapping_np,
-            num_reqs_padded=input_batch.num_reqs_after_padding,
-        )
+        if self._needs_block_table_cpu:
+            input_batch._block_tables_cpu = (  # type: ignore[attr-defined]
+                self.block_tables.gather_block_tables_cpu(
+                    input_batch.idx_mapping_np,
+                    num_reqs_padded=input_batch.num_reqs_after_padding,
+                )
+            )
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.
         slot_mappings = self.block_tables.compute_slot_mappings(
