@@ -365,7 +365,10 @@ void skinny_moe_qpn_sm70(
     int64_t num_tokens, int64_t splitk, int64_t scale_mode,
     int64_t fragment_order, std::optional<torch::Tensor> packed_base,
     std::optional<torch::Tensor> packed_nib,
-    std::optional<torch::Tensor> packed_hi);
+    std::optional<torch::Tensor> packed_hi, int64_t epilogue,
+    double swiglu_limit, std::optional<torch::Tensor> reduce_weights,
+    std::optional<torch::Tensor> reduce_out,
+    std::optional<torch::Tensor> reduce_counters);
 
 void nvfp4_qpn2_gated_sm70_out(torch::Tensor out, torch::Tensor input,
                                torch::Tensor codes, torch::Tensor scales,

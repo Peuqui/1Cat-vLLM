@@ -946,7 +946,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor gscales, Tensor perm, Tensor gids, Tensor goff, int topk, "
       "Tensor(a!) y_slots, bool x_slot_major, int num_tokens, int splitk, "
       "int scale_mode, int fragment_order, Tensor? packed_base=None, "
-      "Tensor? packed_nib=None, Tensor? packed_hi=None) -> ()");
+      "Tensor? packed_nib=None, Tensor? packed_hi=None, int epilogue=0, "
+      "float swiglu_limit=0.0, Tensor? reduce_weights=None, "
+      "Tensor(b!)? reduce_out=None, Tensor(c!)? reduce_counters=None) -> ()");
   ops.impl("skinny_moe_qpn_sm70", torch::kCUDA, &skinny_moe_qpn_sm70);
 
   // csf_32x2_v1 expert scales -> skinny QPN scale raster.

@@ -60,6 +60,16 @@ logger = init_logger(__name__)
 # The grouped operator uses slots as its grid-y dimension.
 _CUDA_GRID_Y_LIMIT = 65535
 _QPN_MAX_M = 16
+# Output columns one CTA of the grouped kernel owns (two 32-column tiles).
+_COLUMNS_PER_CTA = 64
+# The grouped kernel's fused epilogues exist for its decode instances: at most
+# this many slots per expert (the kernel's `prefill` switch). The weighted
+# reduction also runs in one CTA per column block, so it takes only a few
+# tokens (a verify step).
+_FUSED_EPILOGUE_MAX_SLOTS_PER_EXPERT = 8
+_FUSED_REDUCE_MAX_TOKENS = 16
+# Epilogue ids of the native operator (EpilogueMode in the kernel source).
+_EPILOGUE_STORE, _EPILOGUE_SWIGLU, _EPILOGUE_REDUCE = 0, 1, 2
 
 
 class QpnFragmentOrder(IntEnum):
@@ -374,6 +384,10 @@ class _ScaleCaches:
     # Block scale rasters, viewed as the bytes the kernels decode.
     w1_scales_u8: torch.Tensor
     w2_scales_u8: torch.Tensor
+    # Arrival counters of the fused weighted reduction (one per 64 output
+    # columns); the kernel leaves them at zero, so one buffer serves every call
+    # of this layer. One stream runs a layer at a time.
+    reduce_counters: torch.Tensor
 
 
 class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
@@ -807,6 +821,11 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
                 g2_t=g2.to(torch.float32).contiguous(),
                 w1_scales_u8=self._w1_block_scales.view(torch.uint8),
                 w2_scales_u8=self._w2_block_scales.view(torch.uint8),
+                reduce_counters=torch.zeros(
+                    self.moe_config.hidden_dim // _COLUMNS_PER_CTA,
+                    dtype=torch.int32,
+                    device=g1.device,
+                ),
             )
         return self._scale_caches
 
@@ -849,26 +868,57 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
                         goff32,
                         self._csf_scale_entries,
                     )
-        y13 = torch.empty(
-            (num_slots, w1.size(1)), dtype=hidden_states.dtype, device=device
+        dtype = hidden_states.dtype
+        decode = num_slots <= _FUSED_EPILOGUE_MAX_SLOTS_PER_EXPERT * w1.size(0)
+        inter = torch.empty((num_slots, inter_dim), dtype=dtype, device=device)
+        swiglu_limit = self._fused_swiglu_limit(activation, decode)
+        if swiglu_limit is not None:
+            # The projection stores the activation itself, bit for bit what
+            # self.activation computes from the stored projection.
+            self._grouped_projection(
+                hidden_states,
+                w1,
+                scales.w1_scales_u8,
+                scales.g1_t,
+                perm,
+                gids32,
+                goff32,
+                top_k,
+                inter,
+                False,
+                num_tokens,
+                packed_w13,
+                epilogue=_EPILOGUE_SWIGLU,
+                swiglu_limit=swiglu_limit,
+            )
+        else:
+            y13 = torch.empty((num_slots, w1.size(1)), dtype=dtype, device=device)
+            self._grouped_projection(
+                hidden_states,
+                w1,
+                scales.w1_scales_u8,
+                scales.g1_t,
+                perm,
+                gids32,
+                goff32,
+                top_k,
+                y13,
+                False,
+                num_tokens,
+                packed_w13,
+            )
+            self.activation(activation, inter, y13)
+        y2 = torch.empty((num_slots, w2.size(1)), dtype=dtype, device=device)
+        # One pass over the slot rows straight into the output (the reduction
+        # moe_unpermute computes) instead of writing and re-reading two FP32
+        # copies of y2: the last CTA of each column block of the projection
+        # sums its tokens' rows (decode), else a Triton kernel follows.
+        fused_reduce = (
+            decode
+            and num_tokens <= _FUSED_REDUCE_MAX_TOKENS
+            and topk_weights.dtype == torch.float32
+            and output.dtype == dtype
         )
-        self._grouped_projection(
-            hidden_states,
-            w1,
-            scales.w1_scales_u8,
-            scales.g1_t,
-            perm,
-            gids32,
-            goff32,
-            top_k,
-            y13,
-            False,
-            num_tokens,
-            packed_w13,
-        )
-        inter = torch.empty((num_slots, inter_dim), dtype=y13.dtype, device=device)
-        self.activation(activation, inter, y13)
-        y2 = torch.empty((num_slots, w2.size(1)), dtype=y13.dtype, device=device)
         self._grouped_projection(
             inter,
             w2,
@@ -882,11 +932,26 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             True,
             num_tokens,
             packed_w2,
+            epilogue=_EPILOGUE_REDUCE if fused_reduce else _EPILOGUE_STORE,
+            reduce_weights=topk_weights,
+            reduce_out=output,
+            reduce_counters=scales.reduce_counters,
         )
-        # One pass over the slot rows straight into the output (the reduction
-        # moe_unpermute computes) instead of writing and re-reading two FP32
-        # copies of y2.
-        _mtp_weighted_reduce(y2, topk_weights, output)
+        if not fused_reduce:
+            _mtp_weighted_reduce(y2, topk_weights, output)
+
+    def _fused_swiglu_limit(
+        self, activation: MoEActivation, decode: bool
+    ) -> float | None:
+        """The clamp limit when the first projection can store the activation.
+
+        Only the clamped SiLU gate has a fused epilogue (the arithmetic of
+        swiglu_limit_func); anything else keeps the separate activation.
+        """
+        limit = self.quant_config.gemm1_clamp_limit
+        if not decode or activation != MoEActivation.SILU or limit is None:
+            return None
+        return float(limit) if float(limit) > 0 else None
 
     def _grouped_projection(
         self,
@@ -902,6 +967,12 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         x_slot_major: bool,
         num_tokens: int,
         packed: PackedScales | None = None,
+        *,
+        epilogue: int = _EPILOGUE_STORE,
+        swiglu_limit: float = 0.0,
+        reduce_weights: torch.Tensor | None = None,
+        reduce_out: torch.Tensor | None = None,
+        reduce_counters: torch.Tensor | None = None,
     ) -> None:
         """y[slot] = x[row] @ W[expert].T over the expert groups of the slots.
 
@@ -939,6 +1010,11 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             None if packed is None else packed.base,
             None if packed is None else packed.nib,
             None if packed is None else packed.hi,
+            epilogue,
+            swiglu_limit,
+            reduce_weights if epilogue == _EPILOGUE_REDUCE else None,
+            reduce_out if epilogue == _EPILOGUE_REDUCE else None,
+            reduce_counters if epilogue == _EPILOGUE_REDUCE else None,
         )
 
 

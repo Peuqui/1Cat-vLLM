@@ -19,6 +19,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 
+#include <cmath>
+
 #include "mma_fragments_sm70.cuh"
 
 namespace {
@@ -125,6 +127,116 @@ __device__ __forceinline__ void dequant8_tm(unsigned q, half2 sc2p,
   fp4x8_to_half2x4(q, out);
 #pragma unroll
   for (int i = 0; i < 4; ++i) out[i] = __hmul2(out[i], sc2p);
+}
+
+// ---------------------------------------------------------------------------
+// Epilogues of the grouped MoE kernels (decode only: RB == 1, one 8-row tile).
+//
+// EPILOGUE_SWIGLU (W13 projection): the CTA takes the gate tile j and the up
+// tile j + N/64 of the same 32 output columns instead of two adjacent tiles.
+// Each accumulator still sums its own K slices in the same order, so gate and
+// up equal what the plain epilogue stores, and the CTA applies SwiGLU with the
+// clamp to them as fp16 values (the rounding the stored y13 had) and writes
+// the activation, which takes the Triton activation kernel and the y13 round
+// trip out of the layer.
+//
+// EPILOGUE_REDUCE (W2 projection): after storing its rows, the last CTA of a
+// column block to finish sums the routed rows of every token for those 64
+// columns, in slot order, exactly like _mtp_weighted_reduce_kernel
+// (fma.rn.f32 chain from 0, one fp16 rounding at the end).
+// ---------------------------------------------------------------------------
+enum EpilogueMode { EPILOGUE_STORE = 0, EPILOGUE_SWIGLU = 1, EPILOGUE_REDUCE = 2 };
+
+struct MoeEpilogue {
+  int mode;
+  int out_stride;               // SWIGLU: halves per row of the activation
+  float swiglu_limit;           // SWIGLU: the clamp limit (> 0)
+  int num_tokens;               // REDUCE: rows of reduce_out
+  const float* reduce_weights;  // REDUCE: [num_tokens, topk] router weights
+  half* reduce_out;             // REDUCE: [num_tokens, N]
+  int* reduce_counters;         // REDUCE: [N / 64], zero between launches
+};
+
+// The explicit PTX forms below are the instructions Triton 3.6 emits for
+// vllm.model_executor.layers.fused_moe.utils.swiglu_limit_func (fp16 in and
+// out; inspected in the Inductor cache, kernel
+// triton_poi_fused_clamp_copy__mul_silu_slice_0): ex2.approx and div.full for
+// the sigmoid, no contraction, so the fused epilogue is bit-identical to it.
+__device__ __forceinline__ float ptx_sub(float a, float b) {
+  float r;
+  asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float ptx_mul(float a, float b) {
+  float r;
+  asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float ptx_add(float a, float b) {
+  float r;
+  asm("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+__device__ __forceinline__ float ptx_ex2(float a) {
+  float r;
+  asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(a));
+  return r;
+}
+__device__ __forceinline__ float ptx_div_full(float a, float b) {
+  float r;
+  asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+
+// silu(min(gate, limit)) * clamp(up, -limit, limit), rounded once to fp16.
+// Triton compares the fp16 inputs against the fp16-rounded limit and keeps NaN.
+__device__ __forceinline__ half swiglu_clamp_silu_mul(half gate_h, half up_h,
+                                                      float limit) {
+  const float gate = __half2float(gate_h), up = __half2float(up_h);
+  const half limit_h = __float2half_rn(limit);
+  const half neg_limit_h = __float2half_rn(-limit);
+  const float g = __hlt(gate_h, limit_h) ? gate : (gate != gate ? gate : limit);
+  const float neg_g = ptx_sub(0.f, g);
+  const float scaled = ptx_mul(neg_g, __uint_as_float(0x3FB8AA3Bu));  // log2(e)
+  const float denominator = ptx_add(ptx_ex2(scaled), 1.f);
+  const float silu = ptx_mul(g, ptx_div_full(1.f, denominator));
+  const float lower = __hgt(up_h, neg_limit_h) ? up : (up != up ? up : -limit);
+  const float u = (lower < limit) ? lower : (lower != lower ? lower : limit);
+  return __float2half_rn(ptx_mul(silu, u));
+}
+
+// Called by every thread of every CTA of the W2 launch, empty groups included:
+// the counter of a column block expects gridDim.y arrivals. The last arrival
+// owns the block's 64 columns of every token. Counters return to zero by
+// themselves, so the same buffer serves the next launch (one stream at a time).
+__device__ __forceinline__ void reduce_epilogue(const MoeEpilogue& epi,
+                                                const half* __restrict__ y_slots,
+                                                int N, int topk) {
+  __shared__ int last_arrival;
+  __threadfence();  // this thread's stores to y_slots are visible device-wide
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int* counter = epi.reduce_counters + blockIdx.x;
+    const int arrived = atomicAdd(counter, 1);
+    last_arrival = arrived == (int)gridDim.y - 1;
+    if (last_arrival) *counter = 0;
+  }
+  __syncthreads();
+  if (!last_arrival) return;
+  __threadfence();
+  const unsigned short* rows = reinterpret_cast<const unsigned short*>(y_slots);
+  for (int idx = threadIdx.x; idx < epi.num_tokens * 64; idx += blockDim.x) {
+    const int token = idx >> 6, col = blockIdx.x * 64 + (idx & 63);
+    float acc = 0.f;
+    for (int slot = 0; slot < topk; slot++) {
+      const int route = token * topk + slot;
+      // Rows written by other CTAs of this launch: read through L2 (no L1 hit).
+      const float value =
+          __half2float(__ushort_as_half(__ldcg(rows + (size_t)route * N + col)));
+      acc = __fmaf_rn(__ldg(epi.reduce_weights + route), value, acc);
+    }
+    epi.reduce_out[(size_t)token * N + col] = __float2half_rn(acc);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -265,12 +377,15 @@ __global__ void __launch_bounds__(
                          const int* __restrict__ perm,
                          const int* __restrict__ gids,
                          const int* __restrict__ goff, int N, int K, int topk,
-                         int x_slot_major) {
+                         int x_slot_major, const MoeEpilogue epi) {
   static_assert(SBITS == 0 || SBITS == 5 || SBITS == 6,
                 "packed scales are five or six bits");
   static_assert(SBITS == 0 || SCALE_MODE == SCALE_NVFP4_FP8_16,
                 "packed scales carry fp8-e4m3 bytes");
   constexpr bool PACKED = SBITS != 0;
+  // The epilogues above exist for the decode instances (one 8-row tile, two
+  // column tiles); the prefill instances compile without them.
+  constexpr bool kFusedEpilogues = RB == 1 && NT == 2;
   constexpr int HW = PACKED ? kHighWords<SBITS> : 1;
   constexpr int MMAX = 8;
   constexpr int ROWS = RB * MMAX;
@@ -296,16 +411,25 @@ __global__ void __launch_bounds__(
   const int grp = blockIdx.y;
   const int beg = goff[grp];
   const int cnt = goff[grp + 1] - beg;
-  if (cnt <= 0) return;  // block-uniform: padding group, no weight read
+  if (cnt <= 0) {  // block-uniform: padding group, no weight read
+    if constexpr (kFusedEpilogues) {
+      if (epi.mode == EPILOGUE_REDUCE) reduce_epilogue(epi, y_slots, N, topk);
+    }
+    return;
+  }
   const int e = gids[grp];
 
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int tile0 = blockIdx.x * NT;
+  // SWIGLU: tile nt of the CTA is the gate tile (nt = 0) or its up tile
+  // (nt = 1), N / 64 tiles apart; otherwise NT adjacent tiles.
+  const bool paired = kFusedEpilogues && epi.mode == EPILOGUE_SWIGLU;
+  const int tile_step = paired ? (N >> 6) : 1;
+  const int tile0 = paired ? blockIdx.x : blockIdx.x * NT;
   const int qp = (lane >> 2) & 3;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int G = K >> 4, Gq = G / SPLITK;
   const int g0 = warp * Gq;
-  // Tile nt of the CTA starts nt * G * 32 codes / nt * SG * 32 scales on.
+  // Tile nt of the CTA starts nt * tile_step * G * 32 codes / SG * 32 scales on.
   const uint2* cb = reinterpret_cast<const uint2*>(qcodes) +
                     ((size_t)e * (N >> 5) + tile0) * G * 32 + lane;
   // MXFP4 keeps one scale per 32 codes, so its table is half as long.
@@ -319,7 +443,7 @@ __global__ void __launch_bounds__(
   if constexpr (PACKED) {
 #pragma unroll
     for (int nt = 0; nt < NT; nt++) {
-      const size_t tile_packed = (size_t)e * (N >> 5) + tile0 + nt;
+      const size_t tile_packed = (size_t)e * (N >> 5) + tile0 + nt * tile_step;
       packed_base[nt] = __ldg(packed.base + tile_packed * 32 + lane);
       packed_nib[nt] = packed.nib + tile_packed * (G >> 1) * 32 + lane;
       packed_hi[nt] = packed.hi + tile_packed * G * HW;
@@ -371,14 +495,14 @@ __global__ void __launch_bounds__(
       auto load_group = [&](int slot, int g) {
 #pragma unroll
         for (int nt = 0; nt < NT; nt++) {
-          qv[slot][nt] = __ldcs(cb + ((size_t)nt * G + g) * 32);
+          qv[slot][nt] = __ldcs(cb + ((size_t)nt * tile_step * G + g) * 32);
           if constexpr (PACKED) {
             sv[slot][nt] = __ldg(packed_nib[nt] + (size_t)(g >> 1) * 32);
             load_high_words<SBITS>(packed_hi[nt] + g * HW, hv[slot][nt],
                                    hv2[slot][nt]);
           } else {
             sv[slot][nt] = group_scale_byte<SCALE_MODE>(
-                sb + (size_t)nt * SG * 32, g);
+                sb + (size_t)nt * tile_step * SG * 32, g);
           }
         }
         av0[slot] = make_uint4(0, 0, 0, 0);
@@ -449,14 +573,14 @@ __global__ void __launch_bounds__(
           if (gi > 0 && gc + gi >= gend) break;
 #pragma unroll
           for (int nt = 0; nt < NT; nt++) {
-            qv[gi][nt] = __ldcs(cb + ((size_t)nt * G + gc + gi) * 32);
+            qv[gi][nt] = __ldcs(cb + ((size_t)nt * tile_step * G + gc + gi) * 32);
             if constexpr (PACKED) {
               sv[gi][nt] = __ldg(packed_nib[nt] + (size_t)((gc + gi) >> 1) * 32);
               load_high_words<SBITS>(packed_hi[nt] + (gc + gi) * HW, hv[gi][nt],
                                      hv2[gi][nt]);
             } else {
               sv[gi][nt] = group_scale_byte<SCALE_MODE>(
-                  sb + (size_t)nt * SG * 32, gc + gi);
+                  sb + (size_t)nt * tile_step * SG * 32, gc + gi);
             }
           }
         }
@@ -543,17 +667,42 @@ __global__ void __launch_bounds__(
           cs[warp][nt][row * 32 + qp * 8 + col] = c[nt][bl][i];
         }
       __syncthreads();
-      for (int t = threadIdx.x; t < NT * 256; t += blockDim.x) {
-        const int nt = t >> 8, e2 = t & 255;
-        float v = 0.f;
+      if (paired) {
+        if constexpr (kFusedEpilogues) {
+          // Gate (nt = 0) and up (nt = 1) of one element meet in one thread,
+          // each summed over the warps in the plain epilogue's order and
+          // rounded to fp16 as the stored y13 would be.
+          for (int e2 = threadIdx.x; e2 < 256; e2 += blockDim.x) {
+            float gate = 0.f, up = 0.f;
 #pragma unroll
-        for (int w = 0; w < SPLITK; w++) v += cs[w][nt][e2];
-        const int row = bl * MMAX + (e2 >> 5), col = e2 & 31;
-        if (row < rows)
-          y_slots[(size_t)slots[row] * N + (size_t)(tile0 + nt) * 32 + col] =
-              __float2half(v);
+            for (int w = 0; w < SPLITK; w++) {
+              gate += cs[w][0][e2];
+              up += cs[w][1][e2];
+            }
+            const int row = e2 >> 5, col = e2 & 31;
+            if (row < rows)
+              y_slots[(size_t)slots[row] * epi.out_stride +
+                      (size_t)tile0 * 32 + col] =
+                  swiglu_clamp_silu_mul(__float2half(gate), __float2half(up),
+                                        epi.swiglu_limit);
+          }
+        }
+      } else {
+        for (int t = threadIdx.x; t < NT * 256; t += blockDim.x) {
+          const int nt = t >> 8, e2 = t & 255;
+          float v = 0.f;
+#pragma unroll
+          for (int w = 0; w < SPLITK; w++) v += cs[w][nt][e2];
+          const int row = bl * MMAX + (e2 >> 5), col = e2 & 31;
+          if (row < rows)
+            y_slots[(size_t)slots[row] * N + (size_t)(tile0 + nt) * 32 + col] =
+                __float2half(v);
+        }
       }
     }
+  }
+  if constexpr (kFusedEpilogues) {
+    if (epi.mode == EPILOGUE_REDUCE) reduce_epilogue(epi, y_slots, N, topk);
   }
 }
 
@@ -603,12 +752,15 @@ __global__ void __launch_bounds__(
     const half* __restrict__ x,
     half* __restrict__ y_slots, const int* __restrict__ perm,
     const int* __restrict__ gids, const int* __restrict__ goff, int N, int K,
-    int topk, int x_slot_major) {
+    int topk, int x_slot_major, const MoeEpilogue epi) {
   static_assert(SBITS == 0 || SBITS == 5 || SBITS == 6,
                 "packed scales are five or six bits");
   static_assert(SBITS == 0 || SCALE_MODE == SCALE_NVFP4_FP8_16,
                 "packed scales carry fp8-e4m3 bytes");
   constexpr bool PACKED = SBITS != 0;
+  // The epilogues above exist for the decode instances (one 8-row tile, two
+  // column tiles); the prefill instances compile without them.
+  constexpr bool kFusedEpilogues = RB == 1 && NT == 2;
   constexpr int HW = PACKED ? kHighWords<SBITS> : 1;
   constexpr int ROWS = RB * 8;
   // 36-float rows put the C fragment stores of a warp into 32 distinct banks.
@@ -620,11 +772,20 @@ __global__ void __launch_bounds__(
   const int grp = blockIdx.y;
   const int beg = goff[grp];
   const int cnt = goff[grp + 1] - beg;
-  if (cnt <= 0) return;  // block-uniform: padding group, no weight read
+  if (cnt <= 0) {  // block-uniform: padding group, no weight read
+    if constexpr (kFusedEpilogues) {
+      if (epi.mode == EPILOGUE_REDUCE) reduce_epilogue(epi, y_slots, N, topk);
+    }
+    return;
+  }
   const int e = gids[grp];
 
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int tile0 = blockIdx.x * NT;
+  // SWIGLU: tile nt of the CTA is the gate tile (nt = 0) or its up tile
+  // (nt = 1), N / 64 tiles apart; otherwise NT adjacent tiles.
+  const bool paired = kFusedEpilogues && epi.mode == EPILOGUE_SWIGLU;
+  const int tile_step = paired ? (N >> 6) : 1;
+  const int tile0 = paired ? blockIdx.x : blockIdx.x * NT;
   const int row_group = lane >> 2;
   const int k_offset = (lane & 3) * 4;
   const int G = K >> 4, Gq = G / SPLITK;
@@ -645,7 +806,7 @@ __global__ void __launch_bounds__(
   if constexpr (PACKED) {
 #pragma unroll
     for (int nt = 0; nt < NT; nt++) {
-      const size_t tile_packed = (size_t)e * (N >> 5) + tile0 + nt;
+      const size_t tile_packed = (size_t)e * (N >> 5) + tile0 + nt * tile_step;
       base4[nt] =
           __ldg(reinterpret_cast<const uint32_t*>(packed.base + tile_packed * 32) +
                 row_group);
@@ -687,13 +848,13 @@ __global__ void __launch_bounds__(
     auto load_group = [&](int g) {
 #pragma unroll
       for (int nt = 0; nt < NT; nt++) {
-        q_next[nt] = __ldcs(cb + ((size_t)nt * G + g) * 32);
+        q_next[nt] = __ldcs(cb + ((size_t)nt * tile_step * G + g) * 32);
         if constexpr (PACKED) {
           nib_next[nt] = __ldg(nib_ptr[nt] + (size_t)(g >> 1) * 8);
           load_high_words<SBITS>(hi_ptr[nt] + g * HW, hi_next[nt], hi2_next[nt]);
         } else {
           s_next[nt] =
-              __ldg(sb + ((size_t)nt * SG +
+              __ldg(sb + ((size_t)nt * tile_step * SG +
                           (SCALE_MODE == SCALE_MXFP4_E8M0_32 ? g >> 1 : g)) *
                              8);
         }
@@ -765,18 +926,41 @@ __global__ void __launch_bounds__(
             cs[warp][nt][row * CS_ROW + col] = c[nt][bl][t][i];
           }
       __syncthreads();
-      for (int idx = threadIdx.x; idx < NT * 256; idx += blockDim.x) {
-        const int nt = idx >> 8, row = (idx >> 5) & 7, col = idx & 31;
-        float v = 0.f;
+      if (paired) {
+        if constexpr (kFusedEpilogues) {
+          // See the m8n8k4 kernel: gate (nt = 0) and up (nt = 1) per element.
+          for (int idx = threadIdx.x; idx < 256; idx += blockDim.x) {
+            const int row = idx >> 5, col = idx & 31;
+            float gate = 0.f, up = 0.f;
 #pragma unroll
-        for (int split = 0; split < SPLITK; split++)
-          v += cs[split][nt][row * CS_ROW + col];
-        const int out_row = bl * 8 + row;
-        if (out_row < rows)
-          y_slots[(size_t)slots[out_row] * N + (size_t)(tile0 + nt) * 32 +
-                  col] = __float2half(v);
+            for (int split = 0; split < SPLITK; split++) {
+              gate += cs[split][0][row * CS_ROW + col];
+              up += cs[split][1][row * CS_ROW + col];
+            }
+            if (row < rows)
+              y_slots[(size_t)slots[row] * epi.out_stride +
+                      (size_t)tile0 * 32 + col] =
+                  swiglu_clamp_silu_mul(__float2half(gate), __float2half(up),
+                                        epi.swiglu_limit);
+          }
+        }
+      } else {
+        for (int idx = threadIdx.x; idx < NT * 256; idx += blockDim.x) {
+          const int nt = idx >> 8, row = (idx >> 5) & 7, col = idx & 31;
+          float v = 0.f;
+#pragma unroll
+          for (int split = 0; split < SPLITK; split++)
+            v += cs[split][nt][row * CS_ROW + col];
+          const int out_row = bl * 8 + row;
+          if (out_row < rows)
+            y_slots[(size_t)slots[out_row] * N + (size_t)(tile0 + nt) * 32 +
+                    col] = __float2half(v);
+        }
       }
     }
+  }
+  if constexpr (kFusedEpilogues) {
+    if (epi.mode == EPILOGUE_REDUCE) reduce_epilogue(epi, y_slots, N, topk);
   }
 }
 
@@ -828,7 +1012,11 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
                          int64_t fragment_order,
                          std::optional<torch::Tensor> packed_base,
                          std::optional<torch::Tensor> packed_nib,
-                         std::optional<torch::Tensor> packed_hi) {
+                         std::optional<torch::Tensor> packed_hi, int64_t epilogue,
+                         double swiglu_limit,
+                         std::optional<torch::Tensor> reduce_weights,
+                         std::optional<torch::Tensor> reduce_out,
+                         std::optional<torch::Tensor> reduce_counters) {
   TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kHalf && x.is_contiguous());
   const c10::cuda::CUDAGuard device_guard(x.device());
   TORCH_CHECK(fragment_order == ORDER_M8N8K4 || fragment_order == ORDER_M16N8K8,
@@ -865,7 +1053,9 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
   TORCH_CHECK(y_slots.is_cuda() && y_slots.dtype() == torch::kHalf &&
               y_slots.is_contiguous());
   const int64_t T = num_tokens, K = x.size(1);
-  const int64_t E = gscales.size(0), N = y_slots.size(1);
+  // The SWIGLU epilogue stores the activation, half as wide as the projection.
+  const int64_t E = gscales.size(0),
+                N = y_slots.size(1) * (epilogue == EPILOGUE_SWIGLU ? 2 : 1);
   const int64_t S = T * topk;
   TORCH_CHECK(x.size(0) == (x_slot_major ? S : T), "x rows mismatch");
   TORCH_CHECK(qcodes.numel() == E * N * (K >> 1), "qpn codes size");
@@ -880,6 +1070,8 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
   TORCH_CHECK(gids.size(0) == S && goff.size(0) == S + 1,
               "compact routing size");
   TORCH_CHECK(perm.size(0) == S && y_slots.size(0) == S);
+  TORCH_CHECK(epilogue >= EPILOGUE_STORE && epilogue <= EPILOGUE_REDUCE,
+              "epilogue 0 (store), 1 (swiglu) or 2 (weighted reduce)");
   TORCH_CHECK(S <= 65535, "grouped qpn MoE: tokens * topk = ", S,
               " exceeds the CUDA grid y limit");
   TORCH_CHECK(K % 64 == 0 && (K / 16) % splitk == 0,
@@ -895,6 +1087,49 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
   auto stream = at::cuda::getCurrentCUDAStream();
   // Experts average more than one 8-row tile in prefill chunks.
   const bool prefill = (S + E - 1) / E > 8;
+
+  // Fused epilogues (see MoeEpilogue) belong to the decode instances; the
+  // stored width of the output tells the plain and the SwiGLU launch apart.
+  MoeEpilogue epi{};
+  epi.mode = (int)epilogue;
+  epi.out_stride = (int)N;
+  if (epilogue != EPILOGUE_STORE) {
+    TORCH_CHECK(!prefill, "fused epilogues are decode-only (at most 8 slots "
+                          "per expert), got ", S, " slots for ", E, " experts");
+  }
+  if (epilogue == EPILOGUE_SWIGLU) {
+    TORCH_CHECK(N % 64 == 0, "swiglu epilogue needs N % 64");
+    TORCH_CHECK(std::isfinite(swiglu_limit) && swiglu_limit > 0.0,
+                "swiglu epilogue needs a positive clamp limit");
+    epi.out_stride = (int)(N / 2);
+    epi.swiglu_limit = (float)swiglu_limit;
+  } else if (epilogue == EPILOGUE_REDUCE) {
+    TORCH_CHECK(reduce_weights.has_value() && reduce_out.has_value() &&
+                    reduce_counters.has_value(),
+                "reduce epilogue needs weights, output and counters");
+    TORCH_CHECK(reduce_weights->is_cuda() &&
+                    reduce_weights->dtype() == torch::kFloat &&
+                    reduce_weights->is_contiguous() &&
+                    reduce_weights->dim() == 2 &&
+                    reduce_weights->size(0) == T &&
+                    reduce_weights->size(1) == topk,
+                "reduce weights: float32 [num_tokens, topk]");
+    TORCH_CHECK(reduce_out->is_cuda() && reduce_out->dtype() == torch::kHalf &&
+                    reduce_out->is_contiguous() && reduce_out->dim() == 2 &&
+                    reduce_out->size(0) == T && reduce_out->size(1) == N &&
+                    reduce_out->device() == x.device(),
+                "reduce output: float16 [num_tokens, N]");
+    TORCH_CHECK(N % 64 == 0 && reduce_counters->is_cuda() &&
+                    reduce_counters->dtype() == torch::kInt &&
+                    reduce_counters->is_contiguous() &&
+                    reduce_counters->numel() >= N / 64 &&
+                    reduce_counters->device() == x.device(),
+                "reduce counters: int32, at least N / 64 entries");
+    epi.num_tokens = (int)T;
+    epi.reduce_weights = reduce_weights->data_ptr<float>();
+    epi.reduce_out = reinterpret_cast<half*>(reduce_out->data_ptr<at::Half>());
+    epi.reduce_counters = reduce_counters->data_ptr<int>();
+  }
 
   // Packed scale planes replace the raster the kernels read; they decode the
   // planes in place, in decode and in prefill. The width (5 or 6 bits) is the
@@ -940,7 +1175,7 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
           reinterpret_cast<const half*>(x.data_ptr<at::Half>()),            \
           reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),            \
           perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
-          (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
+          (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0, epi)
 
     // Packed scales: the kernel decodes them from the planes.
 #define LAUNCH_MOE_M16N8K8_PACKED(SPv, RBv, SBv)                            \
@@ -951,7 +1186,7 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
           reinterpret_cast<const half*>(x.data_ptr<at::Half>()),            \
           reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),            \
           perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
-          (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
+          (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0, epi)
 
 #define LAUNCH_MOE_M16N8K8_BITS(SPv, RBv)         \
   do {                                            \
@@ -1017,7 +1252,7 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
           reinterpret_cast<const half*>(x.data_ptr<at::Half>()),            \
           reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),            \
           perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
-          (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
+          (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0, epi)
 
 #define LAUNCH_MOE_QPN_PACKED(SPv, RBv, SBv)                                \
   skinny_nvfp4_moe_qpn<SPv, SCALE_NVFP4_FP8_16, RBv, kColumnTiles, SBv>     \
@@ -1027,7 +1262,7 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
           reinterpret_cast<const half*>(x.data_ptr<at::Half>()),            \
           reinterpret_cast<half*>(y_slots.data_ptr<at::Half>()),            \
           perm.data_ptr<int>(), gids.data_ptr<int>(), goff.data_ptr<int>(), \
-          (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0)
+          (int)N, (int)K, (int)topk, x_slot_major ? 1 : 0, epi)
 
 #define LAUNCH_MOE_QPN_BITS(SPv, RBv)         \
   do {                                        \

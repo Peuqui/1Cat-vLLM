@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Skinny QPN MoE (moe_backend="sm70_skinny") for NVFP4 and MXFP4."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,6 +12,10 @@ from torch import nn
 
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe import (
+    _EPILOGUE_REDUCE,
+    _EPILOGUE_SWIGLU,
+    _FUSED_EPILOGUE_MAX_SLOTS_PER_EXPERT,
+    _FUSED_REDUCE_MAX_TOKENS,
     Mxfp4SkinnySm70Experts,
     Nvfp4SkinnySm70Experts,
     QpnFragmentOrder,
@@ -31,6 +36,8 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     NvFp4MoeBackend,
     map_nvfp4_backend,
 )
+from vllm.model_executor.layers.fused_moe.sm70.reduction import _mtp_weighted_reduce
+from vllm.model_executor.layers.fused_moe.sm70.routing import group_routing
 from vllm.model_executor.layers.quantization.utils.csf32_expand import (
     CsfExpertScales,
 )
@@ -803,6 +810,7 @@ def _skinny_experts(device, order, w13, s13, w2, s2, g1, g2):
         g2_t=g2.to(device),
         w1_scales_u8=s13,
         w2_scales_u8=s2,
+        reduce_counters=torch.zeros(w2.size(1) // 64, dtype=torch.int32, device=device),
     )
     return experts
 
@@ -1080,3 +1088,262 @@ def test_csf_experts_give_the_same_output_as_five_bit_planes(
     assert caches.w1_scales_u8.numel() == 0
     assert (caches.w2_scales_u8.numel() == 0) == fits
     assert served.quant_config._w1.scale.numel() == 0
+
+
+# ---------------------------------------------------------------------------
+# Fused epilogues: the W13 projection stores the SwiGLU activation, the W2
+# projection reduces the routed rows into the output (decode only)
+# ---------------------------------------------------------------------------
+
+_KERNEL_SOURCE = (
+    Path(__file__).parents[3] / "csrc/sm70_turbomind/ops/skinny_moe_qpn_sm70.cu"
+)
+
+
+def _bare_experts(clamp_limit):
+    experts = Nvfp4SkinnySm70Experts.__new__(Nvfp4SkinnySm70Experts)
+    experts.quant_config = SimpleNamespace(gemm1_clamp_limit=clamp_limit)
+    return experts
+
+
+@pytest.mark.parametrize(
+    ("activation", "limit", "decode", "expected"),
+    [
+        (MoEActivation.SILU, 10.0, True, 10.0),
+        (MoEActivation.SILU, 0.1, True, 0.1),
+        (MoEActivation.SILU, None, True, None),  # silu_and_mul: other arithmetic
+        (MoEActivation.SILU, 0.0, True, None),  # limit 0 clamps nothing
+        (MoEActivation.SILU, 10.0, False, None),  # prefill: no fused epilogue
+        (MoEActivation.GELU, 10.0, True, None),
+        (MoEActivation.SWIGLUOAI, 10.0, True, None),
+    ],
+)
+def test_swiglu_epilogue_is_chosen_only_where_it_reproduces_the_activation(
+    activation, limit, decode, expected
+):
+    assert _bare_experts(limit)._fused_swiglu_limit(activation, decode) == expected
+
+
+def test_decode_bound_of_the_fused_epilogues_is_the_kernels_prefill_switch():
+    # The host picks fused epilogues with the rule the operator enforces
+    # (`prefill` in skinny_moe_qpn_sm70); a drifting copy would either trip the
+    # operator's check or leave decode on the slow path.
+    assert _FUSED_EPILOGUE_MAX_SLOTS_PER_EXPERT == 8
+    assert "(S + E - 1) / E > 8" in _KERNEL_SOURCE.read_text()
+    assert _FUSED_REDUCE_MAX_TOKENS >= 8  # a verify round of 1 + 7 draft tokens
+
+
+def test_scale_caches_carry_zeroed_reduce_counters_for_every_column_block():
+    experts = Nvfp4SkinnySm70Experts.__new__(Nvfp4SkinnySm70Experts)
+    g = torch.ones(4)
+    experts.quant_config = SimpleNamespace(g1_alphas=g, g2_alphas=g)
+    experts.moe_config = SimpleNamespace(hidden_dim=256)
+    experts._w1_block_scales = torch.zeros(4, 8, dtype=torch.uint8)
+    experts._w2_block_scales = torch.zeros(4, 8, dtype=torch.uint8)
+    experts._scale_caches = None
+    counters = experts._get_scale_caches().reduce_counters
+    assert counters.dtype == torch.int32
+    assert counters.tolist() == [0, 0, 0, 0]  # hidden 256 / 64 columns per CTA
+
+
+def _decode_layer(device, order, generator, limit, hidden=256, intermediate=128):
+    num_experts = 8
+    w13, s13, w2, s2, g1, g2 = _nvfp4_moe(generator, num_experts, hidden, intermediate)
+    w13_d, s13_d, w2_d, s2_d = (t.to(device) for t in (w13, s13, w2, s2))
+    for e in range(num_experts):
+        for w, s in ((w13_d, s13_d), (w2_d, s2_d)):
+            qc, qs = qpn_prepack(w[e], s[e], 16, order)
+            w[e].view(-1).copy_(qc)
+            s[e].view(-1).copy_(qs)
+    experts = _skinny_experts(device, order, w13_d, s13_d, w2_d, s2_d, g1, g2)
+    experts.quant_config.gemm1_clamp_limit = limit
+    return experts, w13_d, w2_d
+
+
+def _round(generator, device, num_tokens, hidden, top_k=3, num_experts=8):
+    # Large activations so that the clamp is active for the small limits.
+    x = (torch.randn(num_tokens, hidden, generator=generator) * 2.0).to(torch.float16)
+    ids = torch.stack(
+        [torch.randperm(num_experts, generator=generator)[:top_k] for _ in x]
+    ).to(torch.int32)
+    weights = torch.rand(num_tokens, top_k, generator=generator)
+    return x.to(device), ids.to(device), weights.to(device)
+
+
+def _unfused_layer(experts, w1, w2, x, weights, ids):
+    """The separate kernels the fused epilogues replace, in the old order."""
+    scales = experts._get_scale_caches()
+    num_tokens, top_k = ids.shape
+    perm, gids, goff = group_routing(ids)
+    slots = ids.numel()
+    y13 = torch.empty(slots, w1.size(1), dtype=x.dtype, device=x.device)
+    experts._grouped_projection(
+        x, w1, scales.w1_scales_u8, scales.g1_t, perm, gids, goff, top_k, y13,
+        False, num_tokens, None,
+    )  # fmt: skip
+    inter = torch.empty(slots, w1.size(1) // 2, dtype=x.dtype, device=x.device)
+    experts.activation(MoEActivation.SILU, inter, y13)
+    y2 = torch.empty(slots, w2.size(1), dtype=x.dtype, device=x.device)
+    experts._grouped_projection(
+        inter, w2, scales.w2_scales_u8, scales.g2_t, perm, gids, goff, top_k, y2,
+        True, num_tokens, None,
+    )  # fmt: skip
+    output = torch.empty(num_tokens, w2.size(1), dtype=x.dtype, device=x.device)
+    _mtp_weighted_reduce(y2, weights, output)
+    return y13, inter, y2, output
+
+
+# 0.1 is not exact in fp16: the clamp compares against its fp16 rounding.
+@pytest.mark.parametrize("limit", [0.05, 0.1, 0.3, 10.0])
+@pytest.mark.parametrize("num_tokens", [1, 5, 8])
+@pytest.mark.parametrize(("hidden", "intermediate"), [(256, 128), (1024, 512)])
+def test_swiglu_epilogue_stores_the_bytes_the_separate_activation_wrote(
+    device, order, num_tokens, limit, hidden, intermediate
+):
+    generator = torch.Generator().manual_seed(21)
+    experts, w1, w2 = _decode_layer(
+        device, order, generator, limit, hidden, intermediate
+    )
+    x, ids, weights = _round(generator, device, num_tokens, hidden)
+    y13_ref, inter_ref, _, _ = _unfused_layer(experts, w1, w2, x, weights, ids)
+
+    scales = experts._get_scale_caches()
+    perm, gids, goff = group_routing(ids)
+    inter = torch.full_like(inter_ref, float("nan"))
+    experts._grouped_projection(
+        x, w1, scales.w1_scales_u8, scales.g1_t, perm, gids, goff, ids.size(1),
+        inter, False, num_tokens, None,
+        epilogue=_EPILOGUE_SWIGLU, swiglu_limit=limit,
+    )  # fmt: skip
+    # Every slot is written, so no NaN marker may survive; compare the bytes.
+    assert torch.equal(inter.view(torch.int16), inter_ref.view(torch.int16))
+    if limit <= 0.3:
+        # The clamp must bite, or the test could not tell the clamp apart.
+        assert (y13_ref[:, : inter.size(1)].float() > limit).any()
+
+
+@pytest.mark.parametrize("num_tokens", [1, 5, 8, 16])
+@pytest.mark.parametrize(("hidden", "intermediate"), [(256, 128), (1024, 512)])
+def test_reduce_epilogue_writes_the_bytes_the_triton_reduction_wrote(
+    device, order, num_tokens, hidden, intermediate
+):
+    generator = torch.Generator().manual_seed(22)
+    experts, w1, w2 = _decode_layer(
+        device, order, generator, 10.0, hidden, intermediate
+    )
+    x, ids, weights = _round(generator, device, num_tokens, hidden)
+    _, inter, y2_ref, output_ref = _unfused_layer(experts, w1, w2, x, weights, ids)
+
+    scales = experts._get_scale_caches()
+    perm, gids, goff = group_routing(ids)
+    for launch in range(2):  # the counters must be zero again for the next launch
+        y2 = torch.empty_like(y2_ref)
+        output = torch.full_like(output_ref, float("nan"))
+        experts._grouped_projection(
+            inter, w2, scales.w2_scales_u8, scales.g2_t, perm, gids, goff,
+            ids.size(1), y2, True, num_tokens, None,
+            epilogue=_EPILOGUE_REDUCE, reduce_weights=weights, reduce_out=output,
+            reduce_counters=scales.reduce_counters,
+        )  # fmt: skip
+        assert torch.equal(y2.view(torch.int16), y2_ref.view(torch.int16))
+        assert torch.equal(output.view(torch.int16), output_ref.view(torch.int16))
+        assert not scales.reduce_counters.any(), f"launch {launch}"
+
+
+@pytest.mark.parametrize("limit", [0.3, 10.0])
+@pytest.mark.parametrize("num_tokens", [1, 5, 16])
+def test_decode_layer_runs_on_the_fused_epilogues_and_equals_the_separate_kernels(
+    device, order, monkeypatch, num_tokens, limit
+):
+    generator = torch.Generator().manual_seed(23)
+    experts, w1, w2 = _decode_layer(device, order, generator, limit)
+    x, ids, weights = _round(generator, device, num_tokens, 256)
+    _, _, _, output_ref = _unfused_layer(experts, w1, w2, x, weights, ids)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a decode layer must not launch the separate kernel")
+
+    monkeypatch.setattr(experts, "activation", forbidden)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.fused_moe.experts.skinny_sm70_moe."
+        "_mtp_weighted_reduce",
+        forbidden,
+    )
+    output = torch.empty_like(output_ref)
+    experts._apply_grouped(
+        output=output,
+        hidden_states=x,
+        w1=w1,
+        w2=w2,
+        topk_weights=weights,
+        topk_ids=ids,
+        activation=MoEActivation.SILU,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+    )
+    assert torch.equal(output.view(torch.int16), output_ref.view(torch.int16))
+
+
+def test_prefill_layer_keeps_the_separate_kernels_and_their_bytes(
+    device, order, monkeypatch
+):
+    # 40 tokens x top-3 = 120 slots on 8 experts: 15 per expert, over the
+    # operator's decode bound, so the fused epilogues are not eligible.
+    generator = torch.Generator().manual_seed(24)
+    experts, w1, w2 = _decode_layer(device, order, generator, 0.3)
+    x, ids, weights = _round(generator, device, 40, 256)
+    _, _, _, output_ref = _unfused_layer(experts, w1, w2, x, weights, ids)
+    calls = []
+    original = experts.activation
+    monkeypatch.setattr(
+        experts, "activation", lambda *a: (calls.append(1), original(*a))[1]
+    )
+    output = torch.empty_like(output_ref)
+    experts._apply_grouped(
+        output=output,
+        hidden_states=x,
+        w1=w1,
+        w2=w2,
+        topk_weights=weights,
+        topk_ids=ids,
+        activation=MoEActivation.SILU,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+    )
+    assert calls == [1]
+    assert torch.equal(output.view(torch.int16), output_ref.view(torch.int16))
+
+
+def test_fused_epilogues_reject_what_the_kernel_cannot_do(device, order):
+    generator = torch.Generator().manual_seed(25)
+    experts, w1, w2 = _decode_layer(device, order, generator, 0.3)
+    scales = experts._get_scale_caches()
+    x, ids, weights = _round(generator, device, 5, 256)
+    perm, gids, goff = group_routing(ids)
+    inter = torch.empty(15, 128, dtype=torch.float16, device=device)
+
+    def swiglu(limit):
+        experts._grouped_projection(
+            x, w1, scales.w1_scales_u8, scales.g1_t, perm, gids, goff, 3,
+            inter, False, 5, None, epilogue=_EPILOGUE_SWIGLU, swiglu_limit=limit,
+        )  # fmt: skip
+
+    with pytest.raises(RuntimeError, match="positive clamp limit"):
+        swiglu(0.0)
+    with pytest.raises(RuntimeError, match="positive clamp limit"):
+        swiglu(float("nan"))
+    output = torch.empty(5, 256, dtype=torch.float16, device=device)
+    with pytest.raises(RuntimeError, match="at least N / 64"):
+        experts._grouped_projection(
+            inter, w2, scales.w2_scales_u8, scales.g2_t, perm, gids, goff, 3,
+            torch.empty(15, 256, dtype=torch.float16, device=device), True, 5, None,
+            epilogue=_EPILOGUE_REDUCE, reduce_weights=weights, reduce_out=output,
+            reduce_counters=torch.zeros(3, dtype=torch.int32, device=device),
+        )  # fmt: skip
+    with pytest.raises(RuntimeError, match="float32"):
+        experts._grouped_projection(
+            inter, w2, scales.w2_scales_u8, scales.g2_t, perm, gids, goff, 3,
+            torch.empty(15, 256, dtype=torch.float16, device=device), True, 5, None,
+            epilogue=_EPILOGUE_REDUCE, reduce_weights=weights.half(),
+            reduce_out=output, reduce_counters=scales.reduce_counters,
+        )  # fmt: skip

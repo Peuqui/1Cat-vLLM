@@ -17,6 +17,10 @@ Production path used (nothing rebuilt by hand except where stated):
   ``self.activation``, the W2 ``_grouped_projection`` and
   ``_mtp_weighted_reduce``), called on a harness subclass that only skips
   ``__init__`` (no vLLM layer is built).
+  Decode rounds take its fused epilogues (the W13 projection stores the
+  SwiGLU activation, the W2 projection reduces the routed rows into the
+  output); the split orchestration below keeps the separate activation and
+  reduction kernels, so it is also the unfused reference of the fused path.
 - split mode: the same calls in the same order, one CUDA graph per
   (layer, phase) so the time of route / up / act / down / reduce is read from
   events. The split output is checked byte for byte against the total mode;
@@ -349,6 +353,7 @@ def build_layer(
         g2_t=g2.to(device),
         w1_scales_u8=rasters[0],
         w2_scales_u8=rasters[1],
+        reduce_counters=torch.zeros(hidden // 64, dtype=torch.int32, device=device),
     )
     packed = (packed_sets[0], packed_sets[1])
     harness = _Harness(order, scales, packed, float(text["swiglu_limit"]))
@@ -669,8 +674,12 @@ def run_reference(
     splits: Sequence[SplitLayer],
     ids_per_draw: Sequence[Sequence[np.ndarray]],
     device: torch.device,
-) -> list[list[tuple[torch.Tensor, torch.Tensor]]]:
-    """Eager (y_slots, output) per [draw][layer] of the split orchestration."""
+) -> list[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+    """Eager (y_slots, output, total output) per [draw][layer].
+
+    The first two come from the split orchestration (separate activation and
+    reduction kernels), the third from ``_apply_grouped`` (fused epilogues).
+    """
     result = []
     for ids in ids_per_draw:
         set_routing(layers, ids, device)
@@ -678,7 +687,14 @@ def run_reference(
         for split in splits:
             for phase in PHASES:
                 getattr(split, phase)()
-            row.append((split.y2.clone().cpu(), split.output.clone().cpu()))
+            apply_total(split.layer)
+            row.append(
+                (
+                    split.y2.clone().cpu(),
+                    split.output.clone().cpu(),
+                    split.layer.output.clone().cpu(),
+                )
+            )
         result.append(row)
     return result
 
@@ -709,8 +725,8 @@ def dump_output(path: Path, layers, splits, ids_per_draw, device) -> None:
         "topk_ids": [[ids.copy() for ids in row] for row in ids_per_draw],
         "x": [layer.x.cpu() for layer in layers],
         "topk_weights": [layer.topk_weights.cpu() for layer in layers],
-        "y_slots": [[y for y, _ in row] for row in results],
-        "output": [[out for _, out in row] for row in results],
+        "y_slots": [[y for y, _, _ in row] for row in results],
+        "output": [[out for _, out, _ in row] for row in results],
     }
     torch.save(payload, path)
     print(f"dumped {len(ids_per_draw)} draws x {len(layers)} layers to {path}")
@@ -738,10 +754,15 @@ def compare_output(path: Path, layers, splits, device) -> bool:
             not bytes_equal(results[d][i][1], ref["output"][d][i])
             for d in range(len(results))
         )
-        all_equal &= bad_slots == 0 and bad_out == 0
+        bad_total = sum(
+            not bytes_equal(results[d][i][2], ref["output"][d][i])
+            for d in range(len(results))
+        )
+        all_equal &= bad_slots == 0 and bad_out == 0 and bad_total == 0
         print(
             f"  layer {layer.index}: y_slots differ in {bad_slots}/{len(results)} "
-            f"draws, output in {bad_out}/{len(results)}"
+            f"draws, split output in {bad_out}/{len(results)}, "
+            f"_apply_grouped output in {bad_total}/{len(results)}"
         )
     print("compare: " + ("BYTE-IDENTICAL" if all_equal else "DIFFERENT"))
     return all_equal
