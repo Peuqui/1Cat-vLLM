@@ -11,7 +11,8 @@ wo_a is a grouped matmul, 8 groups of [1024, 4096] block-FP8 rows. Arms:
                      runs on Volta and Turing
   qpn8_dense_bmm     the large-M route of the grouped QPN8 layer forced for every
                      M: the whole weight dequantized into the shared workspace
-                     on each call, then one batched product (FP32 reduction)
+                     on each call, one product per group overlapped with the
+                     next group's dequantization (FP32 reduction)
   turbomind_grouped  the Volta production route (TurboMind one-launch grouped
                      GEMM on FP8); Volta only
 

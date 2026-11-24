@@ -11,6 +11,7 @@
 #include <torch/library.h>
 
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAEvent.h>
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
@@ -20,6 +21,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <mutex>
+#include <vector>
 
 #include "sm70_policy.h"
 #include "activation_pack_sm70.cuh"
@@ -1607,9 +1609,13 @@ void fp8_qpn8_dequantize_sm70_out(torch::Tensor out, torch::Tensor codes,
 
 // Grouped mode (DeepSeek-V4 wo_a): codes [G, K, N], group_scales
 // [G, K / 128, N / 32], input [M, G * K], out [M, G * N], and the workspace
-// holds the whole dequantized weight, G * K * N elements laid out [G, K, N]. One
-// batched product then computes out[:, g] = input[:, g] @ W_g like the
-// dense-weight bmm it replaces. Not combined with gated_silu.
+// holds the whole dequantized weight, G * K * N elements laid out [G, K, N].
+// Dequantizing is bound by memory and the products by tensor-core math, so the
+// groups are pipelined: a side stream dequantizes group g + 1 while the
+// current stream multiplies group g, and only the first group's dequantization
+// stays exposed. The side stream starts after the work already queued on the
+// current stream (the workspace is shared with other layers) and is joined
+// back before the op returns. Not combined with gated_silu.
 void fp8_qpn8_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
                                torch::Tensor input, torch::Tensor codes,
                                torch::Tensor group_scales, bool gated_silu) {
@@ -1637,17 +1643,34 @@ void fp8_qpn8_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
               "fp8_qpn8_prefill_sm70_out: output shape mismatch");
 
   if (grouped) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
     auto dense_weight = torch::from_blob(
         reinterpret_cast<void*>(dense_weight_ptr), {batch, k, n},
         input.options());
-    for (int64_t group = 0; group < batch; ++group) {
-      auto group_weight = dense_weight.select(0, group);
-      fp8_qpn8_dequantize_sm70_out(group_weight, codes.select(0, group),
-                                   group_scales.select(0, group));
+    const auto compute_stream = at::cuda::getCurrentCUDAStream();
+    const auto dequant_stream =
+        at::cuda::getStreamFromPool(false, compute_stream.device_index());
+    at::cuda::CUDAEvent queued;
+    queued.record(compute_stream);
+    queued.block(dequant_stream);
+    std::vector<at::cuda::CUDAEvent> dequantized(batch);
+    {
+      const at::cuda::CUDAStreamGuard stream_guard(dequant_stream);
+      for (int64_t group = 0; group < batch; ++group) {
+        fp8_qpn8_dequantize_sm70_out(dense_weight.select(0, group),
+                                     codes.select(0, group),
+                                     group_scales.select(0, group));
+        dequantized[group].record(dequant_stream);
+      }
     }
-    auto out_by_group = out.view({m, batch, n}).transpose(0, 1);
-    at::bmm_out(out_by_group, input.view({m, batch, k}).transpose(0, 1),
-                dense_weight);
+    auto input_by_group = input.view({m, batch, k});
+    auto out_by_group = out.view({m, batch, n});
+    for (int64_t group = 0; group < batch; ++group) {
+      dequantized[group].block(compute_stream);
+      auto group_out = out_by_group.select(1, group);
+      at::mm_out(group_out, input_by_group.select(1, group),
+                 dense_weight.select(0, group));
+    }
     return;
   }
 

@@ -200,16 +200,19 @@ def test_layer_matches_fp32_reference_on_every_m_branch(shape, rows):
 
 @pytest.mark.parametrize("rows", [129, 256, 600, 1024])
 @torch.no_grad()
-def test_dense_bmm_rows_equal_the_former_einsum_on_the_dequantized_weight(rows):
-    """Above the grouped-launch range the result is the old route's result.
+def test_dense_rows_are_as_accurate_as_the_former_einsum(rows):
+    """Above the grouped-launch range the result is as accurate as the old
+    route's.
 
-    The old route multiplied the FP16-dequantized weight with torch.einsum; the
-    new one dequantizes into the shared workspace and runs one
-    batched product. The decoded weights are identical, so with the worker's
-    matmul policy (fixture) the outputs should agree bit for
-    bit. If cuBLAS picks a different kernel for the transposed operand layout and
-    this fails by a few ulp, compare against the FP32 oracle instead (the layer
-    test above) and record the difference.
+    The old route multiplied the FP16-dequantized weight with torch.einsum (one
+    batched product); the new one dequantizes into the shared workspace and runs
+    one product per group. The decoded weights are identical and the worker's
+    matmul policy (fixture) keeps the reductions in FP32, but cuBLAS may pick a
+    different algorithm for the single products, so the summation order and the
+    last bit can differ (equal at M = 600 and 1024 on a Quadro RTX 8000, not at
+    129 and 256; outputs near zero then differ by many FP16 steps at a tiny
+    absolute error). Against an FP32 oracle the new route is no less accurate
+    than the old one, in the largest and in the mean absolute error.
 
     Old code: the layer holds an FP16 weight and no packed codes.
     """
@@ -226,7 +229,11 @@ def test_dense_bmm_rows_equal_the_former_einsum_on_the_dequantized_weight(rows):
 
     old_weight = (dense.half()).contiguous()  # exact: FP8 * power of two in FP16
     expected = torch.einsum("...gk,grk->...gr", x, old_weight)
-    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+    oracle = torch.einsum("...gk,grk->...gr", x.float(), old_weight.float())
+    new_error = (out.float() - oracle).abs()
+    old_error = (expected.float() - oracle).abs()
+    assert new_error.max() <= old_error.max() * 1.05
+    assert new_error.mean() <= old_error.mean() * 1.05
 
 
 @torch.no_grad()
