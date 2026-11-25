@@ -15,6 +15,7 @@ from tests.kernels.utils import requires_tensor_core_triton
 from vllm.config.kernel import KernelConfig
 from vllm.model_executor.kernels.linear import skinny_fp16_linear as skinny_module
 from vllm.model_executor.kernels.linear.skinny_fp16_linear import (
+    SKINNY_ARCH_RULES,
     SKINNY_FP16_LINEAR_MAX_CHUNKS,
     SKINNY_FP16_LINEAR_MAX_ROWS,
     SKINNY_FP16_LINEAR_MAX_SPLIT_K,
@@ -105,10 +106,13 @@ def test_production_shapes_are_covered_with_a_sound_tile(shape: Shape, card):
     assert 1 <= chunks <= SKINNY_FP16_LINEAR_MAX_CHUNKS
     assert tile.split_k & (tile.split_k - 1) == 0
     assert tile.split_k <= SKINNY_FP16_LINEAR_MAX_SPLIT_K
-    # Every SM gets a program wherever K allows it.
+    # The grid reaches the programs per SM of the weight's class wherever K
+    # allows it (the measured rule asks for 0.5-1 program per SM, not one each).
+    rule = SKINNY_ARCH_RULES[card[0]]
+    shape_class = rule.small if shape.n <= rule.small_n_max else rule.large
     programs = -(-shape.n // tile.block_n) * tile.split_k
     assert (
-        programs >= card[1]
+        programs >= shape_class.ctas_per_sm * card[1]
         or tile.split_k == SKINNY_FP16_LINEAR_MAX_SPLIT_K
         or chunks == 1
     )
@@ -624,7 +628,7 @@ def test_prepare_leaves_a_weight_that_is_not_on_cuda_on_cublas():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the CUDA platform")
 @pytest.mark.parametrize("widen_in_router", [False, True])
 def test_gate_leaves_the_widening_to_the_router_when_asked(
-    default_vllm_config, widen_in_router
+    default_vllm_config, dist_init, widen_in_router
 ):
     gate = GateLinear(
         4096,
