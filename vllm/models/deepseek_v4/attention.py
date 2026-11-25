@@ -41,6 +41,9 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.kernels.linear.skinny_fp16_linear import (
+    skinny_fp16_linear_apply,
+)
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -81,6 +84,21 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+
+def _fp16_linear_float32(
+    hidden_states: torch.Tensor, linear: torch.nn.Module
+) -> torch.Tensor:
+    """``hidden_states @ linear.weight.T`` with an FP32 result, the product the
+    compressors take. The layer's skinny kernel when its load-time decision
+    admitted one (``kernel_config.skinny_fp16_linear``; it keeps cuBLAS for batches
+    above 8 rows), else cuBLAS directly."""
+    tile = getattr(linear, "skinny_tile", None)
+    if tile is not None:
+        return skinny_fp16_linear_apply(
+            hidden_states, linear.weight, None, tile, float32_output=True
+        )
+    return torch.mm(hidden_states, linear.weight.T, out_dtype=torch.float32)
 
 
 @triton.jit
@@ -477,11 +495,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 )
                 if output is not None:
                     return output
-                return torch.mm(
-                    hidden_states,
-                    compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
-                )
+                return _fp16_linear_float32(hidden_states, compressor.fused_wkv_wgate)
 
             aux_fns[0] = compressor_kv_score
 
@@ -518,10 +532,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 )
                 if output is not None:
                     return output
-                return torch.mm(
-                    hidden_states,
-                    indexer.compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
+                return _fp16_linear_float32(
+                    hidden_states, indexer.compressor.fused_wkv_wgate
                 )
 
             aux_fns[1] = indexer_weights_proj

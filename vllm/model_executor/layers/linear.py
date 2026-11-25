@@ -63,6 +63,47 @@ def _maybe_sm70_glm53_tp8_cublaslt(layer, x, bias):
     return state.apply_glm(x, bias)
 
 
+def _prepare_skinny_fp16_linear(layer: torch.nn.Module) -> None:
+    """Decide once, with the loaded weight, whether the layer takes the skinny
+    FP16 kernel (``kernel_config.skinny_fp16_linear``); ``skinny_tile``
+    is the tile, or None for the cuBLAS route. The weight, its device and the
+    config are all settled here and do not change afterwards."""
+    layer.skinny_tile = None
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    weight = layer.weight
+    if vllm_config is None or weight.device.type != "cuda":
+        return
+    if not vllm_config.kernel_config.use_skinny_fp16_linear(weight.device.index):
+        return
+    from vllm.model_executor.kernels.linear.skinny_fp16_linear import (
+        skinny_fp16_linear_device_traits,
+        skinny_fp16_linear_layer_decision,
+    )
+
+    capability, sm_count = skinny_fp16_linear_device_traits(weight.device)
+    decision = skinny_fp16_linear_layer_decision(
+        weight,
+        getattr(layer, "bias", None),
+        torch.float16,
+        capability=capability,
+        sm_count=sm_count,
+    )
+    prefix = getattr(layer, "prefix", "<unknown>")
+    if decision.tile is None:
+        logger.debug("Skinny FP16 linear not used for %s: %s", prefix, decision.reason)
+        return
+    layer.skinny_tile = decision.tile
+    logger.info_once("Skinny FP16 linear enabled for small unquantized layers.")
+    logger.debug(
+        "Skinny FP16 linear for %s: weight %s, tile %s",
+        prefix,
+        tuple(weight.shape),
+        decision.tile,
+    )
+
+
 def _interleave_output_rows_for_gated_silu(weight):
     from vllm.model_executor.kernels.linear.sm70_dense import (
         _interleave_output_rows_for_gated_silu as interleave,
@@ -394,6 +435,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 policy=layer._layer_execution_policy,
             ),
         )
+        _prepare_skinny_fp16_linear(layer)
 
     def supports_direct_output(self, layer: torch.nn.Module) -> bool:
         return bool(getattr(layer, "_direct_output_ready", False))
@@ -453,6 +495,22 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return sm70_out
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
+        skinny_tile = getattr(layer, "skinny_tile", None)
+        if skinny_tile is not None:
+            from vllm.model_executor.kernels.linear.skinny_fp16_linear import (
+                skinny_fp16_linear_apply,
+            )
+            from vllm.model_executor.kernels.linear_io import (
+                flatten_linear_input,
+                restore_linear_output,
+            )
+
+            return restore_linear_output(
+                skinny_fp16_linear_apply(
+                    flatten_linear_input(x), layer.weight, bias, skinny_tile
+                ),
+                x,
+            )
         if layer._layer_trace.unquant_debug and x.dim() >= 2:
             x_2d = x.reshape(-1, x.shape[-1])
             log_fn = (

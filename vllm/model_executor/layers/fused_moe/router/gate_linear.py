@@ -20,6 +20,12 @@ class GateLinear(ReplicatedLinear):
     The ``out_dtype`` attribute is mutable and can be set after init
     (e.g. when the required dtype depends on the expert quantization
     method which is only known later).
+
+    ``widen_in_router`` leaves the widening of Tier 3's narrower product to
+    ``out_dtype`` (FP16 or BF16 to FP32) to the router: its top-k kernel reads the
+    narrow logits and widens them exactly, so the cast kernel and the FP32 copy
+    are not needed. Set it only for a router whose consumers read any float
+    dtype; the single-row GEMV path above it is not affected.
     """
 
     # Dimensions supported by the DSV3 specialized kernel
@@ -34,6 +40,7 @@ class GateLinear(ReplicatedLinear):
         out_dtype: torch.dtype | None = None,
         params_dtype: torch.dtype | None = None,
         force_fp32_compute: bool = False,
+        widen_in_router: bool = False,
         prefix: str = "",
     ):
         is_hopper_or_blackwell = current_platform.is_device_capability(
@@ -57,6 +64,7 @@ class GateLinear(ReplicatedLinear):
             prefix=prefix,
         )
         self.out_dtype = out_dtype
+        self.widen_in_router = widen_in_router
         self._sm70_dsv4_fp13_gemv = True
 
         # DSV3 specialized kernel eligibility (SM90+, exact dims)
@@ -130,6 +138,10 @@ class GateLinear(ReplicatedLinear):
         if self.out_dtype is not None and x.dtype != self.weight.dtype:
             x = x.to(self.weight.dtype)
         output, output_bias = super().forward(x)
-        if self.out_dtype is not None and output.dtype != self.out_dtype:
+        if (
+            self.out_dtype is not None
+            and output.dtype != self.out_dtype
+            and not self.widen_in_router
+        ):
             output = output.to(self.out_dtype)
         return output, output_bias

@@ -952,6 +952,30 @@ class KernelConfig:
             )
         return self.use_triton_sm7x_tensor_cores(device_index)
 
+    skinny_fp16_linear: bool = False
+    """Run unquantized FP16 linear layers (router gates, compressor and indexer
+    projections, small projections of the KDA and indexer blocks) as a Triton
+    tensor-core kernel for at most 8 rows, instead of cuBLAS. The decision is made
+    once per layer when its weights are loaded (weight at most 32 MiB, FP16, K a
+    multiple of 16); other batches keep the cuBLAS call inside the same opaque
+    op. FP32 accumulation like the cuBLAS kernels, but another summation order, so
+    outputs are not bit-identical. Needs ``triton_sm7x_tensor_cores``. Unlike
+    ``mla_kv_b_skinny`` it is part of the compilation hash: the layers run inside
+    compiled graphs, whose content differs."""
+
+    def use_skinny_fp16_linear(self, device_index: int | None = None) -> bool:
+        """Whether the unquantized linear layers on a device may take the skinny
+        kernel. Like the route it builds on, it applies to SM70-family devices
+        only."""
+        if not self.skinny_fp16_linear:
+            return False
+        if not self.triton_sm7x_tensor_cores:
+            raise ValueError(
+                "kernel_config.skinny_fp16_linear needs "
+                "kernel_config.triton_sm7x_tensor_cores"
+            )
+        return self.use_triton_sm7x_tensor_cores(device_index)
+
     sm70_packed_topk_gather: bool = True
     """Gather SM70 TP2/TP4 compact candidates in one lossless message."""
 

@@ -440,17 +440,24 @@ class DeepseekV4MoE(nn.Module):
                 "deep_gemm_mega_moe for this checkpoint."
             )
 
+        is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
         self.gate = GateLinear(
             input_size=config.hidden_size,
             output_size=config.n_routed_experts,
             bias=False,
             out_dtype=torch.float32,
+            # The top-k kernel of the other layers reads FP16 logits and widens
+            # them exactly in registers: same ids and weights, no cast kernel. The
+            # hash layers keep the FP32 copy: their kernel branch sums the selected
+            # scores across threads, and which thread holds which score depends on
+            # the input dtype, so FP16 input could change the last bit of the
+            # weights.
+            widen_in_router=not is_hash_moe,
             prefix=f"{prefix}.gate",
         )
 
         self.gate.e_score_correction_bias = None
         self.gate.tid2eid = None
-        is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
         self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
         if is_hash_moe:
             # hash MoE doesn't use e_score_correction_bias
