@@ -385,6 +385,135 @@ def test_circular_buffer_group_enables_partial_prefix_cache_and_cow():
     assert cm.block_pool.get_num_free_blocks() == free_initial
 
 
+def _kpool_tail_manager(ring_block_size: int):
+    import torch
+
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KpoolTailSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    full = FullAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=4, dtype=torch.float16
+    )
+    # GLM-5.3's indexer keeps its in-progress kpool in one ring per request.
+    tail = KpoolTailSpec(
+        block_size=ring_block_size,
+        num_kv_heads=1,
+        head_size=4,
+        head_size_v=0,
+        dtype=torch.float16,
+        sliding_window=ring_block_size,
+    )
+    mamba = MambaSpec(
+        block_size=128,
+        shapes=((4,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+    )
+    config = KVCacheConfig(
+        64,
+        [],
+        [
+            KVCacheGroupSpec(["mla"], full),
+            KVCacheGroupSpec(["tail"], tail),
+            KVCacheGroupSpec(["kda"], mamba),
+        ],
+    )
+    return KVCacheManager(config, 1024, 128, partial_prefix_cache=True)
+
+
+def _hash_128(req):
+    return [
+        BlockHash(bytes(x % 256 for x in req.all_token_ids[i : i + 128]))
+        for i in range(0, len(req.all_token_ids) // 128 * 128, 128)
+    ]
+
+
+def test_kpool_tail_group_enables_partial_prefix_cache_on_a_fresh_ring():
+    cm = _kpool_tail_manager(16)
+    # Before kpool-tail support the manager warned and kept block-aligned hits.
+    assert cm.partial_cache is not None
+    free_initial = cm.block_pool.get_num_free_blocks()
+
+    r1 = Request(
+        request_id="r1",
+        prompt_token_ids=list(range(100, 180)),
+        sampling_params=SamplingParams(
+            max_tokens=4, extra_args={"prefix_cache_boundaries": [64]}
+        ),
+        pooling_params=None,
+        block_hasher=_hash_128,
+    )
+    cm.new_step_starts()
+    assert cm.partial_prefix_stops(r1, 0, 80) == (64,)
+    assert cm.allocate_slots(r1, 64) is not None
+    r1.num_computed_tokens = 64
+    tail_mgr = cm.coordinator.single_type_managers[1]
+
+    # The snapshot copies the attention block and the recurrent state, not the
+    # ring: at 64 (a multiple of the ring) its in-progress pool is empty.
+    cm.new_step_starts()
+    snap_copies, snap_groups = cm.take_block_copies_with_groups()
+    assert snap_groups == [0, 2]
+    assert len(snap_copies) == 2
+    entry = next(iter(cm.partial_cache.entries.values()))
+    assert entry.length == 64
+    assert entry.blocks[1] == []
+    assert entry.copy_last == [True, False, True]
+
+    assert cm.allocate_slots(r1, 16) is not None
+    r1.num_computed_tokens = 80
+    cm.free(r1)
+
+    cm.new_step_starts()
+    r2 = Request(
+        request_id="r2",
+        prompt_token_ids=list(range(100, 164)) + [200, 201, 202, 203],
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+        block_hasher=_hash_128,
+    )
+    comp_blocks, num_hit = cm.get_computed_blocks(r2)
+    assert num_hit == 64
+    assert comp_blocks.blocks[1] == []
+    assert cm.allocate_slots(r2, 4, num_hit, comp_blocks) is not None
+    cow_copies, cow_groups = cm.take_block_copies_with_groups()
+    assert cow_groups == [0, 2]
+    assert len(cow_copies) == 2
+    # r2 writes its own ring; nothing of the ring comes from the cache entry.
+    assert len(tail_mgr.req_to_blocks["r2"]) == 1
+    assert tail_mgr.req_to_blocks["r2"][0].ref_cnt == 1
+
+    cm.free(r2)
+    for _ in range(4):
+        cm.new_step_starts()
+    cm.reset_prefix_cache()
+    assert cm.block_pool.get_num_free_blocks() == free_initial
+
+
+def test_kpool_tail_ring_rejects_boundaries_inside_its_pool_span():
+    # A boundary that is not a multiple of the ring could leave an incomplete
+    # pool behind, which a fresh ring would lose: no entry is taken there.
+    cm = _kpool_tail_manager(128)
+    assert cm.partial_cache is not None
+    r1 = Request(
+        request_id="r1",
+        prompt_token_ids=list(range(100, 180)),
+        sampling_params=SamplingParams(
+            max_tokens=4, extra_args={"prefix_cache_boundaries": [64]}
+        ),
+        pooling_params=None,
+        block_hasher=_hash_128,
+    )
+    cm.new_step_starts()
+    assert cm.partial_prefix_stops(r1, 0, 80) == ()
+
+
 def test_chat_boundaries_include_multi_turn_user_fork_boundary():
     tokenizer = _StrictUserQueryTokenizer()
     shared_history = [
