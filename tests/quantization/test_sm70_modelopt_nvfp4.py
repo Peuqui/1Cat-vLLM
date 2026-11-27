@@ -257,3 +257,36 @@ def test_apply_uses_prepared_turbomind_path():
     assert out is fake_out
     apply_tm.assert_called_once()
     fake_kernel.apply_weights.assert_not_called()
+
+
+def test_turbomind_moe_method_creates_weights_without_csf_scales(monkeypatch):
+    """The TurboMind MoE method skips ModelOptNvFp4FusedMoE.__init__, which
+    sets csf_scales; create_weights reads it. It must set it itself (False:
+    the TurboMind experts read uncompressed block scales), or creating the
+    weights raises AttributeError."""
+    import vllm.model_executor.parameter as parameter
+    from vllm.model_executor.layers.quantization import nvfp4_sm70_moe
+
+    monkeypatch.setattr(nvfp4_sm70_moe, "capture_nvfp4_moe_config", MagicMock())
+    monkeypatch.setattr(nvfp4_sm70_moe, "NativeBindings", MagicMock())
+    monkeypatch.setattr(
+        nvfp4_sm70_moe, "validate_nvfp4_sm70_moe_contract", lambda moe: None
+    )
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
+    quant_config = MagicMock(
+        quant_method="NVFP4", group_size=16, is_checkpoint_nvfp4_serialized=True
+    )
+    moe_config = MagicMock(is_act_and_mul=True)
+
+    method = nvfp4_sm70_moe.ModelOptNvFp4SM70MoEMethod(quant_config, moe_config)
+    assert method.csf_scales is False
+    method.create_weights(
+        torch.nn.Module(),
+        8,
+        256,
+        128,
+        torch.float16,
+        weight_loader=None,
+        global_num_experts=8,
+    )
