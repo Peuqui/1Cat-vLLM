@@ -30,7 +30,7 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
 
         return DFlashSpeculator(vllm_config, device)
     if speculative_config.method == "dspark":
-        from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+        from vllm.v1.worker.gpu.spec_decode.dspark.block_drafter import DSparkSpeculator
 
         return DSparkSpeculator(vllm_config, device)
     if speculative_config.use_eagle():
