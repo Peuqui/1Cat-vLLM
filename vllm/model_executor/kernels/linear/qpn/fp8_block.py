@@ -61,12 +61,11 @@ _SM75_MMA_MAX_M = 512
 # Grouped BMM (DeepSeek-V4 wo_a): above this many rows per group the whole
 # weight is dequantized into the shared prefill workspace and multiplied as one
 # batch (the dequantization, ~100 MB of traffic per call, is amortized); up to
-# it each group runs the dense linears' M ladder on its own pack. Measured on a
-# Quadro RTX 8000 (bench_c0.log, 24.11.2026): per-group GEMMs 150 / 245 / 1017 /
-# 1988 us at M = 16 / 64 / 512 / 1024 against 125 / 133 / 495 / 964 us for the
-# batched product on a dequantized weight. The bound lies between the two
-# regimes and is derived from those figures, not yet measured: confirm it with
-# benchmarks/kernels/benchmark_dsv4_wo_a_grouped.py (arm qpn8_dense_bmm).
+# it each group runs the dense linears' M ladder on its own pack. On a Quadro
+# RTX 8000 (benchmarks/kernels/benchmark_dsv4_wo_a_grouped.py, wo_a 8 x
+# [1024, 4096]) the per-group path took 342.1 / 353.5 us at M = 96 / 128
+# against 360.2 / 364.5 us for the batched product on the dequantized weight
+# (arm qpn8_dense_bmm), so the bound keeps M = 128 on the per-group path.
 _GROUPED_DENSE_MIN_M = 128
 _QPN8_BATCH_NATIVE_MAX_M = 40
 _QPN8_ROW_BLOCK = 32

@@ -129,7 +129,7 @@ def _qpn8_dense_bmm_arm(weight, scales, groups):
     def apply(x: torch.Tensor) -> torch.Tensor:
         rows = x.shape[0]
         out = x.new_empty(rows, groups * n_group)
-        dense = fp8_block._block_qpn8_prefill_dense(x.device, codes.numel())
+        dense = fp8_block._ensure_block_qpn8_prefill_workspace(x.device, codes.numel())
         sm70_ops.fp8_qpn8_prefill_sm70_out(
             out,
             dense.data_ptr(),
@@ -164,21 +164,21 @@ def _graph_us(call, x: torch.Tensor, calls: int, replays: int) -> float:
     """Microseconds per call, from CUDA-graph replays of ``calls`` calls."""
     for _ in range(3):
         call(x)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         for _ in range(calls):
             call(x)
     for _ in range(3):
         graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     stop = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(replays):
         graph.replay()
     stop.record()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return start.elapsed_time(stop) * 1000.0 / (calls * replays)
 
 
@@ -206,7 +206,7 @@ def main() -> None:
     parser.add_argument("--json", help="also write the table as JSON")
     args = parser.parse_args()
 
-    torch.cuda.set_device(args.device)
+    torch.accelerator.set_device_index(args.device)
     import vllm._C  # noqa: F401
 
     from vllm.utils.torch_utils import set_high_precision_cuda_matmul_defaults
