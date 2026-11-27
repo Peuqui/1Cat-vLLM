@@ -195,6 +195,7 @@ def test_draft_token_handler_exposes_only_selected_verify_width() -> None:
     handler.req_ids = []
     handler.draft_tokens_np = None
     handler.num_draft_tokens = 0
+    handler._latest_drafts = {}
     batch = SimpleNamespace(
         req_ids=["req-0"],
         has_structured_output_reqs=False,
