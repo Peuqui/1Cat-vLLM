@@ -1149,21 +1149,6 @@ class Scheduler(SchedulerInterface):
                     continue
 
             if (
-                not self.scheduler_config.async_scheduling
-                and request.num_in_flight_tokens > 0
-                and request.num_computed_tokens >= request.num_tokens
-            ):
-                # Sync scheduling under PP keeps several batches in flight. A
-                # decoding request's computed tokens already count its in-flight
-                # step, drafts included, while its sampled token is not applied
-                # yet: drafts that arrive first would go out without the token
-                # they follow, and fewer or no drafts (a confidence cut) would
-                # give a negative count. Wait until that step's output is applied.
-                # Prefill chunks still pipeline (computed < num_tokens).
-                req_index += 1
-                continue
-
-            if (
                 request.num_output_placeholders > 0
                 # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
                 # Since output placeholders are also included in the computed tokens
@@ -1184,6 +1169,17 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if (
+                num_new_tokens < 0
+                and self.use_pp
+                and not self.scheduler_config.async_scheduling
+            ):
+                # PP>1 without async scheduling: a verify step of this request
+                # is still in flight. Scheduling counted its draft rows as
+                # computed, but its sampled tokens are not appended yet, so the
+                # count goes negative. Same case as 1.(1) below: wait for it.
+                req_index += 1
+                continue
             ddtree_payload_for_tree_schedule = self._ddtree_payload_for_tree_schedule(
                 request
             )
