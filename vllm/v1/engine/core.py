@@ -32,7 +32,7 @@ from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.cache import MultiModalCacheMissError
+from vllm.multimodal.cache import MultiModalCacheMissError, has_cache_references
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -830,13 +830,16 @@ class EngineCore:
             and scheduler_output.total_num_scheduled_tokens > 0
         ):
             # Apply only this step's proposals, after its sampled tokens. A later
-            # in-flight step must not replace or delay these proposals.
+            # in-flight step must not replace or delay these proposals. That
+            # later step may be the request's final prompt chunk: pass this
+            # step's output so drafts proposed from an intermediate chunk are
+            # dropped instead of being scheduled without the prompt's token.
             draft_token_ids = model_output.draft_token_ids
             if draft_token_ids is None:
                 raise RuntimeError(
                     "PP synchronous speculative decoding: missing step drafts"
                 )
-            self.scheduler.update_draft_token_ids(draft_token_ids)
+            self.scheduler.update_draft_token_ids(draft_token_ids, scheduler_output)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -1718,7 +1721,11 @@ class EngineCoreProc(EngineCore):
             return False
 
         logger.info("Rejecting request %s (server shutting down)", request.request_id)
-        self._send_abort_outputs_to_client([request.request_id], request.client_index)
+        self._send_abort_outputs_to_client(
+            [request.request_id],
+            request.client_index,
+            self._never_scheduled_mm_request(request),
+        )
         return True
 
     def _reject_utility_in_shutdown(
@@ -1968,7 +1975,11 @@ class EngineCoreProc(EngineCore):
             err.mm_hashes,
             request.request_id,
         )
-        self._send_error_outputs_to_client([request.request_id], request.client_index)
+        self._send_error_outputs_to_client(
+            [request.request_id],
+            request.client_index,
+            self._never_scheduled_mm_request(request),
+        )
 
     def _handle_request_preproc_error(self, request: EngineCoreRequest) -> None:
         """Log and return a request-scoped error response for exceptions raised
@@ -1977,7 +1988,22 @@ class EngineCoreProc(EngineCore):
         logger.exception(
             "Unexpected error pre-processing request %s", request.request_id
         )
-        self._send_error_outputs_to_client([request.request_id], request.client_index)
+        self._send_error_outputs_to_client(
+            [request.request_id],
+            request.client_index,
+            self._never_scheduled_mm_request(request),
+        )
+
+    @staticmethod
+    def _never_scheduled_mm_request(
+        request: EngineCoreRequest | Request,
+    ) -> dict[str, bool] | None:
+        """For a request that fails before it reaches the scheduler, which
+        reports every other finished request: none of its shm processor-cache
+        references will be read, so the frontend has to give them back."""
+        if has_cache_references(request.mm_features):
+            return {request.request_id: False}
+        return None
 
     def pause_scheduler(
         self, mode: PauseMode = "abort", clear_cache: bool = True
@@ -2029,24 +2055,42 @@ class EngineCoreProc(EngineCore):
         return not self.has_work()
 
     def _send_finish_outputs_to_client(
-        self, req_ids: list[str], client_index: int, finish_reason: FinishReason
+        self,
+        req_ids: list[str],
+        client_index: int,
+        finish_reason: FinishReason,
+        finished_mm_requests: dict[str, bool] | None = None,
     ) -> None:
         outputs = [
             EngineCoreOutput(req_id, [], finish_reason=finish_reason)
             for req_id in req_ids
         ]
-        eco = EngineCoreOutputs(finished_requests=req_ids, outputs=outputs)
+        eco = EngineCoreOutputs(
+            finished_requests=req_ids,
+            outputs=outputs,
+            finished_mm_requests=finished_mm_requests,
+        )
         self.output_queue.put_nowait((client_index, eco))
 
     def _send_abort_outputs_to_client(
-        self, req_ids: list[str], client_index: int
+        self,
+        req_ids: list[str],
+        client_index: int,
+        finished_mm_requests: dict[str, bool] | None = None,
     ) -> None:
-        self._send_finish_outputs_to_client(req_ids, client_index, FinishReason.ABORT)
+        self._send_finish_outputs_to_client(
+            req_ids, client_index, FinishReason.ABORT, finished_mm_requests
+        )
 
     def _send_error_outputs_to_client(
-        self, req_ids: list[str], client_index: int
+        self,
+        req_ids: list[str],
+        client_index: int,
+        finished_mm_requests: dict[str, bool] | None = None,
     ) -> None:
-        self._send_finish_outputs_to_client(req_ids, client_index, FinishReason.ERROR)
+        self._send_finish_outputs_to_client(
+            req_ids, client_index, FinishReason.ERROR, finished_mm_requests
+        )
 
     def _send_abort_outputs(self, aborted_reqs: list[tuple[str, int]]) -> None:
         # TODO(nick) this will be moved inside the scheduler

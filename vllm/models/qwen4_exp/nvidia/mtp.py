@@ -277,8 +277,8 @@ def _mtp_fp8_experts_supported(
 def _make_draft_vllm_config(
     vllm_config: VllmConfig,
     mtp_start_layer_idx: int,
-) -> VllmConfig:
-    """Ensure that the draft model config is set in the vLLM config."""
+) -> tuple[VllmConfig, set[str]]:
+    """Return the draft config and the checkpoint FP8 expert prefixes."""
     speculative_config = vllm_config.speculative_config
     if speculative_config is None or speculative_config.draft_model_config is None:
         raise ValueError("speculative_config.draft_model_config must be set")
@@ -382,7 +382,7 @@ def _make_draft_vllm_config(
             )
         draft_quant_config = MTPQ80Config(draft_quant_config)
     draft_vllm_config.quant_config = draft_quant_config
-    return draft_vllm_config
+    return draft_vllm_config, checkpoint_prefixes
 
 
 @support_torch_compile(
@@ -423,16 +423,14 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             if share_target_embed_tokens
             else VocabParallelEmbedding(self.vocab_size, self.hidden_size)
         )
-        draft_vllm_config = _make_draft_vllm_config(
+        draft_vllm_config, checkpoint_prefixes = _make_draft_vllm_config(
             vllm_config,
             self.mtp_start_layer_idx,
         )
         self.fp8_mtp_checkpoint_prefixes = {
             f"model.layers.{int(name.split('.')[2]) - self.mtp_start_layer_idx}"
             ".mlp.experts"
-            for name in getattr(
-                draft_vllm_config.quant_config, "checkpoint_prefixes", ()
-            )
+            for name in checkpoint_prefixes
         }
         self.fp8_mtp_tp_size = draft_vllm_config.parallel_config.tensor_parallel_size
         # Phase 2: the drafter shares the target cache_config; remember the main
@@ -738,7 +736,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             return False
         layer = self.layers[0]
         num_tokens = input_ids.shape[0]
-        if num_tokens >= 1024 and get_tp_group().world_size == 4:
+        if num_tokens >= 320 and get_tp_group().world_size == 4:
             from .sm70_hc_prefill_peer import (
                 hc_sequence_allgather_rows,
                 hc_sequence_shard_rows,
@@ -786,7 +784,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         num_tokens = input_ids.shape[0]
         hidden_sel_pre: torch.Tensor | None = None
         combined_hidden: torch.Tensor | None = None
-        if num_tokens >= 1024 and get_tp_group().world_size == 4:
+        if num_tokens >= 320 and get_tp_group().world_size == 4:
             from .sm70_hc_prefill_peer import (
                 hc_sequence_allgather_rows,
                 hc_sequence_shard_rows,
@@ -956,13 +954,11 @@ class _Qwen4ExpMTPPrefillSequenceModel(nn.Module):
     },
 )
 class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
-    # Qwen4Exp repacks the small BF16/shared/MTP tensors separately from the
-    # target experts and PLE tables. Loading the standalone drafter from that
-    # compact shard set avoids scanning the full target checkpoint a second
-    # time. The remaining patterns preserve compatibility with conventional
-    # Hugging Face checkpoint layouts.
+    # A BF16-named shard may contain only KV scales, with the MTP body in
+    # ordinary shards. Select the full checkpoint, including compact BF16
+    # layouts; skip_checkpoint_weight filters target tensors before reading
+    # them in the standard mapped/direct safetensors iterator.
     allow_patterns_overrides = [
-        "model-bf16-*.safetensors",
         "*.safetensors",
         "*.bin",
         "*.pt",
@@ -1092,7 +1088,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     def _use_hc_prefill_sequence_rows(self, positions, hidden_states, intermediate):
         return bool(
             getattr(self, "_hc_prefill_sequence_qualified", False)
-            and 4096 <= positions.shape[-1] <= 16384
+            and 320 <= positions.shape[-1] <= 16384
             and hidden_states is not None
             and hidden_states.dtype == torch.float16
             and hidden_states.shape == (positions.shape[-1], 10240)

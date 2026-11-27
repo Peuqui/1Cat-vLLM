@@ -319,6 +319,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         vllm_config.quant_config = None
         super().__init__(config, vllm_config, prefix)
         vllm_config.quant_config = saved_quant_config
+        # The chunked prefill path passes these kernels explicitly; bind them
+        # like the other KDA layers (Kimi linear, Bailing MoE v3) do.
         self.chunk_kernels = bind_kda_kernels(vllm_config)
         self._prefill_kernels_warmed_up = False
 

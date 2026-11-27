@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+from collections import defaultdict
 from unittest.mock import Mock
 
 import pytest
@@ -16,7 +17,9 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.multimodal.inputs import (
+    MultiModalBatchedField,
     MultiModalFeatureSpec,
+    MultiModalFieldElem,
     MultiModalKwargsItem,
     PlaceholderRange,
 )
@@ -33,7 +36,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
 )
-from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    DraftTokenIds,
+    KVConnectorOutput,
+    ModelRunnerOutput,
+)
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -173,6 +181,131 @@ def test_schedule_multimodal_requests():
     assert len(output.scheduled_encoder_inputs) == 10
     for req_id, encoder_input in output.scheduled_encoder_inputs.items():
         assert len(encoder_input) == 1
+
+
+def _mm_request(request_id: str, *, shm_reference: bool) -> Request:
+    """A request with one image, sent either as an shm processor-cache
+    reference (its address) or inline."""
+    (request,) = create_requests(
+        num_requests=1,
+        num_tokens=200,
+        mm_positions=[[PlaceholderRange(offset=0, length=100)]],
+        req_ids=[request_id],
+    )
+    if shm_reference:
+        for feature in request.mm_features:
+            feature.data = MultiModalKwargsItem(
+                {
+                    key: MultiModalFieldElem(data=0, field=MultiModalBatchedField())
+                    for key in ("address", "monotonic_id")
+                }
+            )
+    return request
+
+
+def test_mm_request_aborted_before_it_was_scheduled_is_reported_unsent():
+    """Aborted while waiting: the workers never fetch its shm items, so the
+    frontend must give their references back. An abort has no output of its
+    own; the report comes with the next outputs."""
+    scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
+    request = _mm_request("0", shm_reference=True)
+    scheduler.add_request(request)
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+    output = scheduler.schedule()
+    assert output.scheduled_new_reqs == []
+    outputs = scheduler.update_from_output(output, EMPTY_MODEL_RUNNER_OUTPUT)
+    assert outputs[0].finished_mm_requests == {"0": False}
+
+    # Reported once.
+    output = scheduler.schedule()
+    outputs = scheduler.update_from_output(output, EMPTY_MODEL_RUNNER_OUTPUT)
+    assert all(eco.finished_mm_requests is None for eco in outputs.values())
+
+
+def test_mm_request_aborted_in_the_step_it_was_first_scheduled_is_reported_sent():
+    """With async scheduling the abort can land after the step carrying the
+    request went to the workers; they fetch its items in that step."""
+    scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
+    request = _mm_request("0", shm_reference=True)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["0"]
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+
+    outputs = scheduler.update_from_output(output, EMPTY_MODEL_RUNNER_OUTPUT)
+    assert outputs[0].finished_mm_requests == {"0": True}
+
+
+def test_mm_request_finished_after_running_is_reported_sent():
+    scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
+    shm_request = _mm_request("0", shm_reference=True)
+    inline_request = _mm_request("1", shm_reference=False)
+    scheduler.add_request(shm_request)
+    scheduler.add_request(inline_request)
+
+    output = scheduler.schedule()
+    assert len(output.scheduled_new_reqs) == 2
+    model_runner_output = ModelRunnerOutput(
+        req_ids=["0", "1"],
+        req_id_to_index={"0": 0, "1": 1},
+        sampled_token_ids=[[1], [1]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    outputs = scheduler.update_from_output(output, model_runner_output)
+    assert outputs[0].finished_mm_requests is None
+
+    # With the in-process executor the workers replace the address items in
+    # the engine's own features with the data they fetched.
+    for feature in shm_request.mm_features:
+        feature.data = MultiModalKwargsItem.dummy()
+
+    # Requests whose items were sent inline carry no reference to give back.
+    scheduler.finish_requests(["0", "1"], RequestStatus.FINISHED_ABORTED)
+    output = scheduler.schedule()
+    outputs = scheduler.update_from_output(output, EMPTY_MODEL_RUNNER_OUTPUT)
+    assert outputs[0].finished_mm_requests == {"0": True}
+
+
+def test_mm_request_report_rides_on_the_outputs_of_the_same_step():
+    """A report pending for a client goes out with that client's outputs of
+    the step instead of in a second EngineCoreOutputs, and only once."""
+    scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
+    shm_request = _mm_request("0", shm_reference=True)
+    other_request = _mm_request("1", shm_reference=False)
+    scheduler.add_request(shm_request)
+    scheduler.add_request(other_request)
+
+    output = scheduler.schedule()
+    assert len(output.scheduled_new_reqs) == 2
+    scheduler.finish_requests("0", RequestStatus.FINISHED_ABORTED)
+    model_runner_output = ModelRunnerOutput(
+        req_ids=["0", "1"],
+        req_id_to_index={"0": 0, "1": 1},
+        sampled_token_ids=[[1], [1]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    outputs = scheduler.update_from_output(output, model_runner_output)
+    assert list(outputs) == [0]
+    assert [out.request_id for out in outputs[0].outputs] == ["1"]
+    assert outputs[0].finished_mm_requests == {"0": True}
+    assert not scheduler.finished_mm_requests
+
+
+def test_mm_request_failed_before_the_scheduler_is_reported_unsent():
+    """Preprocessing errors and shutdown rejections never reach the
+    scheduler, so EngineCore reports them itself."""
+    from vllm.v1.engine.core import EngineCoreProc
+
+    shm_request = _mm_request("0", shm_reference=True)
+    inline_request = _mm_request("1", shm_reference=False)
+    assert EngineCoreProc._never_scheduled_mm_request(shm_request) == {"0": False}
+    assert EngineCoreProc._never_scheduled_mm_request(inline_request) is None
 
 
 def test_async_scheduling_pp_allows_rescheduling_with_output_placeholders(monkeypatch):
@@ -1233,6 +1366,65 @@ def test_sync_pp_spec_decode_waits_when_in_flight_step_drafts_nothing(monkeypatc
     scheduler.update_from_output(decode, model_output([43, 1]))
     after = scheduler.schedule()
     assert after.num_scheduled_tokens[req.request_id] == 1
+
+
+def test_pp_drafts_from_intermediate_prefill_chunk_are_dropped():
+    """Drafts proposed from an intermediate prompt chunk are dropped under PP.
+
+    With pipeline parallelism the final prompt chunk is scheduled before the
+    first chunk's output and drafts are applied, so ``request.is_prefill_chunk``
+    already describes the final chunk. Accepting the first chunk's drafts then
+    schedules draft tokens without the prompt's sampled token: the V1 runner
+    asserts ``num_scheduled_tokens >= draft_len + 1`` and Model Runner V2
+    replays a decode graph on inconsistent metadata (DeepSeek-V4.1 PP2, any
+    prompt longer than one prefill chunk).
+    """
+    num_spec_tokens = 3
+    scheduler = create_scheduler(
+        num_speculative_tokens=num_spec_tokens,
+        max_num_batched_tokens=50,
+        enable_chunked_prefill=True,
+        pipeline_parallel_size=2,
+    )
+    req = create_requests(num_requests=1, num_tokens=80)[0]
+    scheduler.add_request(req)
+    req_to_index = {req.request_id: 0}
+
+    def runner_output(sampled: list[int]) -> ModelRunnerOutput:
+        return ModelRunnerOutput(
+            req_ids=[req.request_id],
+            req_id_to_index=req_to_index,
+            sampled_token_ids=[sampled],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens[req.request_id] == 50
+    # PP: the final chunk is scheduled while the first one is still in flight.
+    second = scheduler.schedule()
+    assert second.num_scheduled_tokens[req.request_id] == 30
+    # The flag now describes the final chunk, so it cannot reject the drafts.
+    assert not req.is_prefill_chunk
+
+    scheduler.update_from_output(first, runner_output([]))
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([req.request_id], [[1, 2, 3]]), first
+    )
+    assert req.spec_token_ids == []
+    # Nothing to schedule for the request until the final chunk's token arrives.
+    waiting = scheduler.schedule()
+    assert req.request_id not in waiting.num_scheduled_tokens
+
+    scheduler.update_from_output(second, runner_output([42]))
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([req.request_id], [[1, 2, 3]]), second
+    )
+    assert req.spec_token_ids == [1, 2, 3]
+    decode = scheduler.schedule()
+    assert decode.num_scheduled_tokens[req.request_id] == 1 + num_spec_tokens
+    assert len(decode.scheduled_spec_decode_tokens[req.request_id]) == num_spec_tokens
 
 
 def test_scheduler_stats_waiting_queues():
@@ -2744,6 +2936,8 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.kv_event_publisher = Mock()
     scheduler.finished_req_ids = set()
     scheduler.finished_req_ids_dict = None
+    # No shm processor-cache reports pending, as __init__ sets it.
+    scheduler.finished_mm_requests = defaultdict(dict)
     scheduler.vllm_config = Mock()
     scheduler.vllm_config.model_config.enable_return_routed_experts = False
     scheduler.enable_return_routed_experts = False

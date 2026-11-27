@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -61,6 +62,10 @@ def _all_gather_existing_pynccl(input_, communicator, world_size, dim):
 # may read its input again after the call; an in-place reduction hands those
 # readers the summed tensor. Only callers that opt in (see envs.py) use it.
 _INPLACE_AR_MIN = int(envs.VLLM_INPLACE_AR_MIN)
+# VLLM_INKLING2_SM70_PREFILL_NCCL_AR_BYTES: all-reduces of at least this many bytes
+# (prefill chunks) go to NCCL instead of the custom 2-stage kernel; 0 keeps the
+# custom path.
+_PF_NCCL_AR_BYTES = int(os.environ.get("VLLM_INKLING2_SM70_PREFILL_NCCL_AR_BYTES", "0"))
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -191,6 +196,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
+        self._peer_gemma_norm = None
 
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
@@ -255,6 +261,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     "disabled.",
                     self.unique_name or "<unnamed>",
                     scope="global",
+                )
+
+            if (
+                use_long_prefill_fused_norm
+                and self.ca_comm is not None
+                and not self.ca_comm.disabled
+            ):
+                from vllm._custom_ops import try_create_peer_gemma_norm_runtime
+
+                self._peer_gemma_norm = try_create_peer_gemma_norm_runtime(
+                    self.cpu_group,
+                    self.device,
+                    self.rank_in_group,
+                    self.world_size,
+                    self.ca_comm,
                 )
 
         from .sm70_ring import Sm70RingCommunicator
@@ -533,6 +554,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm is not None
             and not ca_comm.disabled
             and ca_comm.should_custom_ar(input_)
+            and not (0 < _PF_NCCL_AR_BYTES <= input_.numel() * input_.element_size())
         ):
             out = ca_comm.custom_all_reduce(input_)
             assert out is not None
@@ -620,6 +642,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and input_.shape[0] >= 128
             and ca_comm.long_prefill_output_ptrs is not None
         ):
+            peer_norm = getattr(self, "_peer_gemma_norm", None)
+            if peer_norm is not None and peer_norm.can_use(input_, residual, weight):
+                return peer_norm.push_rs_gemma_norm_ag(
+                    input_,
+                    residual,
+                    weight,
+                    epsilon,
+                    lambda i, r, w, e: self.all_reduce_gemma_rms_norm(
+                        i, r, w, e, allow_shard_residual=False
+                    ),
+                )
             if ca_comm.can_sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
                 input_, residual, weight
             ):
@@ -762,6 +795,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
         weight: torch.Tensor,
         epsilon: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        peer_norm = getattr(self, "_peer_gemma_norm", None)
+        if peer_norm is not None and peer_norm.can_use(input_, residual, weight):
+            self._collective_trace.record("sm70_tp4_fused_rs_norm_ag", input_)
+            return peer_norm.push_rs_gemma_norm_ag(
+                input_,
+                residual,
+                weight,
+                epsilon,
+                lambda i, r, w, e: self.all_reduce_gemma_rms_norm(
+                    i, r, w, e, allow_shard_residual=False
+                ),
+            )
         ca_comm = self.ca_comm
         if (
             not self.use_sm70_tp4_long_prefill_fused_norm
@@ -924,6 +969,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        peer_norm = getattr(self, "_peer_gemma_norm", None)
+        if peer_norm is not None:
+            peer_norm.close()
+            self._peer_gemma_norm = None
         hc_ll_comm = getattr(self, "hc_ll_comm", None)
         if hc_ll_comm is not None:
             hc_ll_comm.close()

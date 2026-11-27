@@ -2829,6 +2829,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 # dequantize_mxfp8_weight_pairs).
                 assert self.mxfp8_config is not None
                 return ModelOptMxFp8LinearMethod(self.mxfp8_config)
+            if quant_algo:
+                raise ValueError(
+                    f"Unsupported quant_algo {quant_algo!r} for layer {prefix!r} "
+                    "in ModelOpt mixed precision config."
+                )
             # Layers not in quantized_layers stay unquantized; an LM head
             # keeps its own UnquantizedEmbeddingMethod.
             return UnquantizedLinearMethod() if isinstance(layer, LinearBase) else None

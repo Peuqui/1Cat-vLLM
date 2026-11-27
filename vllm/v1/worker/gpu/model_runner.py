@@ -823,14 +823,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             intermediate_tensors = self.intermediate_tensors[:num_tokens]
 
         # Execute the model.
-        self.execute_model(
-            dummy_scheduler_output,
-            intermediate_tensors=intermediate_tensors,
-            dummy_run=True,
-            skip_attn_for_dummy_run=skip_attn,
-            is_profile=is_profile,
-        )
-        self.kv_connector.set_disabled(False)
+        try:
+            self.execute_model(
+                dummy_scheduler_output,
+                intermediate_tensors=intermediate_tensors,
+                dummy_run=True,
+                skip_attn_for_dummy_run=skip_attn,
+                is_profile=is_profile,
+            )
+        finally:
+            self.kv_connector.set_disabled(False)
 
         # Non-last PP ranks don't produce output for sampling.
         if not self.is_last_pp_rank:
@@ -1471,6 +1473,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 cached_logits = sparse_result
             else:
                 sampler_output = sparse_result
+        elif (
+            getattr(self.speculator, "samples_plain_steps", False)
+            and self.lora_config is None
+            and self.rejection_sampler is not None
+        ):
+            # Inkling2 DSpark: steps without drafts (width 0) may take the
+            # speculator's shard-local greedy path too. None = usual path.
+            sampler_output = self.speculator.try_sample_target(
+                self.model,
+                self.rejection_sampler,
+                sample_hidden_states,
+                input_batch,
+                grammar_output,
+            )
         sampler_output = maybe_sample_greedy(
             self.model,
             self.sampler,
@@ -2150,10 +2166,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._step_profiler.finish_context(
                 mtp_profile_ctx, "draft_total", mtp_draft_start
             )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             num_draft_tokens = None
             if hasattr(self.speculator, "next_num_draft_tokens"):
                 num_draft_tokens = self.speculator.next_num_draft_tokens()
+            if num_draft_tokens != 0 or not getattr(
+                self.speculator, "skips_unused_draft_copy", False
+            ):
+                # (Inkling2 DSpark at width 0 hands no drafts on.)
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 draft_tokens,

@@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsManager,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+from vllm.multimodal.cache import has_cache_references
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
@@ -243,6 +244,13 @@ class Scheduler(SchedulerInterface):
         # requests so that they can free the cached states for those requests.
         # This is flushed at the end of each scheduling step.
         self.finished_req_ids: set[str] = set()
+
+        # Finished requests that carry shm processor-cache references, per
+        # client: request id -> whether the workers received the request. A
+        # reference is balanced only by the workers' reads, so the frontend
+        # gives back those of requests the workers never received. Sent with
+        # the next outputs, see EngineCoreOutputs.finished_mm_requests.
+        self.finished_mm_requests: dict[int, dict[str, bool]] = defaultdict(dict)
 
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
@@ -855,13 +863,22 @@ class Scheduler(SchedulerInterface):
                         ),
                         default=0,
                     )
+                    # Preserve full-block chunk alignment on large-block hybrid
+                    # KV/state pools (e.g. block_size=2048) so long concurrent
+                    # prefills avoid sub-block 1024/512 fragmentation.
+                    _block_aligned_floor = max(
+                        self.cache_config.block_size,
+                        self.mamba_state_block_size or 0,
+                    )
                     if _max_prefill_computed >= 49152:
                         _concurrent_cap = min(
-                            self._split_mtp_concurrent_prefill_cap, 512
+                            self._split_mtp_concurrent_prefill_cap,
+                            max(512, _block_aligned_floor),
                         )
                     elif _max_prefill_computed >= 16384:
                         _concurrent_cap = min(
-                            self._split_mtp_concurrent_prefill_cap, 1024
+                            self._split_mtp_concurrent_prefill_cap,
+                            max(1024, _block_aligned_floor),
                         )
                     else:
                         _concurrent_cap = self._split_mtp_concurrent_prefill_cap
@@ -1867,7 +1884,13 @@ class Scheduler(SchedulerInterface):
                     ):
                         self._split_mtp_decode_steps_due = 2
                     else:
-                        self._split_mtp_decode_steps_due = 8
+                        _block_aligned_floor = max(
+                            self.cache_config.block_size,
+                            self.mamba_state_block_size or 0,
+                        )
+                        self._split_mtp_decode_steps_due = (
+                            4 if _block_aligned_floor >= 2048 else 8
+                        )
                     self._split_mtp_prefill_burst_tokens = 0
                 else:
                     self._split_mtp_decode_steps_due = 2
@@ -1911,6 +1934,12 @@ class Scheduler(SchedulerInterface):
                 )
                 for req in scheduled_new_reqs
             ]
+        # The workers fetch the shm processor-cache items of every new request
+        # in this output, which balances their references. Set here rather
+        # than when the request was taken from the waiting queue: schedule()
+        # can still raise before this output exists.
+        for req in scheduled_new_reqs:
+            req.sent_to_workers = True
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
@@ -2841,6 +2870,18 @@ class Scheduler(SchedulerInterface):
                     )
             finished_req_ids.clear()
 
+        # Requests aborted between steps have no output of their own, so this
+        # is the only way their processor-cache references get back.
+        if self.finished_mm_requests:
+            for client_index, finished_mm in self.finished_mm_requests.items():
+                if (eco := engine_core_outputs.get(client_index)) is not None:
+                    eco.finished_mm_requests = finished_mm
+                else:
+                    engine_core_outputs[client_index] = EngineCoreOutputs(
+                        finished_mm_requests=finished_mm
+                    )
+            self.finished_mm_requests.clear()
+
         if (
             stats := self.make_stats(
                 spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats
@@ -2948,7 +2989,46 @@ class Scheduler(SchedulerInterface):
                 # in the decoder's KV cache.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
-    def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+    def _prefill_chunk_req_ids(self, scheduler_output: SchedulerOutput) -> set[str]:
+        """Requests whose prompt was still unfinished after this step.
+
+        With pipeline parallelism the next step of a request (its final prompt
+        chunk) can be scheduled before this step's output is applied, and
+        scheduling sets ``request.is_prefill_chunk`` for that later step. Only
+        the step that produced the drafts can say whether they were proposed
+        from an intermediate chunk, whose sampled token is discarded.
+        """
+        computed = {
+            new_req.req_id: new_req.num_computed_tokens
+            for new_req in scheduler_output.scheduled_new_reqs
+        }
+        cached = scheduler_output.scheduled_cached_reqs
+        computed.update(zip(cached.req_ids, cached.num_computed_tokens))
+        chunks: set[str] = set()
+        for req_id, num_computed in computed.items():
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+            reached = num_computed + scheduler_output.num_scheduled_tokens.get(
+                req_id, 0
+            )
+            if reached < request.num_prompt_tokens:
+                chunks.add(req_id)
+        return chunks
+
+    def update_draft_token_ids(
+        self,
+        draft_token_ids: DraftTokenIds,
+        scheduler_output: SchedulerOutput | None = None,
+    ) -> None:
+        # scheduler_output: the step that produced these drafts. Pipeline
+        # parallelism passes it, because a later step of the same request may
+        # already be scheduled (see _prefill_chunk_req_ids).
+        chunk_req_ids = (
+            self._prefill_chunk_req_ids(scheduler_output)
+            if scheduler_output is not None
+            else set()
+        )
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
@@ -2959,7 +3039,7 @@ class Scheduler(SchedulerInterface):
                 # The request may have been finished. Skip.
                 continue
 
-            if request.is_prefill_chunk:
+            if request.is_prefill_chunk or req_id in chunk_req_ids:
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
@@ -3123,6 +3203,11 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            # Decided now: with the in-process executor the workers replace the
+            # address items in these very features with the fetched data.
+            request.carries_mm_cache_references = has_cache_references(
+                request.mm_features
+            )
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:
@@ -3204,6 +3289,10 @@ class Scheduler(SchedulerInterface):
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
+        if request.carries_mm_cache_references:
+            self.finished_mm_requests[request.client_index][request_id] = (
+                request.sent_to_workers
+            )
 
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:

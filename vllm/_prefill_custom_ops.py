@@ -67,7 +67,7 @@ def maybe_tp_sharded_router_topk(
         or runner._quant_method.is_monolithic
         or isinstance(runner.router, ZeroExpertRouter)
         or hidden_states.ndim != 2
-        or hidden_states.shape[0] < 1024
+        or hidden_states.shape[0] < 320
         or not hidden_states.is_cuda
         or not hidden_states.is_contiguous()
         or is_sm70_decode_graph_compiling()
@@ -147,6 +147,14 @@ def maybe_gdn_rmsnorm_gated(
     num_tokens: int,
     layer_name: str,
 ) -> torch.Tensor | None:
+    from vllm._custom_ops import maybe_fast_gdn_rmsnorm_gated
+
+    dump_requested = _gdn_projection_dump_requested(layer_name)
+    fast_out = maybe_fast_gdn_rmsnorm_gated(
+        attn, core_attn_out, z, num_tokens, layer_name, dump_requested
+    )
+    if fast_out is not None:
+        return fast_out
     if not (
         num_tokens >= 256
         and not torch.compiler.is_compiling()
@@ -167,7 +175,7 @@ def maybe_gdn_rmsnorm_gated(
         and attn.norm.group_size is None
         and attn.norm.norm_before_gate
         and attn.norm.activation in ("silu", "swish")
-        and not _gdn_projection_dump_requested(layer_name)
+        and not dump_requested
     ):
         return None
     profile_start = attn._gdn_profiler.start()
@@ -238,7 +246,7 @@ def ple_prefill_slice_range(
     copy_rows = num_tokens
     local_rows = (num_tokens + 3) // 4
     if (
-        num_tokens >= 1024
+        num_tokens >= 320
         and hidden_states.ndim == 2
         and hidden_states.shape[0] == local_rows
         and local_rows < num_tokens
