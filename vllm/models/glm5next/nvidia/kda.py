@@ -21,10 +21,7 @@ from vllm.model_executor.layers.fla.ops.kda import (
     chunk_kda_with_fused_gate,
     fused_recurrent_kda,
 )
-from vllm.model_executor.layers.fla.ops.sm70.kda_glue import (
-    kda_gated_rmsnorm,
-    kda_pack_recurrent_inputs,
-)
+from vllm.model_executor.layers.fla.ops.kda_glue import kda_pack_recurrent_inputs
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -687,15 +684,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
         if core_output_dtype != hidden_states.dtype:
-            # Keep the recurrent output in FP32 until normalization. One
-            # kernel replaces the eager forward_native chain (11 launches)
-            # with the same fp32 operation order; it does not go through the
-            # CustomOp dispatch, which stays for the other (non-fp32) branch.
-            core_attn_out = kda_gated_rmsnorm(
+            # Keep the recurrent output in FP32 until normalization. The
+            # CustomOp owner selects Triton when enabled and preserves an
+            # explicit disable instead of bypassing its captured dispatch.
+            core_attn_out = self.o_norm(
                 core_attn_out,
                 g2,
-                self.o_norm.weight,
-                self.o_norm.eps,
                 out_dtype=hidden_states.dtype,
             )
             logger.info_once(
