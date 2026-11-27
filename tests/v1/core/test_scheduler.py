@@ -1368,7 +1368,7 @@ def test_sync_pp_spec_decode_waits_when_in_flight_step_drafts_nothing(monkeypatc
     assert after.num_scheduled_tokens[req.request_id] == 1
 
 
-def test_pp_drafts_from_intermediate_prefill_chunk_are_dropped():
+def test_pp_drafts_from_intermediate_prefill_chunk_are_dropped(monkeypatch):
     """Drafts proposed from an intermediate prompt chunk are dropped under PP.
 
     With pipeline parallelism the final prompt chunk is scheduled before the
@@ -1379,6 +1379,8 @@ def test_pp_drafts_from_intermediate_prefill_chunk_are_dropped():
     replays a decode graph on inconsistent metadata (DeepSeek-V4.1 PP2, any
     prompt longer than one prefill chunk).
     """
+    # Scheduler bookkeeping is CPU-only; do not require two physical GPUs.
+    pretend_gpu_count(monkeypatch, 2)
     num_spec_tokens = 3
     scheduler = create_scheduler(
         num_speculative_tokens=num_spec_tokens,
