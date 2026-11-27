@@ -240,7 +240,9 @@ def _adaptive_verify_manager(
     config = SimpleNamespace(
         attention_config=AttentionConfig(),
         kernel_config=KernelConfig(
-            adaptive_verify=AdaptiveVerifyConfig(enabled=enabled, **verify)
+            adaptive_verify=AdaptiveVerifyConfig(
+                enabled=enabled, verify_cost_ratio=0.119, **verify
+            )
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=4),
         model_config=SimpleNamespace(max_model_len=BUILTIN_MAX_CONTEXT),
@@ -296,6 +298,20 @@ def test_adaptive_verify_captures_every_single_request_tail(
     # Below the shortest verify length, and for batches, nothing is captured.
     assert manager.dispatch(1, 2, 2).cg_mode == CUDAGraphMode.NONE
     assert manager.dispatch(2, 2 * 3, 3).cg_mode == CUDAGraphMode.NONE
+
+
+def test_adaptive_verify_tails_stay_off_for_short_blocks_and_sequence_parallel(
+    monkeypatch,
+):
+    # Blocks of fewer than three drafts get no tails, as for adaptive MTP.
+    short = _adaptive_verify_manager(monkeypatch, 3, ModelCudaGraphManager)
+    assert short.tail_query_lens == ()
+    assert short.decode_query_lens == (3,)
+    # Sequence parallelism captures no tail shapes at all.
+    manager = _adaptive_verify_manager(monkeypatch, 8, ModelCudaGraphManager)
+    assert manager.tail_query_lens == tuple(range(7, 1, -1))
+    manager.vllm_config.compilation_config.pass_config.enable_sp = True
+    assert cg.tail_query_lens(manager.vllm_config, 8, True) == ()
 
 
 def test_adaptive_verify_drafter_manager_keeps_its_block_width(monkeypatch):

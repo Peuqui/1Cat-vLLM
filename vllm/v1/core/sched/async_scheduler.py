@@ -42,11 +42,9 @@ class AsyncScheduler(Scheduler):
             speculative_config, self.vllm_config.kernel_config, self.num_spec_tokens
         )
         if plan is not None and not self.use_v2_model_runner:
-            # Only the V2 runner honours a per-round verify length; MTP's
-            # automatic mode silently stays fixed there, an explicit
-            # adaptive_verify setting must not.
-            if plan.rule != "mtp_bands":
-                raise ValueError("adaptive_verify requires the V2 model runner")
+            # Only the V2 runner honours a per-round verify length, so the
+            # automatic depth stays fixed here; the one method an explicit
+            # adaptive_verify setting admits runs on the V2 runner only.
             plan = None
         if plan is not None:
             self._verify_controller = build_verify_controller(plan)

@@ -13,7 +13,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from vllm.config.kernel import ADAPTIVE_MTP_FLOOR_K, AdaptiveVerifyPlan
+from vllm.config.kernel import (
+    ADAPTIVE_MTP_FLOOR_K,
+    AdaptiveVerifyPlan,
+    required_verify_cost_ratio,
+)
 
 
 class VerifyState(Protocol):
@@ -155,6 +159,7 @@ class ThroughputController:
     def __init__(self, plan: AdaptiveVerifyPlan) -> None:
         self._plan = plan
         self._settings = plan.settings
+        self._cost_ratio = required_verify_cost_ratio(plan.settings)
         self.initial_length = plan.initial_tokens
         self.max_length = plan.max_tokens
 
@@ -206,10 +211,10 @@ class ThroughputController:
             state.length += 1
             return
         cumulative = self._cumulative_acceptance(state, observed_tokens)
+        cost_ratio = self._cost_ratio
         best = best_verify_length(
-            cumulative, settings.verify_cost_ratio, plan.min_tokens, plan.max_tokens
+            cumulative, cost_ratio, plan.min_tokens, plan.max_tokens
         )
-        cost_ratio = settings.verify_cost_ratio
         if expected_throughput(cumulative, best, cost_ratio) > (
             1.0 + settings.switch_margin
         ) * expected_throughput(cumulative, state.length, cost_ratio):

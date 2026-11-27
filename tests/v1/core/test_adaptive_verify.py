@@ -24,10 +24,11 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 pytestmark = pytest.mark.cpu_test
 
-# Cumulative acceptance A_j = P(at least j drafts accepted), DESIGN.md 5.2.
-AIFRED_SAMPLING = [0.62, 0.37, 0.23, 0.15, 0.10, 0.07, 0.04]
+# Cumulative acceptance A_j = P(at least j drafts accepted) per draft position.
+SAMPLED_TEXT_ACCEPTANCE = [0.62, 0.37, 0.23, 0.15, 0.10, 0.07, 0.04]
 GREEDY = [0.72, 0.50, 0.34, 0.23, 0.17, 0.11, 0.08]
 HIGH_ACCEPTANCE = [0.85**j for j in range(1, 8)]
+# A round cost ratio for the controller tables (GLM-5.3-Flash measured 0.119).
 COST_RATIO = 0.108
 
 
@@ -36,6 +37,7 @@ def _kernel_config(**adaptive_verify) -> KernelConfig:
 
 
 def _dflash_plan(k_max: int = 7, **adaptive_verify):
+    adaptive_verify.setdefault("verify_cost_ratio", COST_RATIO)
     plan = resolve_adaptive_verify(
         SimpleNamespace(method="dflash"),
         _kernel_config(enabled=True, **adaptive_verify),
@@ -47,7 +49,7 @@ def _dflash_plan(k_max: int = 7, **adaptive_verify):
 
 @pytest.mark.parametrize(
     ("acceptance", "expected_length"),
-    [(AIFRED_SAMPLING, 3), (GREEDY, 4), (HIGH_ACCEPTANCE, 7)],
+    [(SAMPLED_TEXT_ACCEPTANCE, 3), (GREEDY, 4), (HIGH_ACCEPTANCE, 7)],
 )
 def test_best_verify_length_follows_the_throughput_optimum(acceptance, expected_length):
     assert best_verify_length(acceptance, COST_RATIO, 1, 7) == expected_length
@@ -55,7 +57,7 @@ def test_best_verify_length_follows_the_throughput_optimum(acceptance, expected_
 
 def test_best_verify_length_respects_the_bounds():
     assert best_verify_length(HIGH_ACCEPTANCE, COST_RATIO, 1, 5) == 5
-    assert best_verify_length(AIFRED_SAMPLING, COST_RATIO, 4, 7) == 4
+    assert best_verify_length(SAMPLED_TEXT_ACCEPTANCE, COST_RATIO, 4, 7) == 4
 
 
 def test_unobserved_positions_do_not_move():
@@ -121,8 +123,8 @@ def test_dispatch_picks_the_controller_of_the_rule():
     )
 
 
-# Depth sequences of 1Cat's EntMTP controller recorded from
-# merge-1cat-2d218ab03 (async_scheduler.py before the dispatch refactor): 200
+# Depth sequences of 1Cat's EntMTP controller recorded from its code as it was
+# before this dispatch (async_scheduler.py of 1Cat main 2d218ab03): 200
 # rounds with the acceptance probability redrawn every 25 rounds, seeds
 # 99 + k_max. Each row is (k_max, k_min, depths, ema_successes, ema_trials,
 # final depth). The k=7 row records 1Cat's behaviour as it is: its hysteresis
@@ -288,3 +290,67 @@ def test_varying_verify_length_keeps_pipeline_bookkeeping_consistent(monkeypatch
         assert request.num_output_placeholders == 0
         assert request.num_computed_tokens == request.num_tokens - 1
     assert len(set(counts[1:])) > 1
+
+
+def _scheduler_from_init(monkeypatch, plan, use_v2_model_runner: bool):
+    """Build an async scheduler through its own __init__ with `plan` resolved.
+
+    The CPU config holds no drafter, so the resolver is answered with a plan the
+    real resolver produced; the wiring from plan to controller is the code under
+    test."""
+    from vllm.config import VllmConfig
+    from vllm.v1.core.sched import async_scheduler
+
+    monkeypatch.setattr(
+        VllmConfig,
+        "use_v2_model_runner",
+        property(lambda _self: use_v2_model_runner),
+    )
+    monkeypatch.setattr(async_scheduler, "resolve_adaptive_verify", lambda *_args: plan)
+    pretend_gpu_count(monkeypatch, 1)
+    return create_scheduler(async_scheduling=True)
+
+
+def _mtp_plan(monkeypatch, k_max: int = 5):
+    monkeypatch.setattr(
+        "vllm.config.speculative_sampling.resolve_sampling_policy",
+        lambda _config: SimpleNamespace(adaptive_mtp="on", adaptive_mtp_min_k=2),
+    )
+    plan = resolve_adaptive_verify(SimpleNamespace(method="mtp"), KernelConfig(), k_max)
+    assert plan is not None and plan.rule == "mtp_bands"
+    return plan
+
+
+def test_init_builds_the_controller_of_the_resolved_plan(monkeypatch):
+    scheduler = _scheduler_from_init(
+        monkeypatch, _dflash_plan(initial_tokens=4), use_v2_model_runner=True
+    )
+    assert isinstance(scheduler._verify_controller, ThroughputController)
+    assert scheduler._verify_controller.initial_length == 4
+
+
+def test_init_keeps_automatic_mtp_fixed_without_the_v2_runner(monkeypatch):
+    scheduler = _scheduler_from_init(
+        monkeypatch, _mtp_plan(monkeypatch), use_v2_model_runner=False
+    )
+    assert scheduler._verify_controller is None
+
+
+def test_init_without_a_plan_keeps_the_fixed_length(monkeypatch):
+    scheduler = _scheduler_from_init(monkeypatch, None, use_v2_model_runner=True)
+    assert scheduler._verify_controller is None
+    assert scheduler._select_adaptive_batch_k(["a"]) == scheduler.num_spec_tokens
+
+
+def test_a_decode_batch_of_several_requests_verifies_the_full_block(monkeypatch):
+    scheduler = _adaptive_scheduler(monkeypatch, _dflash_plan(initial_tokens=2))
+    controller = scheduler._verify_controller
+    state = controller.new_state()
+    state.length = 3
+    scheduler._verify_states["a"] = state
+
+    # A lone request follows its own state, or initial_tokens before feedback.
+    assert scheduler._select_adaptive_batch_k(["a"]) == 3
+    assert scheduler._select_adaptive_batch_k(["b"]) == 2
+    # Several requests share one captured graph shape: the full block.
+    assert scheduler._select_adaptive_batch_k(["a", "b"]) == 7

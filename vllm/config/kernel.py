@@ -763,14 +763,12 @@ class AdaptiveVerifyConfig:
     """Let the scheduler choose the verification length per round."""
 
     min_tokens: int = Field(default=1, ge=1)
-    """Shortest verification length n (draft tokens per round)."""
-
-    max_tokens: int | None = Field(default=None, ge=1)
-    """Longest verification length; None means num_speculative_tokens."""
+    """Shortest verification length n (draft tokens per round); the longest is
+    num_speculative_tokens, the drafter's block."""
 
     initial_tokens: int | None = Field(default=None, ge=1)
     """Length of a request's first decode round, before any feedback; None
-    means max_tokens."""
+    means num_speculative_tokens."""
 
     forced_tokens: int | None = Field(default=None, ge=1)
     """Calibration: verify exactly this many draft tokens every round."""
@@ -785,9 +783,10 @@ class AdaptiveVerifyConfig:
     prior_weight: float = Field(default=2.0, gt=0)
     """Observations the prior counts for; it decays with the EMA."""
 
-    verify_cost_ratio: float = Field(default=0.108, gt=0)
+    verify_cost_ratio: float | None = Field(default=None, gt=0)
     """Round cost per verified draft token relative to the fixed round cost
-    (rho = c / t0 of the target verify round)."""
+    (rho = c / t0 of the target verify round), measured for the model and the
+    GPUs; required by the throughput rule, which has no generic value."""
 
     switch_margin: float = Field(default=0.02, ge=0)
     """Relative throughput gain a new length needs before it replaces the
@@ -1872,19 +1871,25 @@ def _adaptive_mtp_min_k(
     return max(ADAPTIVE_MTP_FLOOR_K, min(val, num_spec_tokens))
 
 
+def required_verify_cost_ratio(settings: AdaptiveVerifyConfig) -> float:
+    """verify_cost_ratio of the throughput rule; it has no default."""
+    if settings.verify_cost_ratio is None:
+        raise ValueError(
+            "adaptive_verify.verify_cost_ratio is required: the round cost per "
+            "verified draft token relative to the fixed round cost, measured "
+            "for this model and these GPUs"
+        )
+    return settings.verify_cost_ratio
+
+
 def _resolve_dflash_verify(
     settings: AdaptiveVerifyConfig, num_spec_tokens: int
 ) -> AdaptiveVerifyPlan:
-    max_tokens = num_spec_tokens if settings.max_tokens is None else settings.max_tokens
-    if max_tokens > num_spec_tokens:
-        raise ValueError(
-            f"adaptive_verify.max_tokens ({max_tokens}) exceeds "
-            f"num_speculative_tokens ({num_spec_tokens})"
-        )
+    max_tokens = num_spec_tokens
     if settings.min_tokens > max_tokens:
         raise ValueError(
             f"adaptive_verify.min_tokens ({settings.min_tokens}) exceeds "
-            f"max_tokens ({max_tokens})"
+            f"num_speculative_tokens ({max_tokens})"
         )
     initial = max_tokens if settings.initial_tokens is None else settings.initial_tokens
     for name, value in (
@@ -1904,6 +1909,7 @@ def _resolve_dflash_verify(
             settings.forced_tokens,
             settings,
         )
+    required_verify_cost_ratio(settings)
     return AdaptiveVerifyPlan(
         "throughput", settings.min_tokens, max_tokens, initial, settings
     )
@@ -1945,4 +1951,21 @@ def resolve_adaptive_verify(
             f"adaptive_verify.enabled requires speculative method 'dflash', "
             f"got {method!r}"
         )
+    if getattr(speculative_config, "ngram_assist", False):
+        raise ValueError(
+            "adaptive_verify.enabled does not support ngram_assist: "
+            "lookup-augmented DFlash2 verifies proposals wider than the "
+            "drafter's block"
+        )
     return _resolve_dflash_verify(settings, num_spec_tokens)
+
+
+def check_adaptive_verify_scheduling(
+    kernel_config: "KernelConfig", async_scheduling: bool | None
+) -> None:
+    """Only the async scheduler chooses a verification length per round."""
+    if kernel_config.adaptive_verify.enabled and not async_scheduling:
+        raise ValueError(
+            "adaptive_verify.enabled requires async scheduling; the synchronous "
+            "scheduler always verifies num_speculative_tokens"
+        )
