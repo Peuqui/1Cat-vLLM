@@ -14,7 +14,8 @@ counted from its page's origin ``page_bases[page] / 2``; every page adds one
 terminal offset.
 
 Reference: local-inference-lab ``docs/csf-scale-blocks.md`` as implemented by
-TensorFold ``zig/src/core/nvfp4_csf32.zig`` (Apache-2.0).
+TensorFold (Apache-2.0),
+https://github.com/ashhart/TensorFold/blob/main/zig/src/core/nvfp4_csf32.zig
 """
 
 from dataclasses import dataclass

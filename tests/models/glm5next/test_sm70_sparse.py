@@ -204,7 +204,9 @@ def test_glm53_sm70_sparse_attention_matches_reference():
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda() or current_platform.get_device_capability()[0] != 7,
+    not torch.cuda.is_available()
+    or not current_platform.is_cuda()
+    or current_platform.get_device_capability()[0] != 7,
     reason="requires a Volta or Turing CUDA device",
 )
 def test_glm53_sm70_fp8_kv_prefill_blocks_match_reference():
@@ -482,7 +484,7 @@ def test_glm53_indexer_query_and_op_share_the_fp16_predicate():
     )
 
 
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_glm53_fp16_indexer_predicate_follows_each_card():
     from vllm.model_executor.layers.quantization.sm70_turbomind import (
         is_pre_ampere_cuda_platform,

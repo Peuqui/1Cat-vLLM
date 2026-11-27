@@ -54,9 +54,10 @@ if TYPE_CHECKING:
 
     _MediaProcessor = Glm5NextImageProcessor | Glm5NextVideoProcessor
 
+
 # The tower runs every token-wise step (projections, q/k norm, rotary, MLPs,
 # merger) over at most this many rows at a time; only the attention itself
-# sees the whole sequence. A maximum-size image has 32,000 patches, and their
+# sees the whole sequence. A maximum-size image has 31,684 patches, and their
 # MLP and merger intermediates in one piece were 1.3 GiB on the first
 # pipeline stage, which the KV cache then lacks. Each row is computed exactly
 # as before.

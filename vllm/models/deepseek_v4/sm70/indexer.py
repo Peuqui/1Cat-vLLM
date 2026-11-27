@@ -1223,7 +1223,9 @@ def sm70_indexer_decode_logits(
         )
         if blocker is None and triton_tensor_cores:
             logger.info_once(
-                "SM70 indexer decode: fused multi-row scorer on %s.", q.device
+                "SM70 indexer decode: fused multi-row scorer on %s.",
+                q.device,
+                scope="process",
             )
             return _decode_logits_fused(
                 q,

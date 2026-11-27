@@ -17,13 +17,13 @@ import argparse
 import itertools
 
 import torch
-from triton.runtime.errors import OutOfResources
 
 from vllm.model_executor.layers.attention.mla_kv_b_skinny import (
     KvBTile,
     kv_b_bmm_skinny,
     kv_b_skinny_tile,
 )
+from vllm.triton_utils import triton
 
 HEADS, NOPE, VALUE, LATENT = 64, 256, 256, 512
 PEAK_GBPS = {"V100": 900.0, "RTX 8000": 672.0}
@@ -45,14 +45,14 @@ def _graph_time_us(launch, calls: int, repeats: int) -> float:
     with torch.cuda.stream(stream):
         for index in range(calls):  # compile and warm up outside the capture
             launch(index)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         for index in range(calls):
             launch(index)
     for _ in range(3):
         graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     start, end = (
         torch.cuda.Event(enable_timing=True),
         torch.cuda.Event(enable_timing=True),
@@ -89,7 +89,7 @@ def _case(name, rows, sets, which, args, tile=None):
         microseconds = _graph_time_us(launch, args.calls, args.repeats)
         results[label] = microseconds
         launch(0)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         error = (out.float() - reference.float()).abs().max().item()
         print(
             f"{name:18s} M={rows} {label:6s} tile={shown_tile} "
@@ -127,7 +127,7 @@ def main() -> None:
                 tile = KvBTile(block_n, block_k, warps)
                 try:
                     _case(name, rows, sets, which, args, tile)
-                except OutOfResources as error:
+                except triton.runtime.errors.OutOfResources as error:
                     # The sweep grid includes tiles larger than a card's shared
                     # memory (Turing: 64 KiB); they are not candidates there.
                     print(f"{name:18s} M={rows} skinny tile={tile} skipped: {error}")

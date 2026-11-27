@@ -706,7 +706,7 @@ def test_moe_qpn_decode_load_ring_equals_the_prefill_path(
         qc, qs = qpn_prepack(w[e], scales[e].to(device), group_size, order)
         w[e].view(-1).copy_(qc)
         raster[e].copy_(qs.reshape(-1))
-    extra = ()
+    extra: tuple[torch.Tensor, ...] = ()
     if scale_bits:
         planes = encode_scales(raster, cols // 16, scale_bits)
         extra = (planes.base, planes.nib, planes.hi)

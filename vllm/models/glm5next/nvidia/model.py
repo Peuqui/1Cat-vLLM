@@ -1161,11 +1161,20 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
 
     def _kda_projection_mapping(self) -> list[tuple[str, str, int]]:
         """KDA input projections as the layers were built: q, k, v packed
-        MXFP8 and b, f_a, g_a BF16, or all six merged into one GEMM."""
-        if any(
-            isinstance(module, Glm5NextLinearAttention) and module.split_qkv
+        MXFP8 and b, f_a, g_a BF16, or all six merged into one GEMM. One
+        mapping serves every KDA layer of this stage, so the layers must agree."""
+        splits = {
+            module.split_qkv
             for module in self.modules()
-        ):
+            if isinstance(module, Glm5NextLinearAttention)
+        }
+        if len(splits) > 1:
+            raise ValueError(
+                "The checkpoint quantizes in_proj_qkv in some KDA layers of this "
+                "pipeline stage only; their input projections cannot share one "
+                "weight mapping."
+            )
+        if splits == {True}:
             return [
                 (".in_proj_qkv", ".q_proj", 0),
                 (".in_proj_qkv", ".k_proj", 1),

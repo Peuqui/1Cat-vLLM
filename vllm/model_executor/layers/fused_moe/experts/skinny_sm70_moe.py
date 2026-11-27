@@ -72,8 +72,13 @@ class QpnFragmentOrder(IntEnum):
     M16N8K8 = 1
 
 
-def qpn_fragment_order(device_id: int) -> QpnFragmentOrder:
-    """The order the given card's kernels read: m16n8k8 where the card has it."""
+def qpn_fragment_order(device_id: int | None = None) -> QpnFragmentOrder:
+    """The order the given card's kernels read: m16n8k8 where the card has it.
+
+    Without an index the platform answers for the device this process runs on,
+    without creating a CUDA context (kernel selection runs in processes that
+    must not hold one).
+    """
     if current_platform.has_device_capability(75, device_id=device_id):
         return QpnFragmentOrder.M16N8K8
     return QpnFragmentOrder.M8N8K4
@@ -694,7 +699,7 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
         kernel_config.sm70_skinny_moe_applicable = True
         if not kernel_config.sm70_skinny_moe:
             return False, "disabled by kernel_config.sm70_skinny_moe"
-        order = qpn_fragment_order(torch.accelerator.current_device_index())
+        order = qpn_fragment_order()
         for name, k in (
             ("hidden", moe_config.hidden_dim),
             ("intermediate", moe_config.intermediate_size_per_partition),

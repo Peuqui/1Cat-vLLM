@@ -178,6 +178,9 @@ void csf32_expand_sm70(torch::Tensor out, torch::Tensor bases,
   TORCH_CHECK(bases.numel() == matrices * rows &&
                   codes.numel() == matrices * rows * groups / 2,
               "CSF plane sizes");
+  TORCH_CHECK(out.size(0) * projections >= matrices &&
+                  out.size(1) >= projections * rows * groups,
+              "the raster holds every expert's projections");
   const int64_t num_blocks = (rows / 32) * (groups / 2);
   TORCH_CHECK(
       page_bases.dim() == 2 && page_bases.size(0) == matrices &&

@@ -393,8 +393,9 @@ def sm70_glm5_sparse_attention_paged_fp8_batched_gemm(
 ) -> None:
     """Run small-batch sparse MLA with the B1 tensor-core arithmetic path.
 
-    ``batched_pv`` replaces the per-token PV GEMMs by one batched GEMM; only
-    callers that need no parity with B1 decode (prefill) set it.
+    ``batched_pv`` replaces the per-token PV GEMMs by one batched GEMM, which
+    reduces in a different order. Prefill sets it; decode and speculative
+    verification keep the per-token GEMMs so that their logits match B1.
     """
     assert q.dtype == out.dtype == torch.float16
     assert q.shape == out.shape and q.shape[-1] == GLM5_FP8_KV_DIM

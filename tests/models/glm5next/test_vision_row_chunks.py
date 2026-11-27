@@ -9,6 +9,8 @@ from torch import nn
 
 from vllm.models.glm5next.nvidia import multimodal
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
 _ROWS = 10
 _ONE_PIECE = 1 << 30
 
