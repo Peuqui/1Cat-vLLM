@@ -5,8 +5,12 @@
 One PP stage's MoE layers (real checkpoint weights, real prepack path) run
 back to back in ONE CUDA graph, each layer with the routing a verify round
 (1 anchor + 4 draft tokens = 5 rows x top-8) really produces: the number of
-distinct experts per round is drawn from the per-layer histograms of the
-expert counter (``rank<stage>.json``, MOE_KERN.md 7.1). Weights of a layer are
+distinct experts per round is drawn from per-layer histograms recorded while
+serving (``--histograms``: one ``rank<stage>.json`` per PP stage, holding
+``{"layers": {<module name with "layers.N.">: [counts for 1 row, 2 rows, ...]}}``
+with at least five entries (five rows are read), each list counting decode
+steps by the number of distinct
+experts (the list index)). Weights of a layer are
 GBs, far larger than L2, and the layers alternate, so every layer streams its
 experts from DRAM like the serving decode does.
 
@@ -36,12 +40,12 @@ histograms, needs no GPU and no weights).
 Example (stage 1 runs on a V100, stages 0 and 4 on a RTX 8000):
   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 python \\
       benchmarks/kernels/benchmark_glm_skinny_moe_routing.py --stage 1 \\
+      --checkpoint <checkpoint dir> --histograms <histogram dir> \\
       --layers 7 --mode dist --iters 200 --timing both
 """
 
 import argparse
 import json
-import re
 import statistics
 import subprocess
 import time
@@ -51,6 +55,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import regex as re
 import torch
 
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -73,8 +78,6 @@ from vllm.model_executor.layers.quantization.utils.s5_scales import (
     scale_spread,
 )
 
-DEFAULT_CHECKPOINT = Path("/home/mp/models/GLM-5.3-Flash-NVFP4-MTP")
-DEFAULT_HISTOGRAMS = Path("/home/mp/.cache/bench-scripts/expert_count_2026-11-23")
 SWEEP_DISTINCT = (16, 20, 24, 28, 32, 36, 40)
 ROWS = 5  # verify round: anchor + 4 draft tokens (cudagraph capture size 5)
 TOP_K = 8
@@ -112,7 +115,7 @@ def make_topk_ids(
 ) -> np.ndarray:
     """int32 [5, 8] routing with exactly ``distinct`` different experts.
 
-    The recipe of MOE_KERN.md 7.1: draw the experts, give each one random row
+    Draw the experts, give each one random row
     first (at most 8 per row), fill the remaining 40 - d places per row with
     experts the row does not hold yet, Zipf-weighted over a random expert
     ranking, so the leading experts recur in several rows like the anchor and
@@ -776,13 +779,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dump-draws", type=int, default=16, help="draws stored/compared"
     )
-    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
-    parser.add_argument("--histograms", type=Path, default=DEFAULT_HISTOGRAMS)
+    parser.add_argument(
+        "--checkpoint", type=Path, help="GLM-5.3-Flash NVFP4 checkpoint directory"
+    )
+    parser.add_argument(
+        "--histograms",
+        type=Path,
+        required=True,
+        help="directory of the per-stage rank<stage>.json expert histograms",
+    )
     parser.add_argument(
         "--selftest", action="store_true", help="CPU only: generator vs histograms"
     )
     parser.add_argument("--selftest-samples", type=int, default=3000)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.selftest and args.checkpoint is None:
+        parser.error("--checkpoint is required unless --selftest is given")
+    return args
 
 
 def main() -> None:
@@ -869,7 +882,7 @@ def main() -> None:
         print("memory.used after split graphs:", memory_used())
         report_split(time_split(graphs, layers, draws, device), draws, layers)
     print("memory.used end:", memory_used())
-    peak = torch.cuda.max_memory_reserved(device) / 2**20
+    peak = torch.accelerator.max_memory_reserved(device) / 2**20
     print(f"peak reserved by this process: {peak:.0f} MiB")
 
 

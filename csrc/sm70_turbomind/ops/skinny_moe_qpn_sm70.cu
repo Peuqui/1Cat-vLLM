@@ -355,7 +355,7 @@ __global__ void __launch_bounds__(
       // (kDecodeRing groups ahead, like load_group in the m16n8k8 kernel):
       // left to the compiler, `unroll 4` fetched the codes about one group
       // ahead and drained the pipeline at every loop edge, which kept the DRAM
-      // stream at 57-67 % of its bandwidth. Slot i is consumed, then refilled
+      // stream at 63-67 % of its bandwidth. Slot i is consumed, then refilled
       // with the group kDecodeRing on, so the next groups' loads are in flight
       // while this one computes. Math and summation order per group are
       // unchanged.

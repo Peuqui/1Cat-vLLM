@@ -10,7 +10,6 @@ test_sm70_group_routing.py on CUDA and the CUDA-graph micro-benchmark.
     TRITON_INTERPRET=1 pytest tests/kernels/moe/test_sm70_group_routing_cpu.py
 """
 
-import importlib.util
 import os
 import sys
 
@@ -22,37 +21,11 @@ if "triton" in sys.modules and os.environ.get("TRITON_INTERPRET") != "1":
         "before this file could turn the interpreter on",
         allow_module_level=True,
     )
-os.environ["TRITON_INTERPRET"] = "1"  # before triton is imported
-
-import types  # noqa: E402
-from pathlib import Path  # noqa: E402
+os.environ["TRITON_INTERPRET"] = "1"  # before the kernel is decorated
 
 import torch  # noqa: E402
-import triton  # noqa: E402
-import triton.language as tl  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[3]
-
-
-def _load_routing():
-    # Load the one module by path: importing vllm.model_executor pulls in the
-    # whole engine.
-    if "vllm.triton_utils" not in sys.modules:
-        sys.modules.setdefault("vllm", types.ModuleType("vllm"))
-        shim = types.ModuleType("vllm.triton_utils")
-        setattr(shim, "tl", tl)  # noqa: B010
-        setattr(shim, "triton", triton)  # noqa: B010
-        sys.modules["vllm.triton_utils"] = shim
-    spec = importlib.util.spec_from_file_location(
-        "routing_under_test",
-        ROOT / "vllm/model_executor/layers/fused_moe/sm70/routing.py",
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-ROUTING = _load_routing()
+from vllm.model_executor.layers.fused_moe.sm70 import routing as ROUTING  # noqa: E402
 
 
 def _assert_same(topk_ids: torch.Tensor) -> None:
