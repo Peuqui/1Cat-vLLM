@@ -26,7 +26,12 @@ import torch
 from vllm.triton_utils import tl, triton
 
 # One MMA row tile: more rows than this and cuBLAS is no longer bandwidth-bound
-# on the weight, so the caller keeps torch.bmm.
+# on the weight, so the caller keeps torch.bmm. A single row (decode without
+# speculation) stays on cuBLAS too: there this kernel is 3-7 % slower on
+# capability 70 and under 2 % faster on 75 (benchmarks/kernels/
+# benchmark_mla_kv_b_skinny.py at one row); at five and seven rows, the verify
+# rounds it was measured for, it is faster on both.
+KV_B_SKINNY_MIN_ROWS = 2
 KV_B_SKINNY_MAX_ROWS = 8
 _BLOCK_M = 16  # smallest tl.dot row tile; rows past the batch are masked
 
@@ -41,7 +46,7 @@ class KvBTile(NamedTuple):
 # is W[h] = [K, N] row-major (W_UK_T, K = nope dim 256, N = latent 512); "K
 # contiguous" is W[h] = [N, K] row-major (W_UV, K = latent 512, N = value 256).
 # Chosen by benchmarks/kernels/benchmark_mla_kv_b_skinny.py --sweep --rows 1 5 7
-# on GLM-5.3's shapes (24.11.2026): the fastest sum over 1, 5 and 7 rows. Turing
+# on GLM-5.3's shapes: the fastest sum over 1, 5 and 7 rows. Turing
 # has 64 KiB of shared memory, which rules out the largest tiles there.
 KV_B_SKINNY_TILES: dict[int, tuple[KvBTile, KvBTile]] = {
     70: (KvBTile(block_n=64, block_k=32, num_warps=4), KvBTile(64, 64, 2)),

@@ -226,6 +226,7 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
 )
 from vllm.model_executor.layers.attention.mla_kv_b_skinny import (
     KV_B_SKINNY_MAX_ROWS,
+    KV_B_SKINNY_MIN_ROWS,
     KvBTile,
     kv_b_bmm_skinny,
     kv_b_skinny_tile,
@@ -1007,7 +1008,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         """The per-head kv_b product ``out = x @ weight`` ([heads, rows, K]);
         ``which`` is 0 for W_UK_T and 1 for W_UV."""
         tiles = self.kv_b_skinny_tiles
-        if tiles is not None and x.shape[1] <= KV_B_SKINNY_MAX_ROWS:
+        if (
+            tiles is not None
+            and KV_B_SKINNY_MIN_ROWS <= x.shape[1] <= KV_B_SKINNY_MAX_ROWS
+        ):
             kv_b_bmm_skinny(x, weight, out, tiles[which])
         else:
             torch.bmm(x, weight, out=out)

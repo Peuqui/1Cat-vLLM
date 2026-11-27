@@ -935,7 +935,7 @@ class KernelConfig:
     mla_kv_b_skinny: bool = False
     """Run the two kv_b products of MLA decode (``q_nope @ W_UK_T`` and
     ``attn_out @ W_UV``, one FP16 matrix per head) as a Triton tensor-core kernel
-    for at most 8 rows, instead of ``torch.bmm``. FP32 accumulation like the
+    for two to eight rows, instead of ``torch.bmm``. FP32 accumulation like the
     cuBLAS kernels, but another summation order, so outputs are not bit-identical.
     Needs ``triton_sm7x_tensor_cores``."""
 

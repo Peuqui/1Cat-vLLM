@@ -13,6 +13,7 @@ from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention.mla_kv_b_skinny import (
     KV_B_SKINNY_MAX_ROWS,
+    KV_B_SKINNY_MIN_ROWS,
     KV_B_SKINNY_TILES,
     kv_b_bmm_skinny,
     kv_b_skinny_tile,
@@ -61,7 +62,9 @@ def test_setting_keeps_the_compilation_hash():
     )
 
 
-@pytest.mark.parametrize("rows", [1, KV_B_SKINNY_MAX_ROWS, KV_B_SKINNY_MAX_ROWS + 1])
+@pytest.mark.parametrize(
+    "rows", [1, KV_B_SKINNY_MIN_ROWS, KV_B_SKINNY_MAX_ROWS, KV_B_SKINNY_MAX_ROWS + 1]
+)
 @pytest.mark.parametrize("skinny", [False, True])
 def test_dispatch_takes_the_kernel_only_for_few_rows(monkeypatch, rows, skinny):
     calls: list[str] = []
@@ -77,7 +80,8 @@ def test_dispatch_takes_the_kernel_only_for_few_rows(monkeypatch, rows, skinny):
     layer = SimpleNamespace(kv_b_skinny_tiles=tiles)
     x = torch.empty(HEADS, rows, 8)
     MLAAttention._kv_b_bmm(layer, x, x, x, 0)
-    assert calls == ["skinny" if skinny and rows <= KV_B_SKINNY_MAX_ROWS else "cublas"]
+    takes_kernel = skinny and KV_B_SKINNY_MIN_ROWS <= rows <= KV_B_SKINNY_MAX_ROWS
+    assert calls == ["skinny" if takes_kernel else "cublas"]
 
 
 # --- GPU tests --------------------------------------------------------------
