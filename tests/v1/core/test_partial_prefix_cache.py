@@ -514,6 +514,49 @@ def test_kpool_tail_ring_rejects_boundaries_inside_its_pool_span():
     assert cm.partial_prefix_stops(r1, 0, 80) == ()
 
 
+def test_boundary_before_the_generation_prompt_is_kept_with_decode_checkpoints():
+    # A reasoning template drops the reasoning of the reply in the next turn,
+    # which therefore diverges at the end of the last message: the snapshot
+    # there must not be left to a decode checkpoint of the reply.
+    import torch
+
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    full = FullAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=4, dtype=torch.float16
+    )
+    mamba = MambaSpec(
+        block_size=128,
+        shapes=((4,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+    )
+    config = KVCacheConfig(
+        64, [], [KVCacheGroupSpec(["mla"], full), KVCacheGroupSpec(["kda"], mamba)]
+    )
+    cm = KVCacheManager(
+        config, 1024, 128, partial_prefix_cache=True, enable_decode_ckpt=True
+    )
+    assert cm._enable_decode_ckpt is True
+    request = Request(
+        request_id="r1",
+        prompt_token_ids=list(range(100, 300)),
+        sampling_params=SamplingParams(
+            max_tokens=256, extra_args={"prefix_cache_boundaries": [192]}
+        ),
+        pooling_params=None,
+        block_hasher=_hash_128,
+    )
+    # The last prefill chunk ends at the prompt end, 8 tokens after 192.
+    assert cm.partial_prefix_stops(request, 128, 200) == (192,)
+
+
 def test_chat_boundaries_include_multi_turn_user_fork_boundary():
     tokenizer = _StrictUserQueryTokenizer()
     shared_history = [
@@ -1250,7 +1293,10 @@ def test_spec_decode_crosses_2048_mamba_block_and_hits_full_and_partial_on_turn2
     )
     comp_blocks, hit = cm.get_computed_blocks(t2)
     assert hit == 2112
-    assert cm.partial_prefix_stops(t2, hit, len(t2_tokens)) == ()
+    # The boundary just before the generation prompt (aligned to 64) is a stop:
+    # the next turn of a reasoning template diverges there, so it is not left
+    # to a decode checkpoint of the reply.
+    assert cm.partial_prefix_stops(t2, hit, len(t2_tokens)) == (2240,)
     assert cm.allocate_slots(t2, len(t2_tokens) - hit, hit, comp_blocks) is not None
     t2.status = RequestStatus.FINISHED_ABORTED
     cm.free(t2)

@@ -408,22 +408,21 @@ class KVCacheManager:
     def partial_prefix_stops(
         self, request: Request, start: int, end: int
     ) -> tuple[int, ...]:
-        """Boundaries inside ``(start, end)`` whose state must be kept."""
+        """Boundaries inside ``(start, end)`` whose state must be kept.
+
+        A boundary just before the end of the prompt is kept too, although a
+        decode checkpoint of the reply may later cover it: the next turn
+        replays the reply only when the template renders it verbatim, and a
+        reasoning template drops the reasoning, so that turn diverges at this
+        boundary (the end of the last message)."""
         if self.partial_cache is None or not request.prefix_cache_boundaries:
             return ()
         hashed = len(request.block_hashes) * self.hash_block_size
-        coalesce_gen_tail = (
-            start > 0
-            and self._enable_decode_ckpt
-            and end == request.num_prompt_tokens
-            and (request.max_tokens or 0) >= 64
-        )
         return tuple(
             b
             for b in request.prefix_cache_boundaries
             if start < b < end
             and self._partial_boundary_ok(b)
-            and not (coalesce_gen_tail and end - b < 80)
             and b // self.partial_block_size * self.partial_block_size <= hashed
             and not self.partial_cache.contains(self._partial_key(request, b))
         )
