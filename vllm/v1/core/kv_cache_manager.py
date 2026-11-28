@@ -390,6 +390,17 @@ class KVCacheManager:
             if isinstance(m, KpoolTailManager)
         )
 
+    def _partial_ready_step(
+        self, copy_last: list[bool], targets: list[list[KVCacheBlock]]
+    ) -> int:
+        """First step in which a new entry can be hit.
+
+        Only groups that keep blocks count: a kpool-tail group keeps none and
+        has nothing to wait for."""
+        if all(copy for copy, blocks in zip(copy_last, targets) if blocks):
+            return self._step - 1
+        return self._step
+
     def _partial_block_range(self, manager, boundary: int) -> tuple[int, int]:
         """Block indices ``[first, last]`` an entry keeps for one group."""
         if isinstance(manager, CircularBufferManager):
@@ -644,7 +655,7 @@ class KVCacheManager:
                     length=boundary,
                     blocks=targets,
                     copy_last=copy_last,
-                    ready_step=self._step - 1 if all(copy_last) else self._step,
+                    ready_step=self._partial_ready_step(copy_last, targets),
                     pinned_blocks=pinned_parents,
                 )
             )
@@ -701,7 +712,7 @@ class KVCacheManager:
                     length=boundary,
                     blocks=targets,
                     copy_last=copy_last,
-                    ready_step=self._step - 1 if all(copy_last) else self._step,
+                    ready_step=self._partial_ready_step(copy_last, targets),
                     pinned_blocks=pinned_parents,
                 )
             )
@@ -1278,7 +1289,7 @@ class KVCacheManager:
             step_end = total_computed_tokens + num_new_tokens
             if (
                 step_end in request.prefix_cache_boundaries
-                and step_end % self.partial_block_size
+                and self._partial_boundary_ok(step_end)
                 and step_end < request.num_prompt_tokens
             ):
                 # The state at ``step_end`` exists once this step has run;
